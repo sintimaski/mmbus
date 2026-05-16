@@ -24,6 +24,7 @@ fn setup_e2e(label: &str, slot_size: u32) -> E2EBench {
         capacity: 4096,
         slot_size,
         base_dir: PathBuf::from(BENCH_BASE),
+        ..Default::default()
     };
     let _ = std::fs::remove_file(cfg.base_dir.join(label).join("signal.sock"));
 

@@ -15,12 +15,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const BENCH_BASE: &str = "/tmp/mmbus_bench";
+const MAX_SUBS: u32 = 4;
 
 fn setup_ring(name: &str, capacity: u32, slot_size: u32) -> Arc<RingBuffer> {
     let dir = PathBuf::from(BENCH_BASE).join(name);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    Arc::new(RingBuffer::create(&dir.join("ring.mmap"), capacity, slot_size).unwrap())
+    Arc::new(RingBuffer::create(&dir.join("ring.mmap"), capacity, slot_size, MAX_SUBS).unwrap())
 }
 
 /// Throughput: how many messages per second can flow through the ring buffer
@@ -28,11 +29,11 @@ fn setup_ring(name: &str, capacity: u32, slot_size: u32) -> Arc<RingBuffer> {
 ///
 /// Regression signal: throughput drop > 10% suggests a memory-ordering
 /// regression (e.g., SeqCst instead of Acquire/Release) or a ring math bug.
-fn ring_spsc_throughput(c: &mut Criterion) {
+fn ring_throughput(c: &mut Criterion) {
     const CAPACITY: u32 = 4096;
     const BATCH: usize = 50_000;
 
-    let mut group = c.benchmark_group("ring_spsc_throughput");
+    let mut group = c.benchmark_group("ring_throughput");
     group.throughput(Throughput::Elements(BATCH as u64));
 
     for msg_size in [32usize, 256, 1024] {
@@ -41,12 +42,16 @@ fn ring_spsc_throughput(c: &mut Criterion) {
 
         let msg = vec![0xABu8; msg_size];
 
-        // Channels for coordinating the consumer thread across Criterion samples.
+        // Claim a cursor for the consumer thread before spawning it so the
+        // producer's backpressure check sees our position immediately.
+        let cursor_start = ring.current_tail();
+        let cursor_idx = ring.claim_cursor(cursor_start).unwrap();
+
         let (go_tx, go_rx) = std::sync::mpsc::sync_channel::<usize>(1);
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
 
         std::thread::spawn(move || {
-            let mut cursor = ring_c.current_tail();
+            let mut cursor = cursor_start;
             let mut buf = Vec::with_capacity(1024);
             loop {
                 let n = match go_rx.recv() {
@@ -55,9 +60,8 @@ fn ring_spsc_throughput(c: &mut Criterion) {
                 };
                 let mut received = 0;
                 while received < n {
-                    if ring_c.try_receive(cursor, &mut buf) {
-                        ring_c.advance_head(cursor + 1);
-                        cursor += 1;
+                    if let Some(new_cursor) = ring_c.try_receive(cursor_idx, cursor, &mut buf) {
+                        cursor = new_cursor;
                         received += 1;
                     } else {
                         spin_loop();
@@ -65,6 +69,7 @@ fn ring_spsc_throughput(c: &mut Criterion) {
                 }
                 done_tx.send(()).unwrap();
             }
+            ring_c.release_cursor(cursor_idx);
         });
 
         group.bench_with_input(
@@ -95,17 +100,18 @@ fn ring_spsc_throughput(c: &mut Criterion) {
 }
 
 /// Single-message round-trip latency on the ring buffer (sequential, one thread).
-/// Producer and consumer alternate on the same core — the lower bound on
-/// ring buffer operation overhead.
+/// Producer and consumer alternate on the same core — lower bound on ring overhead.
 ///
 /// Regression signal: ns/iter increase > 20% suggests overhead added to
-/// try_publish or try_receive (e.g., unnecessary allocations or fences).
+/// try_publish or try_receive (unnecessary allocations, extra fences, etc.).
 fn ring_single_msg_latency(c: &mut Criterion) {
     const CAPACITY: u32 = 256;
     const SLOT_SIZE: u32 = 256;
 
     let ring = setup_ring("latency", CAPACITY, SLOT_SIZE);
-    let mut cursor = ring.current_tail();
+    let cursor_start = ring.current_tail();
+    let cursor_idx = ring.claim_cursor(cursor_start).unwrap();
+    let mut cursor = cursor_start;
     let msg = b"ping";
     let mut buf = Vec::with_capacity(256);
 
@@ -114,21 +120,22 @@ fn ring_single_msg_latency(c: &mut Criterion) {
 
     group.bench_function("sequential_roundtrip", |b| {
         b.iter(|| {
-            // Publish one message.
             while !ring.try_publish(msg) {
                 spin_loop();
             }
-            // Receive it (same thread — simulates context-switch-free cost).
-            while !ring.try_receive(cursor, &mut buf) {
+            loop {
+                if let Some(new_cursor) = ring.try_receive(cursor_idx, cursor, &mut buf) {
+                    cursor = new_cursor;
+                    break;
+                }
                 spin_loop();
             }
-            ring.advance_head(cursor + 1);
-            cursor += 1;
         })
     });
 
+    ring.release_cursor(cursor_idx);
     group.finish();
 }
 
-criterion_group!(benches, ring_spsc_throughput, ring_single_msg_latency);
+criterion_group!(benches, ring_throughput, ring_single_msg_latency);
 criterion_main!(benches);

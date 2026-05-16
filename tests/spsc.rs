@@ -6,6 +6,7 @@ fn make_cfg(name: &str) -> BusConfig {
         capacity: 32,
         slot_size: 128,
         base_dir: std::env::temp_dir().join("mmbus_tests").join(name),
+        ..Default::default()
     }
 }
 
@@ -114,11 +115,23 @@ fn ring_full_returns_error() {
         capacity: 4,
         slot_size: 8,
         base_dir: std::env::temp_dir().join("mmbus_tests").join("full"),
+        ..Default::default()
     };
     cleanup(&cfg);
 
-    // No subscriber — ring fills up after `capacity` publishes.
+    // A subscriber that connects but never reads holds the ring at capacity.
+    // Without an active cursor the producer has no backpressure — we need
+    // at least one subscriber for Full to be returned.
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let cfg_sub = cfg.clone();
+    let sub_thread = std::thread::spawn(move || {
+        let _sub = Subscriber::connect("bus", &cfg_sub, Duration::from_secs(5)).unwrap();
+        let _ = done_rx.recv(); // hold cursor until signaled
+    });
+
     let mut pub_ = Publisher::create("bus", cfg.clone()).unwrap();
+    pub_.wait_for_subscribers(1, Duration::from_secs(5)).unwrap();
+
     let mut fulls = 0;
     for _ in 0..16 {
         match pub_.publish(b"data") {
@@ -128,6 +141,9 @@ fn ring_full_returns_error() {
         }
     }
     assert!(fulls > 0, "expected Full errors");
+
+    done_tx.send(()).unwrap();
+    sub_thread.join().unwrap();
     cleanup(&cfg);
 }
 
@@ -248,6 +264,7 @@ fn stress_content_integrity() {
         capacity: 64,
         slot_size: 16,
         base_dir: std::env::temp_dir().join("mmbus_tests").join("stress"),
+        ..Default::default()
     };
     cleanup(&cfg);
     let n = 10_000usize;
@@ -290,6 +307,7 @@ fn bus_cfg(label: &str) -> BusConfig {
         capacity: 32,
         slot_size: 256,
         base_dir: std::env::temp_dir().join("mmbus_tests").join(label),
+        ..Default::default()
     }
 }
 
