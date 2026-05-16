@@ -1,9 +1,10 @@
 use crate::ring::{RingBuffer, RingStats};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -21,6 +22,8 @@ pub enum Error {
     Timeout(String),
     #[error("too many subscribers: limit is {0}")]
     TooManySubscribers(u32),
+    #[error("a publisher is already running for topic '{0}'")]
+    AlreadyPublishing(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -36,6 +39,56 @@ pub enum BackpressurePolicy {
     /// Silently drop the oldest unread slot for the slowest subscriber and
     /// keep writing. The subscriber detects the skip on its next read.
     DropOldest,
+}
+
+// ── Producer lock ─────────────────────────────────────────────────────────────
+
+// Tracks active publisher paths within this process. Required because BSD/macOS
+// flock(2) semantics are per-process: all fds opened by the same process share
+// one lock record, so a same-process duplicate would bypass flock alone.
+static IN_PROCESS_LOCKS: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+struct ProducerLock {
+    path: PathBuf,
+    _file: fs::File, // keeps the OS-level flock alive until dropped
+}
+
+impl Drop for ProducerLock {
+    fn drop(&mut self) {
+        // Remove in-process entry; _file drop releases the OS flock.
+        let mut set = IN_PROCESS_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        set.remove(&self.path);
+    }
+}
+
+fn acquire_producer_lock(name: &str, dir: &Path) -> Result<ProducerLock> {
+    let path = dir.join("producer.lock");
+
+    // In-process check must come first on macOS.
+    {
+        let mut set = IN_PROCESS_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        if !set.insert(path.clone()) {
+            return Err(Error::AlreadyPublishing(name.to_owned()));
+        }
+    }
+
+    let file = match fs::OpenOptions::new().create(true).write(true).open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            IN_PROCESS_LOCKS.lock().unwrap_or_else(|e| e.into_inner()).remove(&path);
+            return Err(Error::Io(e));
+        }
+    };
+
+    // Cross-process exclusive advisory lock (non-blocking).
+    use std::os::unix::io::AsRawFd;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        IN_PROCESS_LOCKS.lock().unwrap_or_else(|e| e.into_inner()).remove(&path);
+        return Err(Error::AlreadyPublishing(name.to_owned()));
+    }
+
+    Ok(ProducerLock { path, _file: file })
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -214,6 +267,7 @@ pub struct Publisher {
     listener: UnixListener,
     clients: Vec<UnixStream>,
     backpressure: BackpressurePolicy,
+    _lock: ProducerLock,
 }
 
 impl Publisher {
@@ -226,12 +280,19 @@ impl Publisher {
         let sock_path = dir.join("signal.sock");
         let _ = fs::remove_file(&sock_path);
 
+        let lock = acquire_producer_lock(name, &dir)?;
         let ring =
             RingBuffer::create(&ring_path, cfg.capacity, cfg.slot_size, cfg.max_subscribers)?;
         let listener = UnixListener::bind(&sock_path)?;
         listener.set_nonblocking(true)?;
 
-        Ok(Self { ring, listener, clients: Vec::new(), backpressure: cfg.backpressure })
+        Ok(Self {
+            ring,
+            listener,
+            clients: Vec::new(),
+            backpressure: cfg.backpressure,
+            _lock: lock,
+        })
     }
 
     /// Publish a message. Returns `Err(Error::Full)` if the ring is saturated

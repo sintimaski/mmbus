@@ -330,6 +330,33 @@ fn subscriber_lag_tracking() {
 
 // ── Publisher stats ───────────────────────────────────────────────────────────
 
+// ── Producer lock ─────────────────────────────────────────────────────────────
+
+/// Trying to create a second publisher for the same topic while one is alive
+/// returns `AlreadyPublishing`. The lock is released when the first publisher
+/// is dropped, allowing a new publisher to take over.
+#[test]
+fn duplicate_publisher_returns_error() {
+    let cfg = cfg("dup_pub");
+    cleanup(&cfg);
+
+    let pub1 = Publisher::create("bus", cfg.clone()).unwrap();
+
+    match Publisher::create("bus", cfg.clone()) {
+        Err(Error::AlreadyPublishing(_)) => {}
+        Err(e) => panic!("expected AlreadyPublishing, got Err({e})"),
+        Ok(_) => panic!("expected AlreadyPublishing, got Ok"),
+    }
+
+    // After the first publisher is dropped the slot is free.
+    drop(pub1);
+    Publisher::create("bus", cfg.clone()).expect("should succeed after first publisher dropped");
+
+    cleanup(&cfg);
+}
+
+// ── Publisher stats ───────────────────────────────────────────────────────────
+
 /// `Publisher::stats()` reports correct tail and active subscriber count.
 #[test]
 fn publisher_stats() {
