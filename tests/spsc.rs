@@ -1,4 +1,4 @@
-use mmbus::{BusConfig, Error, Publisher, Subscriber};
+use mmbus::{Bus, BusConfig, Error, Publisher, Subscriber};
 use std::time::Duration;
 
 fn make_cfg(name: &str) -> BusConfig {
@@ -281,4 +281,127 @@ fn stress_content_integrity() {
         assert_eq!(val, i as u64, "content mismatch at position {i}: got {val}");
     }
     cleanup(&cfg);
+}
+
+// ── Bus API tests ─────────────────────────────────────────────────────────────
+
+fn bus_cfg(label: &str) -> BusConfig {
+    BusConfig {
+        capacity: 32,
+        slot_size: 256,
+        base_dir: std::env::temp_dir().join("mmbus_tests").join(label),
+    }
+}
+
+fn cleanup_bus(cfg: &BusConfig) {
+    let _ = std::fs::remove_dir_all(&cfg.base_dir);
+}
+
+#[test]
+fn bus_api_single_topic_roundtrip() {
+    let cfg = bus_cfg("bus_single");
+    cleanup_bus(&cfg);
+
+    let cfg_sub = cfg.clone();
+    let consumer = std::thread::spawn(move || {
+        let bus = Bus::with_config("app", cfg_sub);
+        let mut sub = bus.subscribe("events").unwrap();
+        sub.recv().unwrap()
+    });
+
+    let mut bus = Bus::with_config("app", cfg.clone());
+    // Create the publisher and wait for subscriber to connect before publishing.
+    bus.wait_for_subscribers("events", 1, Duration::from_secs(5)).unwrap();
+    bus.publish("events", b"hello bus").unwrap();
+
+    assert_eq!(consumer.join().unwrap(), b"hello bus");
+    cleanup_bus(&cfg);
+}
+
+#[test]
+fn bus_api_two_topics_independent() {
+    // Messages on "topic-a" must not appear on "topic-b" and vice versa.
+    let cfg = bus_cfg("bus_two_topics");
+    cleanup_bus(&cfg);
+
+    let cfg_a = cfg.clone();
+    let consumer_a = std::thread::spawn(move || {
+        let bus = Bus::with_config("app", cfg_a);
+        bus.subscribe("topic-a").unwrap().recv().unwrap()
+    });
+
+    let cfg_b = cfg.clone();
+    let consumer_b = std::thread::spawn(move || {
+        let bus = Bus::with_config("app", cfg_b);
+        bus.subscribe("topic-b").unwrap().recv().unwrap()
+    });
+
+    let mut bus = Bus::with_config("app", cfg.clone());
+    bus.wait_for_subscribers("topic-a", 1, Duration::from_secs(5)).unwrap();
+    bus.wait_for_subscribers("topic-b", 1, Duration::from_secs(5)).unwrap();
+    bus.publish("topic-a", b"for-a").unwrap();
+    bus.publish("topic-b", b"for-b").unwrap();
+
+    assert_eq!(consumer_a.join().unwrap(), b"for-a");
+    assert_eq!(consumer_b.join().unwrap(), b"for-b");
+    cleanup_bus(&cfg);
+}
+
+#[test]
+fn bus_api_recv_timeout_returns_none() {
+    let cfg = bus_cfg("bus_timeout");
+    cleanup_bus(&cfg);
+
+    // Create a publisher so the subscriber can connect.
+    let mut bus_pub = Bus::with_config("app", cfg.clone());
+    // Force publisher creation by publishing a dummy (no subscriber yet).
+    let _ = bus_pub.publish("ch", b"ignored");
+
+    let cfg_sub = cfg.clone();
+    let result = std::thread::spawn(move || {
+        let bus = Bus::with_config("app", cfg_sub);
+        let mut sub = bus.subscribe_timeout("ch", Duration::from_secs(5)).unwrap();
+        sub.recv_timeout(Duration::from_millis(100)).unwrap()
+    })
+    .join()
+    .unwrap();
+
+    assert!(result.is_none(), "expected timeout (None), got {result:?}");
+    cleanup_bus(&cfg);
+}
+
+#[test]
+fn bus_api_iterator() {
+    let cfg = bus_cfg("bus_iter");
+    cleanup_bus(&cfg);
+    let n = 50usize;
+
+    let cfg_sub = cfg.clone();
+    let consumer = std::thread::spawn(move || {
+        let bus = Bus::with_config("app", cfg_sub);
+        bus.subscribe("stream")
+            .unwrap()
+            .take(n)
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>()
+    });
+
+    let mut bus = Bus::with_config("app", cfg.clone());
+    bus.wait_for_subscribers("stream", 1, Duration::from_secs(5)).unwrap();
+    for i in 0..n {
+        loop {
+            match bus.publish("stream", format!("{i:03}").as_bytes()) {
+                Ok(()) => break,
+                Err(Error::Full) => std::hint::spin_loop(),
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
+
+    let received = consumer.join().unwrap();
+    assert_eq!(received.len(), n);
+    for (i, msg) in received.iter().enumerate() {
+        assert_eq!(msg.as_slice(), format!("{i:03}").as_bytes(), "message {i}");
+    }
+    cleanup_bus(&cfg);
 }
