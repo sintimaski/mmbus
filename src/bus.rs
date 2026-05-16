@@ -227,6 +227,16 @@ impl Subscription {
     pub fn try_recv(&mut self) -> Option<Vec<u8>> {
         self.sub.try_receive()
     }
+
+    /// How many messages this subscriber is behind the producer.
+    pub fn lag(&self) -> u64 {
+        self.sub.lag()
+    }
+
+    /// Current read cursor position.
+    pub fn cursor(&self) -> u64 {
+        self.sub.cursor()
+    }
 }
 
 impl Iterator for Subscription {

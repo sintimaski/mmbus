@@ -1,9 +1,8 @@
 /// PyO3 bindings — exposes Bus, Subscription, and TopicStats to Python.
 ///
 /// The extension module is compiled as `mmbus._mmbus`; the thin Python wrapper
-/// at `python/mmbus/__init__.py` re-exports the public names so callers just do:
-///
-///   from mmbus import Bus
+/// at `python/mmbus/__init__.py` re-exports the public API and adds
+/// `AsyncSubscription` for use with asyncio.
 use std::time::Duration;
 
 use pyo3::prelude::*;
@@ -11,31 +10,42 @@ use pyo3::types::PyBytes;
 
 use crate::bus::{Bus, BusConfig, Error, Subscription};
 
+// ── Custom Python exception classes ──────────────────────────────────────────
+
+pyo3::create_exception!(mmbus, BusFullError, pyo3::exceptions::PyException);
+pyo3::create_exception!(mmbus, MessageTooLargeError, pyo3::exceptions::PyException);
+pyo3::create_exception!(mmbus, ConnectTimeoutError, pyo3::exceptions::PyException);
+pyo3::create_exception!(mmbus, TooManySubscribersError, pyo3::exceptions::PyException);
+pyo3::create_exception!(mmbus, AlreadyPublishingError, pyo3::exceptions::PyException);
+
+fn mmbus_err(e: Error) -> PyErr {
+    match e {
+        Error::Full => BusFullError::new_err("ring buffer full"),
+        Error::TooLarge { size, max } => {
+            MessageTooLargeError::new_err(format!(
+                "message is {size} bytes; slot_size is {max} bytes"
+            ))
+        }
+        Error::Timeout(topic) => {
+            ConnectTimeoutError::new_err(format!("timed out waiting for '{topic}'"))
+        }
+        Error::TooManySubscribers(limit) => {
+            TooManySubscribersError::new_err(format!("subscriber limit for this topic is {limit}"))
+        }
+        Error::AlreadyPublishing(topic) => {
+            AlreadyPublishingError::new_err(format!(
+                "a publisher is already active for topic '{topic}'"
+            ))
+        }
+        Error::Io(e) => PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()),
+    }
+}
+
 // ── Bus ───────────────────────────────────────────────────────────────────────
 
-/// Named pub-sub namespace. One instance can both publish and subscribe.
-///
-/// Parameters
-/// ----------
-/// name : str
-///     Logical bus name — used as a sub-directory under `base_dir`.
-/// base_dir : str, optional
-///     Root directory for ring-buffer files (default: ``/tmp/mmbus``).
-/// capacity : int, optional
-///     Ring-buffer slot count per topic (default: 256).
-/// slot_size : int, optional
-///     Max bytes per message (default: 65536).
-/// max_subscribers : int, optional
-///     Maximum simultaneous subscribers per topic (default: 16).
-///
-/// Examples
-/// --------
-/// >>> bus = Bus("my-app")
-/// >>> bus.publish("events", b"hello")
-/// >>> sub = bus.subscribe("events")
-/// >>> for msg in sub:
-/// ...     print(msg)
-#[pyclass(name = "Bus")]
+/// Low-level Rust-backed Bus.  Prefer the Python ``Bus`` wrapper in
+/// ``mmbus/__init__.py`` which adds async support and context-manager protocol.
+#[pyclass(name = "_RustBus")]
 pub struct PyBus {
     inner: Bus,
 }
@@ -62,25 +72,20 @@ impl PyBus {
         PyBus { inner: Bus::with_config(name, config) }
     }
 
-    /// Publish ``data`` to ``topic``.  Raises ``RuntimeError`` when the ring
-    /// is full (backpressure policy is ``Error``, the default).
+    /// Publish bytes to ``topic``.
+    ///
+    /// Raises :exc:`BusFullError` if the ring is saturated (backpressure
+    /// policy ``Error``, the default).
     fn publish(&mut self, topic: &str, data: &[u8]) -> PyResult<()> {
-        self.inner
-            .publish(topic, data)
-            .map_err(runtime_err)
+        self.inner.publish(topic, data).map_err(mmbus_err)
     }
 
-    /// Subscribe to ``topic``, blocking until the publisher is ready.
-    /// Releases the GIL while waiting so other Python threads can progress.
-    fn subscribe(&self, py: Python<'_>, topic: &str) -> PyResult<PySubscription> {
-        py.allow_threads(|| self.inner.subscribe(topic))
-            .map(|s| PySubscription { inner: s })
-            .map_err(runtime_err)
-    }
-
-    /// Subscribe with a custom timeout in seconds.
+    /// Subscribe to ``topic`` with a custom connection timeout (seconds).
+    /// Releases the GIL while waiting for the publisher.
+    ///
+    /// Raises :exc:`ConnectTimeoutError` if ``timeout_secs`` elapses.
     #[pyo3(signature = (topic, timeout_secs=30.0))]
-    fn subscribe_timeout(
+    fn subscribe(
         &self,
         py: Python<'_>,
         topic: &str,
@@ -89,7 +94,7 @@ impl PyBus {
         let timeout = Duration::from_secs_f64(timeout_secs);
         py.allow_threads(|| self.inner.subscribe_timeout(topic, timeout))
             .map(|s| PySubscription { inner: s })
-            .map_err(runtime_err)
+            .map_err(mmbus_err)
     }
 
     /// Block until ``n`` subscribers are connected to ``topic``.
@@ -104,11 +109,11 @@ impl PyBus {
     ) -> PyResult<()> {
         let timeout = Duration::from_secs_f64(timeout_secs);
         py.allow_threads(|| self.inner.wait_for_subscribers(topic, n, timeout))
-            .map_err(runtime_err)
+            .map_err(mmbus_err)
     }
 
-    /// Return a :class:`TopicStats` snapshot for ``topic``, or ``None`` if no
-    /// publisher has been created for this topic in this Bus instance.
+    /// Return a :class:`TopicStats` snapshot, or ``None`` if no publisher
+    /// exists for this topic in the current process.
     fn stats(&self, topic: &str) -> Option<PyTopicStats> {
         self.inner.stats(topic).map(|s| PyTopicStats {
             tail: s.ring.tail,
@@ -121,17 +126,15 @@ impl PyBus {
 
 // ── Subscription ──────────────────────────────────────────────────────────────
 
-/// Active subscription to a topic.  Iterable — each iteration blocks for the
-/// next message and releases the GIL so other Python threads can run.
+/// Active subscription to a topic.
 ///
-/// Methods
-/// -------
-/// recv() -> bytes
-///     Block until the next message arrives.
-/// recv_timeout(timeout_secs) -> bytes | None
-///     Block up to ``timeout_secs``; return ``None`` on timeout.
-/// try_recv() -> bytes | None
-///     Non-blocking poll; return ``None`` immediately if no message is ready.
+/// Supports both synchronous and context-manager use::
+///
+///     with bus.subscribe("events") as sub:
+///         for msg in sub:
+///             print(msg)
+///
+/// Use :class:`mmbus.AsyncSubscription` for asyncio.
 #[pyclass(name = "Subscription")]
 pub struct PySubscription {
     inner: Subscription,
@@ -139,11 +142,9 @@ pub struct PySubscription {
 
 #[pymethods]
 impl PySubscription {
-    /// Block until the next message arrives.  Releases the GIL.
+    /// Block until the next message.  Releases the GIL.
     fn recv<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let data = py
-            .allow_threads(|| self.inner.recv())
-            .map_err(runtime_err)?;
+        let data = py.allow_threads(|| self.inner.recv()).map_err(mmbus_err)?;
         Ok(PyBytes::new_bound(py, &data))
     }
 
@@ -155,9 +156,8 @@ impl PySubscription {
         timeout_secs: f64,
     ) -> PyResult<Option<Bound<'py, PyBytes>>> {
         let timeout = Duration::from_secs_f64(timeout_secs);
-        let result = py
-            .allow_threads(|| self.inner.recv_timeout(timeout))
-            .map_err(runtime_err)?;
+        let result =
+            py.allow_threads(|| self.inner.recv_timeout(timeout)).map_err(mmbus_err)?;
         Ok(result.map(|data| PyBytes::new_bound(py, &data)))
     }
 
@@ -166,12 +166,24 @@ impl PySubscription {
         self.inner.try_recv().map(|data| PyBytes::new_bound(py, &data))
     }
 
+    /// How many messages this subscriber is behind the producer.
+    #[getter]
+    fn lag(&self) -> u64 {
+        self.inner.lag()
+    }
+
+    /// Current read cursor position.
+    #[getter]
+    fn cursor(&self) -> u64 {
+        self.inner.cursor()
+    }
+
+    // ── Iterator protocol ────────────────────────────────────────────────────
+
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
 
-    /// Iterator protocol — blocks for the next message, releases GIL.
-    /// Raises ``StopIteration`` when the publisher disconnects.
     fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
         match py.allow_threads(|| self.inner.recv()) {
             Ok(data) => Ok(Some(PyBytes::new_bound(py, &data))),
@@ -179,27 +191,34 @@ impl PySubscription {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof
                     || e.kind() == std::io::ErrorKind::ConnectionReset =>
             {
-                Ok(None) // triggers StopIteration
+                Ok(None) // StopIteration
             }
-            Err(e) => Err(runtime_err(e)),
+            Err(e) => Err(mmbus_err(e)),
         }
+    }
+
+    // ── Context-manager protocol ──────────────────────────────────────────────
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
+    fn __exit__(
+        &mut self,
+        _exc_type: Option<&Bound<'_, PyAny>>,
+        _exc_val: Option<&Bound<'_, PyAny>>,
+        _exc_tb: Option<&Bound<'_, PyAny>>,
+    ) -> bool {
+        // Cursor is released when this object is GC'd (Drop for Subscriber).
+        // Return false: do not suppress any exception.
+        false
     }
 }
 
 // ── TopicStats ────────────────────────────────────────────────────────────────
 
-/// Snapshot of a topic's ring-buffer and socket state.
-///
-/// Attributes
-/// ----------
-/// tail : int
-///     Next slot position the producer will write.
-/// active_subscribers : int
-///     Number of claimed subscriber cursor slots.
-/// lags : list[int]
-///     Per-subscriber lag in messages (tail − cursor).
-/// connected_sockets : int
-///     Number of subscriber sockets accepted by this publisher instance.
+/// Ring-buffer and socket snapshot for a topic.
 #[pyclass(name = "TopicStats")]
 #[derive(Clone)]
 pub struct PyTopicStats {
@@ -226,16 +245,17 @@ impl PyTopicStats {
 // ── Module entry point ────────────────────────────────────────────────────────
 
 #[pymodule]
-pub fn _mmbus(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+pub fn _mmbus(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBus>()?;
     m.add_class::<PySubscription>()?;
     m.add_class::<PyTopicStats>()?;
+
+    // Register exception classes so callers can `except mmbus.BusFullError`.
+    m.add("BusFullError", py.get_type_bound::<BusFullError>())?;
+    m.add("MessageTooLargeError", py.get_type_bound::<MessageTooLargeError>())?;
+    m.add("ConnectTimeoutError", py.get_type_bound::<ConnectTimeoutError>())?;
+    m.add("TooManySubscribersError", py.get_type_bound::<TooManySubscribersError>())?;
+    m.add("AlreadyPublishingError", py.get_type_bound::<AlreadyPublishingError>())?;
+
     Ok(())
 }
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn runtime_err(e: Error) -> PyErr {
-    pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
-}
-
