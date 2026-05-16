@@ -1,7 +1,7 @@
-use crate::ring::RingBuffer;
+use crate::ring::{RingBuffer, RingStats};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -27,15 +27,14 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 // ── BackpressurePolicy ────────────────────────────────────────────────────────
 
-/// What the publisher does when the ring buffer is full (slowest subscriber
-/// has not consumed `capacity` messages yet).
+/// What the publisher does when the ring buffer is full.
 #[derive(Clone, Debug, Default)]
 pub enum BackpressurePolicy {
     /// Return `Err(Error::Full)` so the caller decides what to do.
     #[default]
     Error,
     /// Silently drop the oldest unread slot for the slowest subscriber and
-    /// continue writing. The subscriber detects the skip on its next read.
+    /// keep writing. The subscriber detects the skip on its next read.
     DropOldest,
 }
 
@@ -105,8 +104,8 @@ impl Bus {
         Self { name: name.into(), config, publishers: HashMap::new() }
     }
 
-    /// Publish `data` to `topic`. The publisher is created on the first call
-    /// and cached. Returns `Err(Error::Full)` when the ring is saturated.
+    /// Publish `data` to `topic`. Publisher is created on the first call and
+    /// cached. Returns `Err(Error::Full)` when the ring is saturated.
     pub fn publish(&mut self, topic: &str, data: &[u8]) -> Result<()> {
         if !self.publishers.contains_key(topic) {
             let pub_ = Publisher::create(topic, self.topic_config(topic))?;
@@ -139,6 +138,12 @@ impl Bus {
             self.publishers.insert(topic.to_owned(), pub_);
         }
         self.publishers.get_mut(topic).unwrap().wait_for_subscribers(n, timeout)
+    }
+
+    /// Snapshot of ring and socket stats for `topic`.
+    /// Returns `None` if no publisher has been created for `topic` in this Bus.
+    pub fn stats(&self, topic: &str) -> Option<TopicStats> {
+        self.publishers.get(topic).map(|p| p.stats())
     }
 
     fn topic_config(&self, _topic: &str) -> BusConfig {
@@ -188,6 +193,19 @@ impl Iterator for Subscription {
     }
 }
 
+// ── TopicStats ────────────────────────────────────────────────────────────────
+
+/// Snapshot of a topic's ring-buffer and socket state.
+#[derive(Debug, Clone)]
+pub struct TopicStats {
+    /// Ring stats (tail position, active subscriber cursors, per-cursor lags).
+    pub ring: RingStats,
+    /// Number of subscriber sockets currently accepted by the publisher.
+    /// May lag slightly behind `ring.active_subscribers` (cursor is claimed
+    /// before the socket handshake completes).
+    pub connected_sockets: usize,
+}
+
 // ── Publisher ─────────────────────────────────────────────────────────────────
 
 /// Low-level producer handle. Prefer [`Bus::publish`] for most use-cases.
@@ -217,7 +235,7 @@ impl Publisher {
     }
 
     /// Publish a message. Returns `Err(Error::Full)` if the ring is saturated
-    /// (and backpressure policy is `Error`).
+    /// and backpressure policy is `Error`.
     pub fn publish(&mut self, data: &[u8]) -> Result<()> {
         if data.len() > self.ring.slot_payload_size as usize {
             return Err(Error::TooLarge {
@@ -231,6 +249,7 @@ impl Publisher {
             match self.listener.accept() {
                 Ok((stream, _)) => {
                     stream.set_nonblocking(false)?;
+                    suppress_sigpipe(&stream);
                     self.clients.push(stream);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -247,14 +266,12 @@ impl Publisher {
         }
 
         // Broadcast 1-byte wakeup; drop disconnected clients.
-        // TODO: set SO_NOSIGPIPE / MSG_NOSIGNAL to suppress SIGPIPE on disconnect.
-        let wakeup = [0x01u8];
         let mut i = 0;
         while i < self.clients.len() {
-            if self.clients[i].write_all(&wakeup).is_err() {
-                self.clients.swap_remove(i);
-            } else {
+            if send_wakeup(&self.clients[i]) {
                 i += 1;
+            } else {
+                self.clients.swap_remove(i);
             }
         }
 
@@ -269,6 +286,7 @@ impl Publisher {
                 match self.listener.accept() {
                     Ok((stream, _)) => {
                         stream.set_nonblocking(false)?;
+                        suppress_sigpipe(&stream);
                         self.clients.push(stream);
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -283,6 +301,11 @@ impl Publisher {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// Snapshot of ring and socket stats for this topic.
+    pub fn stats(&self) -> TopicStats {
+        TopicStats { ring: self.ring.stats(), connected_sockets: self.clients.len() }
     }
 
     pub fn slot_size(&self) -> u32 {
@@ -322,8 +345,6 @@ impl Subscriber {
         let sock_path = dir.join("signal.sock");
         let deadline = Instant::now() + timeout;
 
-        // Publisher creates the ring file before binding the socket; retry until
-        // both are available.
         let ring = loop {
             match RingBuffer::open(&ring_path) {
                 Ok(r) => break r,
@@ -369,8 +390,8 @@ impl Subscriber {
                 self.cursor = new_cursor;
                 return Ok(out);
             }
-            // Wakeup consumed but ring returned nothing (e.g. force-advanced
-            // slot already consumed). Loop and wait for the next wakeup.
+            // Wakeup consumed but ring has nothing yet (e.g. force-advanced slot
+            // already consumed by a concurrent read). Loop for the next wakeup.
         }
     }
 
@@ -402,7 +423,53 @@ impl Subscriber {
         }
     }
 
+    /// How many messages are currently ahead of this subscriber's read position.
+    pub fn lag(&self) -> u64 {
+        self.ring.current_tail().saturating_sub(self.cursor)
+    }
+
     pub fn cursor(&self) -> u64 {
         self.cursor
     }
+}
+
+// ── Platform helpers ──────────────────────────────────────────────────────────
+
+/// Set SO_NOSIGPIPE (macOS) so writing to a closed socket returns EPIPE
+/// instead of raising SIGPIPE. On Linux we use MSG_NOSIGNAL in send_wakeup.
+fn suppress_sigpipe(_stream: &UnixStream) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            let val: libc::c_int = 1;
+            libc::setsockopt(
+                _stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_NOSIGPIPE,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+}
+
+/// Write the 1-byte wakeup signal to a subscriber socket without triggering
+/// SIGPIPE if the subscriber has disconnected. Returns true on success.
+fn send_wakeup(stream: &UnixStream) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let byte: u8 = 0x01;
+    let ret = unsafe {
+        libc::send(
+            stream.as_raw_fd(),
+            &byte as *const u8 as *const libc::c_void,
+            1,
+            // MSG_NOSIGNAL suppresses SIGPIPE on Linux; macOS uses SO_NOSIGPIPE.
+            #[cfg(target_os = "linux")]
+            libc::MSG_NOSIGNAL,
+            #[cfg(not(target_os = "linux"))]
+            0,
+        )
+    };
+    ret == 1
 }

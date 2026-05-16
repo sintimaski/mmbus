@@ -277,6 +277,7 @@ name = "mmbus"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "libc",
  "memmap2",
  "thiserror",
 ]

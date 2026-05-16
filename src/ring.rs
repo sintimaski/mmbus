@@ -309,4 +309,29 @@ impl RingBuffer {
     pub fn current_tail(&self) -> u64 {
         self.tail_atomic().load(Ordering::Acquire)
     }
+
+    /// Snapshot of the ring's backpressure state.
+    pub fn stats(&self) -> RingStats {
+        let tail = self.tail_atomic().load(Ordering::Acquire);
+        let mut lags = Vec::new();
+        for i in 0..self.max_subscribers as usize {
+            let c = self.cursor_atomic(i).load(Ordering::Acquire);
+            if c != CURSOR_UNCLAIMED {
+                lags.push(tail.saturating_sub(c));
+            }
+        }
+        RingStats { tail, active_subscribers: lags.len(), lags }
+    }
+}
+
+/// Snapshot of ring cursor state for monitoring.
+#[derive(Debug, Clone)]
+pub struct RingStats {
+    /// Next slot the producer will write.
+    pub tail: u64,
+    /// Number of claimed (active) subscriber cursor slots.
+    pub active_subscribers: usize,
+    /// Per-subscriber lag in messages (tail − cursor). One entry per active
+    /// subscriber; order is arbitrary.
+    pub lags: Vec<u64>,
 }

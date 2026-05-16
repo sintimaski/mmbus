@@ -1,5 +1,7 @@
 pub mod ring;
 pub mod bus;
 
-pub use bus::{Bus, BusConfig, Error, Publisher, Subscriber, Subscription};
-pub use ring::RingBuffer;
+pub use bus::{
+    BackpressurePolicy, Bus, BusConfig, Error, Publisher, Subscriber, Subscription, TopicStats,
+};
+pub use ring::{RingBuffer, RingStats};
