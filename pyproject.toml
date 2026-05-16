@@ -1,0 +1,22 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "mmbus"
+version = "0.1.0"
+description = "Zero-copy pub/sub over mmap — Python bindings"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Software Development :: Libraries",
+    "Operating System :: POSIX",
+]
+
+[tool.maturin]
+# Build the Rust extension as the private mmbus._mmbus sub-module.
+# python/mmbus/__init__.py re-exports the public API.
+features = ["python"]
+module-name = "mmbus._mmbus"
+python-source = "python"

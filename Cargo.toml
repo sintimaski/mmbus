@@ -4,10 +4,19 @@ version = "0.1.0"
 edition = "2021"
 description = "Zero-copy pub/sub over mmap for local IPC"
 
+[lib]
+name = "mmbus"
+# cdylib = Python extension (.so); rlib = Rust dependency
+crate-type = ["cdylib", "rlib"]
+
+[features]
+python = ["pyo3"]
+
 [dependencies]
 memmap2 = "0.9"
 thiserror = "1"
 libc = "0.2"
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
