@@ -1,4 +1,4 @@
-use mmbus::{BusConfig, Publisher, Subscriber};
+use mmbus::{BusConfig, Error, Publisher, Subscriber};
 use std::time::Duration;
 
 fn make_cfg(name: &str) -> BusConfig {
@@ -161,6 +161,124 @@ fn wrap_around_correctness() {
     assert_eq!(received.len(), n);
     for (i, msg) in received.iter().enumerate() {
         assert_eq!(msg.as_slice(), format!("{i:03}").as_bytes(), "slot {i}");
+    }
+    cleanup(&cfg);
+}
+
+#[test]
+fn too_large_returns_error() {
+    let cfg = make_cfg("toolarge");
+    cleanup(&cfg);
+    let mut pub_ = Publisher::create("bus", cfg.clone()).unwrap();
+
+    let oversized = vec![0u8; cfg.slot_size as usize + 1];
+    match pub_.publish(&oversized) {
+        Err(Error::TooLarge { size, max }) => {
+            assert_eq!(size, cfg.slot_size as usize + 1);
+            assert_eq!(max, cfg.slot_size as usize);
+        }
+        other => panic!("expected TooLarge, got {other:?}"),
+    }
+    cleanup(&cfg);
+}
+
+#[test]
+fn late_subscriber_starts_at_current_tail() {
+    // Publish N messages before any subscriber connects; subscriber should
+    // see cursor = N and not receive any of those old messages.
+    let cfg = make_cfg("latesub");
+    cleanup(&cfg);
+    let n = 5usize;
+
+    let mut pub_ = Publisher::create("bus", cfg.clone()).unwrap();
+    for i in 0..n {
+        pub_.publish(format!("old-{i}").as_bytes()).unwrap();
+    }
+
+    // Subscriber connects after messages are already published.
+    let cfg_sub = cfg.clone();
+    let consumer = std::thread::spawn(move || {
+        let mut sub = Subscriber::connect("bus", &cfg_sub, Duration::from_secs(5)).unwrap();
+        let starting_cursor = sub.cursor();
+        // Receive one new message published after connect.
+        let msg = sub.receive().unwrap();
+        (starting_cursor, msg)
+    });
+
+    pub_.wait_for_subscribers(1, Duration::from_secs(5)).unwrap();
+    pub_.publish(b"new").unwrap();
+
+    let (starting_cursor, msg) = consumer.join().unwrap();
+    assert_eq!(starting_cursor, n as u64, "cursor should skip old messages");
+    assert_eq!(msg, b"new");
+    cleanup(&cfg);
+}
+
+#[test]
+fn try_receive_nonblocking() {
+    let cfg = make_cfg("tryrecv");
+    cleanup(&cfg);
+
+    let cfg_sub = cfg.clone();
+    let consumer = std::thread::spawn(move || {
+        let mut sub = Subscriber::connect("bus", &cfg_sub, Duration::from_secs(5)).unwrap();
+        // Poll until a message arrives.
+        loop {
+            if let Some(msg) = sub.try_receive() {
+                return msg;
+            }
+            std::hint::spin_loop();
+        }
+    });
+
+    let mut pub_ = Publisher::create("bus", cfg.clone()).unwrap();
+    pub_.wait_for_subscribers(1, Duration::from_secs(5)).unwrap();
+    pub_.publish(b"nonblocking").unwrap();
+
+    assert_eq!(consumer.join().unwrap(), b"nonblocking");
+    cleanup(&cfg);
+}
+
+#[test]
+fn stress_content_integrity() {
+    // High-concurrency run: verify every message arrives with correct byte content.
+    // Uses 10K messages with a u64 sequence number in the first 8 bytes.
+    // Catches any atomicity bugs or slot corruption under concurrent load.
+    let cfg = BusConfig {
+        capacity: 64,
+        slot_size: 16,
+        base_dir: std::env::temp_dir().join("mmbus_tests").join("stress"),
+    };
+    cleanup(&cfg);
+    let n = 10_000usize;
+
+    let cfg_sub = cfg.clone();
+    let consumer = std::thread::spawn(move || {
+        let mut sub = Subscriber::connect("bus", &cfg_sub, Duration::from_secs(10)).unwrap();
+        (0..n).map(|_| {
+            let bytes = sub.receive().unwrap();
+            assert_eq!(bytes.len(), 8, "unexpected message length");
+            u64::from_le_bytes(bytes.try_into().unwrap())
+        }).collect::<Vec<u64>>()
+    });
+
+    let mut pub_ = Publisher::create("bus", cfg.clone()).unwrap();
+    pub_.wait_for_subscribers(1, Duration::from_secs(5)).unwrap();
+    for i in 0..n as u64 {
+        let payload = i.to_le_bytes();
+        loop {
+            match pub_.publish(&payload) {
+                Ok(()) => break,
+                Err(Error::Full) => std::hint::spin_loop(),
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
+
+    let received = consumer.join().unwrap();
+    assert_eq!(received.len(), n);
+    for (i, &val) in received.iter().enumerate() {
+        assert_eq!(val, i as u64, "content mismatch at position {i}: got {val}");
     }
     cleanup(&cfg);
 }

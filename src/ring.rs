@@ -5,8 +5,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // Magic = "mmbus" (5 bytes) packed into u64 high bits + version 1 in low byte.
-pub(crate) const MAGIC: u64 = 0x6D6D_6275_7300_0001;
-pub(crate) const HEADER_SIZE: usize = 64; // one cache line
+pub const MAGIC: u64 = 0x6D6D_6275_7300_0001;
+pub const HEADER_SIZE: usize = 64; // one cache line
 
 // Header field offsets (bytes from mmap start).
 const OFF_MAGIC: usize = 0;    // u64
@@ -22,7 +22,7 @@ const OFF_TAIL: usize = 40; // AtomicU64 — producer cursor (aligned to 8)
 //   [0..4]  : u32 payload length (little-endian)
 //   [4..4+slot_payload_size]: payload bytes
 
-pub(crate) struct RingBuffer {
+pub struct RingBuffer {
     // UnsafeCell enables write-through raw pointers from &self, which we need
     // because publisher and subscriber each hold their own MmapMut handle to
     // the same shared file. Atomic operations provide the actual synchronization.
