@@ -178,6 +178,12 @@ impl PySubscription {
         self.inner.cursor()
     }
 
+    /// The underlying wakeup fd (eventfd on Linux, socket on macOS).
+    /// Pass to ``asyncio.get_event_loop().add_reader()`` for zero-thread async.
+    fn fileno(&self) -> i32 {
+        self.inner.fileno()
+    }
+
     // ── Iterator protocol ────────────────────────────────────────────────────
 
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {

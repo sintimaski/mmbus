@@ -1,0 +1,55 @@
+services:
+
+  # Run Rust tests + Python eventfd smoke test inside a single Linux container.
+  test:
+    build:
+      context: .
+      target: test
+    volumes:
+      # Live-mount source so you can iterate without rebuilding the image.
+      - .:/app
+    environment:
+      - RUST_BACKTRACE=1
+
+  # Two-container cross-process test: publisher and subscriber on shared tmpfs.
+  publisher:
+    build:
+      context: .
+      target: builder
+    volumes:
+      - mmbus-ipc:/tmp/mmbus
+    command: >
+      .venv/bin/python3 -c "
+      import mmbus, time, sys
+      bus = mmbus.Bus('cross-proc')
+      print('publisher: waiting for subscriber...')
+      bus.wait_for_subscribers('events', n=1, timeout_secs=30.0)
+      for i in range(5):
+          bus.publish('events', f'msg-{i}'.encode())
+          print(f'publisher: sent msg-{i}')
+          time.sleep(0.1)
+      print('publisher: done')
+      "
+    profiles: [cross-proc]
+
+  subscriber:
+    build:
+      context: .
+      target: builder
+    volumes:
+      - mmbus-ipc:/tmp/mmbus
+    command: >
+      .venv/bin/python3 -c "
+      import mmbus
+      bus = mmbus.Bus('cross-proc')
+      print('subscriber: connecting...')
+      sub = bus.subscribe('events', timeout_secs=30.0)
+      for msg in sub:
+          print(f'subscriber: received {msg}')
+      "
+    profiles: [cross-proc]
+    depends_on:
+      - publisher
+
+volumes:
+  mmbus-ipc:

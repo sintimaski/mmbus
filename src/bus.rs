@@ -2,11 +2,15 @@ use crate::ring::{RingBuffer, RingStats};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
+
+#[cfg(target_os = "linux")]
+use std::os::fd::{FromRawFd, OwnedFd};
 
 // ── Error ─────────────────────────────────────────────────────────────────────
 
@@ -82,7 +86,6 @@ fn acquire_producer_lock(name: &str, dir: &Path) -> Result<ProducerLock> {
     };
 
     // Cross-process exclusive advisory lock (non-blocking).
-    use std::os::unix::io::AsRawFd;
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         IN_PROCESS_LOCKS.lock().unwrap_or_else(|e| e.into_inner()).remove(&path);
         return Err(Error::AlreadyPublishing(name.to_owned()));
@@ -237,6 +240,16 @@ impl Subscription {
     pub fn cursor(&self) -> u64 {
         self.sub.cursor()
     }
+
+    /// The underlying wakeup file descriptor.
+    ///
+    /// On Linux this is the subscriber's `eventfd(2)`; on macOS it is the Unix
+    /// domain socket.  Either way the fd becomes readable when a new message
+    /// is available, so callers can pass it to `asyncio.get_event_loop().add_reader()`
+    /// or any `epoll`/`kqueue`-based poller for truly non-blocking receive.
+    pub fn fileno(&self) -> RawFd {
+        self.sub.fileno()
+    }
 }
 
 impl Iterator for Subscription {
@@ -271,11 +284,35 @@ pub struct TopicStats {
 
 // ── Publisher ─────────────────────────────────────────────────────────────────
 
+/// Per-subscriber connection state held by the publisher.
+struct Client {
+    sock: UnixStream,
+    /// On Linux: the write-end of the subscriber's eventfd, received via
+    /// SCM_RIGHTS.  Used for low-overhead per-message wakeup.
+    #[cfg(target_os = "linux")]
+    efd: OwnedFd,
+}
+
+impl Client {
+    /// Send one wakeup signal to this subscriber.
+    /// Returns false if the subscriber has disconnected.
+    fn wake(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            crate::waker::linux::eventfd_wake(self.efd.as_raw_fd())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            send_wakeup_socket(&self.sock)
+        }
+    }
+}
+
 /// Low-level producer handle. Prefer [`Bus::publish`] for most use-cases.
 pub struct Publisher {
     ring: RingBuffer,
     listener: UnixListener,
-    clients: Vec<UnixStream>,
+    clients: Vec<Client>,
     backpressure: BackpressurePolicy,
     _lock: ProducerLock,
 }
@@ -315,18 +352,7 @@ impl Publisher {
             });
         }
 
-        // Accept any pending new subscriber connections.
-        loop {
-            match self.listener.accept() {
-                Ok((stream, _)) => {
-                    stream.set_nonblocking(false)?;
-                    suppress_sigpipe(&stream);
-                    self.clients.push(stream);
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => return Err(e.into()),
-            }
-        }
+        self.accept_clients()?;
 
         let published = match self.backpressure {
             BackpressurePolicy::Error => self.ring.try_publish(data),
@@ -336,10 +362,10 @@ impl Publisher {
             return Err(Error::Full);
         }
 
-        // Broadcast 1-byte wakeup; drop disconnected clients.
+        // Broadcast one wakeup per connected subscriber; drop disconnected ones.
         let mut i = 0;
         while i < self.clients.len() {
-            if send_wakeup(&self.clients[i]) {
+            if self.clients[i].wake() {
                 i += 1;
             } else {
                 self.clients.swap_remove(i);
@@ -353,17 +379,7 @@ impl Publisher {
     pub fn wait_for_subscribers(&mut self, min_count: usize, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         loop {
-            loop {
-                match self.listener.accept() {
-                    Ok((stream, _)) => {
-                        stream.set_nonblocking(false)?;
-                        suppress_sigpipe(&stream);
-                        self.clients.push(stream);
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => return Err(e.into()),
-                }
-            }
+            self.accept_clients()?;
             if self.clients.len() >= min_count {
                 return Ok(());
             }
@@ -386,6 +402,30 @@ impl Publisher {
     pub fn connected_subscribers(&self) -> usize {
         self.clients.len()
     }
+
+    /// Drain the non-blocking listener and promote new connections to clients.
+    fn accept_clients(&mut self) -> Result<()> {
+        loop {
+            match self.listener.accept() {
+                Ok((sock, _)) => {
+                    sock.set_nonblocking(false)?;
+                    suppress_sigpipe(&sock);
+
+                    #[cfg(target_os = "linux")]
+                    let efd = crate::waker::linux::recv_fd(&sock)?;
+
+                    self.clients.push(Client {
+                        sock,
+                        #[cfg(target_os = "linux")]
+                        efd,
+                    });
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
 }
 
 // ── Subscriber ────────────────────────────────────────────────────────────────
@@ -393,7 +433,10 @@ impl Publisher {
 /// Low-level consumer handle. Prefer [`Bus::subscribe`] for most use-cases.
 pub struct Subscriber {
     ring: RingBuffer,
-    stream: UnixStream,
+    sock: UnixStream,
+    /// On Linux: the subscriber-owned read-end of the eventfd.
+    #[cfg(target_os = "linux")]
+    efd: OwnedFd,
     cursor: u64,
     cursor_idx: usize,
 }
@@ -410,6 +453,9 @@ impl Subscriber {
     /// The cursor is claimed in the ring *before* completing the socket
     /// handshake, so that by the time `Publisher::wait_for_subscribers` returns,
     /// the cursor is already visible to the producer's backpressure check.
+    ///
+    /// On Linux an `eventfd(2)` is created before connecting and its write-end
+    /// is passed to the publisher via `SCM_RIGHTS` over the handshake socket.
     pub fn connect(name: &str, cfg: &BusConfig, timeout: Duration) -> Result<Self> {
         let dir = cfg.base_dir.join(name);
         let ring_path = dir.join("ring.mmap");
@@ -433,7 +479,15 @@ impl Subscriber {
             .claim_cursor(cursor)
             .ok_or_else(|| Error::TooManySubscribers(ring.max_subscribers))?;
 
-        let stream = loop {
+        // On Linux: create the eventfd now so we can pass it during the
+        // socket handshake.
+        #[cfg(target_os = "linux")]
+        let efd = crate::waker::linux::create_eventfd().map_err(|e| {
+            ring.release_cursor(cursor_idx);
+            Error::Io(e)
+        })?;
+
+        let sock = loop {
             match UnixStream::connect(&sock_path) {
                 Ok(s) => break s,
                 Err(_) if Instant::now() < deadline => {
@@ -446,40 +500,60 @@ impl Subscriber {
             }
         };
 
-        Ok(Self { ring, stream, cursor, cursor_idx })
+        // Pass the eventfd write-end to the publisher so it can wake us.
+        #[cfg(target_os = "linux")]
+        if let Err(e) = crate::waker::linux::send_fd(&sock, efd.as_raw_fd()) {
+            ring.release_cursor(cursor_idx);
+            return Err(Error::Io(e));
+        }
+
+        Ok(Self {
+            ring,
+            sock,
+            #[cfg(target_os = "linux")]
+            efd,
+            cursor,
+            cursor_idx,
+        })
     }
 
     /// Block until the next message arrives.
     pub fn receive(&mut self) -> Result<Vec<u8>> {
-        let mut wakeup = [0u8; 1];
         let mut out = Vec::new();
         loop {
-            self.stream.read_exact(&mut wakeup)?;
+            self.wait_wakeup(-1)?; // -1 = wait forever
             if let Some(new_cursor) =
                 self.ring.try_receive(self.cursor_idx, self.cursor, &mut out)
             {
                 self.cursor = new_cursor;
                 return Ok(out);
             }
-            // Wakeup consumed but ring has nothing yet (e.g. force-advanced slot
-            // already consumed by a concurrent read). Loop for the next wakeup.
+            // Wakeup consumed but ring slot not yet visible (e.g. DropOldest
+            // race).  Loop for the next wakeup.
         }
     }
 
     /// Block with a timeout. Returns `Ok(None)` if the timeout elapses.
     pub fn receive_timeout(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>> {
-        self.stream.set_read_timeout(Some(timeout))?;
-        let result = self.receive();
-        let _ = self.stream.set_read_timeout(None);
-        match result {
-            Ok(msg) => Ok(Some(msg)),
-            Err(Error::Io(e))
-                if e.kind() == io::ErrorKind::TimedOut
-                    || e.kind() == io::ErrorKind::WouldBlock =>
-            {
-                Ok(None)
+        let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+        let mut out = Vec::new();
+        loop {
+            match self.wait_wakeup(timeout_ms) {
+                Ok(()) => {}
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    return Ok(None);
+                }
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => Err(e),
+            if let Some(new_cursor) =
+                self.ring.try_receive(self.cursor_idx, self.cursor, &mut out)
+            {
+                self.cursor = new_cursor;
+                return Ok(Some(out));
+            }
         }
     }
 
@@ -502,45 +576,77 @@ impl Subscriber {
     pub fn cursor(&self) -> u64 {
         self.cursor
     }
+
+    /// The underlying wakeup fd: eventfd on Linux, Unix socket on macOS.
+    /// Becomes readable when at least one message is available.
+    pub fn fileno(&self) -> RawFd {
+        #[cfg(target_os = "linux")]
+        {
+            self.efd.as_raw_fd()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.sock.as_raw_fd()
+        }
+    }
+
+    // ── Internal wakeup helpers ───────────────────────────────────────────────
+
+    /// Wait for one wakeup signal.  `timeout_ms = -1` blocks indefinitely.
+    /// On Linux: `poll(2)` on eventfd + socket (disconnect detection).
+    /// On macOS: `read_exact(1)` on the socket (with optional read timeout).
+    fn wait_wakeup(&mut self, timeout_ms: i32) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            crate::waker::linux::poll_wakeup(
+                self.efd.as_raw_fd(),
+                self.sock.as_raw_fd(),
+                timeout_ms,
+            )?;
+            // Drain the eventfd counter (reset to 0) so the next poll blocks.
+            crate::waker::linux::eventfd_drain(self.efd.as_raw_fd())?;
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if timeout_ms < 0 {
+                let mut b = [0u8; 1];
+                self.sock.read_exact(&mut b)
+            } else {
+                let t = Duration::from_millis(timeout_ms as u64);
+                self.sock.set_read_timeout(Some(t))?;
+                let mut b = [0u8; 1];
+                let r = self.sock.read_exact(&mut b);
+                let _ = self.sock.set_read_timeout(None);
+                r
+            }
+        }
+    }
 }
 
 // ── Platform helpers ──────────────────────────────────────────────────────────
 
 /// Set SO_NOSIGPIPE (macOS) so writing to a closed socket returns EPIPE
-/// instead of raising SIGPIPE. On Linux we use MSG_NOSIGNAL in send_wakeup.
+/// instead of raising SIGPIPE. On Linux MSG_NOSIGNAL is used per-send.
 fn suppress_sigpipe(_stream: &UnixStream) {
     #[cfg(target_os = "macos")]
-    {
-        use std::os::unix::io::AsRawFd;
-        unsafe {
-            let val: libc::c_int = 1;
-            libc::setsockopt(
-                _stream.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_NOSIGPIPE,
-                &val as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
+    unsafe {
+        let val: libc::c_int = 1;
+        libc::setsockopt(
+            _stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_NOSIGPIPE,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
     }
 }
 
-/// Write the 1-byte wakeup signal to a subscriber socket without triggering
-/// SIGPIPE if the subscriber has disconnected. Returns true on success.
-fn send_wakeup(stream: &UnixStream) -> bool {
-    use std::os::unix::io::AsRawFd;
+/// Send the 1-byte wakeup signal over a Unix socket (macOS path).
+#[cfg(not(target_os = "linux"))]
+fn send_wakeup_socket(stream: &UnixStream) -> bool {
     let byte: u8 = 0x01;
-    let ret = unsafe {
-        libc::send(
-            stream.as_raw_fd(),
-            &byte as *const u8 as *const libc::c_void,
-            1,
-            // MSG_NOSIGNAL suppresses SIGPIPE on Linux; macOS uses SO_NOSIGPIPE.
-            #[cfg(target_os = "linux")]
-            libc::MSG_NOSIGNAL,
-            #[cfg(not(target_os = "linux"))]
-            0,
-        )
-    };
-    ret == 1
+    unsafe {
+        libc::send(stream.as_raw_fd(), &byte as *const u8 as *const libc::c_void, 1, 0) == 1
+    }
 }
