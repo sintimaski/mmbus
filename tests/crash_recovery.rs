@@ -35,10 +35,7 @@ fn restart_invalidates_existing_subscriber() {
         // Next recv should detect the publisher restart and return EOF.
         match sub.receive() {
             Err(mmbus::Error::Io(e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                ()
-            }
+                if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
             Err(e) => panic!("expected UnexpectedEof, got {e}"),
             Ok(bytes) => panic!("expected EOF, got message {bytes:?}"),
         }
@@ -58,12 +55,10 @@ fn restart_invalidates_existing_subscriber() {
     // NOT truncate (which would SIGBUS the subscriber's mmap); instead it
     // bumps the in-header `generation` counter.
     let mut pub2 = Publisher::create("bus", cfg.clone()).unwrap();
-    pub2.wait_for_subscribers(1, Duration::from_secs(5))
-        .unwrap_or_else(|_| {
-            // Subscriber from pub1 may have already exited via POLLHUP/EOF
-            // before this point — that's a valid path through the protocol
-            // (publisher death is detected before publisher restart).
-        });
+    // Subscriber from pub1 may have already exited via POLLHUP/EOF before
+    // this point — that's a valid path through the protocol (publisher
+    // death is detected before publisher restart).  Either outcome is OK.
+    let _ = pub2.wait_for_subscribers(1, Duration::from_secs(5));
     pub2.publish(b"from-pub2").ok();
 
     sub_thread.join().expect("subscriber thread panicked");

@@ -36,11 +36,7 @@ fn setup_e2e(label: &str, slot_size: u32) -> E2EBench {
     std::thread::spawn(move || {
         let mut sub =
             Subscriber::connect(&label_owned, &cfg_sub, Duration::from_secs(10)).unwrap();
-        loop {
-            let n = match go_rx.recv() {
-                Ok(n) => n,
-                Err(_) => break,
-            };
+        while let Ok(n) = go_rx.recv() {
             for _ in 0..n {
                 sub.receive().unwrap();
             }

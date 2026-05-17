@@ -43,7 +43,15 @@ pub(crate) fn acquire_producer_lock(name: &str, dir: &Path) -> Result<ProducerLo
         }
     }
 
-    let file = match fs::OpenOptions::new().create(true).write(true).open(&path) {
+    // truncate(false): we never write meaningful content to the lock file;
+    // explicitly preserve whatever's there in case a stale lock was left
+    // behind by a crashed publisher (we only need the inode for flock).
+    let file = match fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+    {
         Ok(f) => f,
         Err(e) => {
             IN_PROCESS_LOCKS.lock().unwrap_or_else(|e| e.into_inner()).remove(&path);

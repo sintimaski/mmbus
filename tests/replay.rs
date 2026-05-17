@@ -84,11 +84,10 @@ fn subscribe_with_history_beyond_capacity_is_best_effort() {
         let mut sub = sub_bus.subscribe_with_history("ch", 5 * CAPACITY).unwrap();
         let mut got = Vec::new();
         // Read what's available; bail when nothing arrives for 200 ms.
-        loop {
-            match sub.recv_timeout(Duration::from_millis(200)).unwrap() {
-                Some(bytes) => got.push(u64::from_le_bytes(bytes.try_into().unwrap())),
-                None => break,
-            }
+        while let Some(bytes) =
+            sub.recv_timeout(Duration::from_millis(200)).unwrap()
+        {
+            got.push(u64::from_le_bytes(bytes.try_into().unwrap()));
         }
         got
     });

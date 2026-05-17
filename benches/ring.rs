@@ -53,11 +53,7 @@ fn ring_throughput(c: &mut Criterion) {
         std::thread::spawn(move || {
             let mut cursor = cursor_start;
             let mut buf = Vec::with_capacity(1024);
-            loop {
-                let n = match go_rx.recv() {
-                    Ok(n) => n,
-                    Err(_) => break,
-                };
+            while let Ok(n) = go_rx.recv() {
                 let mut received = 0;
                 while received < n {
                     if let Some(new_cursor) = ring_c.try_receive(cursor_idx, cursor, &mut buf) {

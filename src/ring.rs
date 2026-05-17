@@ -212,9 +212,8 @@ impl RingBuffer {
     /// Claim a free cursor slot, initialising it to `initial_cursor`.
     /// Returns the slot index on success, or `None` if all slots are taken.
     pub fn claim_cursor(&self, initial_cursor: u64) -> Option<usize> {
-        for i in 0..self.max_subscribers as usize {
-            if self
-                .cursor_atomic(i)
+        (0..self.max_subscribers as usize).find(|&i| {
+            self.cursor_atomic(i)
                 .compare_exchange(
                     CURSOR_UNCLAIMED,
                     initial_cursor,
@@ -222,11 +221,7 @@ impl RingBuffer {
                     Ordering::Relaxed,
                 )
                 .is_ok()
-            {
-                return Some(i);
-            }
-        }
-        None
+        })
     }
 
     /// Release a cursor slot (subscriber disconnecting or being dropped).

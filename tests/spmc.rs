@@ -260,8 +260,7 @@ fn too_many_subscribers_returns_error() {
     });
     let cfg2 = cfg.clone();
     let h2 = std::thread::spawn(move || {
-        let sub = Subscriber::connect("bus", &cfg2, Duration::from_secs(5)).unwrap();
-        sub
+        Subscriber::connect("bus", &cfg2, Duration::from_secs(5)).unwrap()
     });
 
     let mut pub_ = Publisher::create("bus", cfg.clone()).unwrap();
