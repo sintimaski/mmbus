@@ -86,7 +86,7 @@ Each task is sized for one or two reviewable commits.
   - Manual: `cargo doc --no-deps` shows the new `mmbus::wal`
     module page.
 - **Idempotency:** Yes — type additions only.
-- **Status:** Todo
+- **Status:** Shipped
 - **Ambiguity:**
   - crc32c vs crc32fast crate — decide in the validation step
     based on a micro-bench at default segment size (target:
@@ -157,7 +157,7 @@ Each task is sized for one or two reviewable commits.
   (intentional, avoids clobbering); `append` is naturally
   appending and not retry-safe (a duplicate append duplicates
   the record).
-- **Status:** Todo
+- **Status:** Shipped
 - **Ambiguity:**
   - Whether to use `pwrite` directly for the append step
     (skips BufWriter's Vec).  Defer to W1-c bench; the BufWriter
@@ -220,7 +220,7 @@ Each task is sized for one or two reviewable commits.
     without yielding the corrupted record.
 - **Idempotency:** Yes — `recover_truncate` is idempotent (a
   re-run on an already-clean file is a no-op).
-- **Status:** Todo
+- **Status:** Shipped
 - **Ambiguity:** None blocking.
 - **Observability:**
   - WARN log on every truncate event with `bytes_dropped`,
@@ -303,7 +303,7 @@ Each task is sized for one or two reviewable commits.
   on a dirty dir it runs `recover_truncate` (also idempotent).
   `append` is naturally appending — re-running publishes records
   twice.
-- **Status:** Todo
+- **Status:** Shipped
 - **Ambiguity:**
   - `bump_generation` semantics: rotate immediately, OR rotate
     on next append?  RFC §6 says "publisher detects fresh
@@ -384,7 +384,7 @@ Each task is sized for one or two reviewable commits.
 - **Idempotency:** `create_or_reuse` is idempotent (per existing
   `producer.lock` + generation bump semantics; WAL recovery is
   also idempotent).  `publish` is not (each call appends).
-- **Status:** Todo
+- **Status:** Shipped
 - **Ambiguity:**
   - Subscriber-visible `WalStats` exposure — surface in
     `TopicStats` so existing observability picks it up
@@ -459,7 +459,7 @@ Each task is sized for one or two reviewable commits.
 - **Idempotency:** `subscribe_from(cursor)` is idempotent — two
   subscribers requesting the same cursor get independent
   replayers + matching streams.
-- **Status:** Todo
+- **Status:** Shipped
 - **Ambiguity:**
   - Replayer rate-limit: should we throttle so a replayer can't
     starve live subscribers?  Lean: no v1 throttle; the WAL
@@ -521,7 +521,7 @@ Each task is sized for one or two reviewable commits.
   - Manual: cross-check the published bench numbers against
     the RFC §15 < 10% gate.
 - **Idempotency:** Yes — tests + benches re-run cleanly.
-- **Status:** Todo
+- **Status:** Shipped
 - **Ambiguity:**
   - Default fsync_policy at flip time — if `batched` shows >
     10% regression, do we ship with `none` as default and a

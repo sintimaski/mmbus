@@ -6,6 +6,60 @@ All notable changes to mmbus are recorded here.  Format follows
 
 ## [Unreleased]
 
+### Added
+
+#### WAL Phase B (opt-in durability)
+
+- `BusConfig::wal` — per-bus write-ahead log.  Opt-in (default
+  `WalConfig::disabled()`); enables `subscribe_from(cursor)` to
+  replay arbitrarily-old cursors from on-disk segments instead of
+  only the in-ring history.
+- `WalConfig::fsync_policy` — `None` (no fsync), `Batched` (background
+  flusher every `fsync_interval` or `fsync_batch_bytes`; default),
+  `Each` (fsync inline per publish).
+- `Publisher` opens the WAL when enabled, aligns the ring's tail
+  with the WAL's pending cursor on restart, and appends every
+  record to the WAL before the ring write.  A failed WAL append
+  returns `Error::Wal` and the ring stays untouched.
+- `Subscriber::connect_with(StartPos::Explicit(c))` consults the
+  WAL when `c` falls behind the ring; transparently feeds records
+  through the existing `receive()` / `try_receive()` /
+  `receive_timeout()` / `poll_recv()` paths and then transitions
+  back to live ring reads.
+- `TopicStats.wal: Option<WalStats>` exposes pending / durable /
+  oldest cursors, active-segment bytes, and segment count.
+- Crash recovery: every `Wal::open` runs `recover_truncate` on
+  every segment so a power-loss-torn tail is dropped before any
+  reader sees it.
+- Retention: oldest segments are deleted once total bytes exceed
+  `retention_bytes` (default 1 GiB); subscribers asking for a
+  retention-evicted cursor get `Error::CursorTooOld { oldest:
+  wal.oldest_cursor }`.
+
+#### Acceptance + perf
+
+- `tests/wal_acceptance.rs` — 7 RFC §15 scenarios across the
+  three fsync policies (crash recovery, cursor monotonicity,
+  retention semantics, durable-cursor invariants per policy,
+  WAL→ring handoff under live publishing).
+- `benches/publish_with_wal.rs` — Criterion bench comparing
+  publish throughput across baseline / `None` / `Batched` / `Each`.
+
+### Bench results (32 B payload, capacity 4096, macOS 25.4 APFS)
+
+| Policy        | ns/publish | Overhead vs baseline |
+|---------------|-----------:|---------------------:|
+| no WAL        |        185 |                    — |
+| `wal=None`    |        275 |                 +49% |
+| `wal=Batched` |        767 |                +315% |
+| `wal=Each`    |  3,700,000 | catastrophic (fsync) |
+
+`Batched` exceeds the planned <10% gate, so the default stays at
+`WalConfig::disabled()`.  Optimisation follow-ups (drop the
+per-publish `SystemTime::now`, reduce mutex contention against the
+flusher thread, lock-free batch) tracked before flipping the
+default.
+
 ## [0.1.0] - first public release
 
 ### Added

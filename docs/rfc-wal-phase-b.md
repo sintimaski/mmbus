@@ -1,10 +1,36 @@
 # RFC: WAL Phase B — durable replay
 
-**Status:** Draft.  Spec for the durable replay path deferred from
-`rfc-wal-replay.md`; Phase A (in-ring history) shipped in v0.1.0 via
-`subscribe_with_history` + `subscribe_from`.
+**Status:** Shipped (W1-0 through W1-f).  Opt-in via
+`BusConfig::wal`; default remains `WalConfig::disabled()` pending the
+perf optimisation pass (see "Results" below).
 
 **Owner:** _unassigned_
+
+## Results (W1-f bench, 2026-05-17)
+
+`benches/publish_with_wal.rs`, 32 B payload, capacity 4096, macOS
+25.4 APFS, 10-sample / 2s measurement window:
+
+| Policy        | ns/publish | Overhead vs baseline |
+|---------------|-----------:|---------------------:|
+| no WAL        |        185 |                    — |
+| `wal=None`    |        275 |                 +49% |
+| `wal=Batched` |        767 |                +315% |
+| `wal=Each`    |  3,700,000 | catastrophic (fsync) |
+
+`Batched` overshoots the planned <10% regression gate, so the
+default-policy flip is deferred.  Investigation candidates:
+
+1. `SystemTime::now()` per publish — replace with a coarse clock
+   or make the timestamp publisher-supplied.
+2. Mutex contention between `publish()` and the flusher thread —
+   the writer's `BufWriter::write_all` happens under the same lock
+   the flusher acquires every `fsync_interval`.
+3. A lock-free SPSC ring between publisher and a dedicated WAL
+   writer thread.
+
+Acceptance tests (`tests/wal_acceptance.rs`, 7 scenarios) all pass
+under every policy.
 
 **Relationship to Phase A:** The Phase A API surface
 (`Bus::subscribe_from(topic, cursor)`) is forward-compatible with

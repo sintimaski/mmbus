@@ -61,3 +61,7 @@ harness = false
 [[bench]]
 name = "e2e"
 harness = false
+
+[[bench]]
+name = "publish_with_wal"
+harness = false
