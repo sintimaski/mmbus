@@ -23,6 +23,12 @@ pub struct Subscriber {
 
     cursor: u64,
     cursor_idx: usize,
+
+    /// Publisher generation at connect time.  If the publisher crashes and a
+    /// new one bumps the generation, the next wakeup observes the mismatch
+    /// and `receive` returns `UnexpectedEof` so the iterator terminates
+    /// instead of reading from a logically-reset ring.
+    generation: u64,
 }
 
 impl Drop for Subscriber {
@@ -94,6 +100,8 @@ impl Subscriber {
             return Err(Error::Io(e));
         }
 
+        let generation = ring.generation();
+
         Ok(Self {
             ring,
             sock,
@@ -101,6 +109,7 @@ impl Subscriber {
             efd,
             cursor,
             cursor_idx,
+            generation,
         })
     }
 
@@ -195,6 +204,12 @@ impl Subscriber {
         if !self.try_drain_wakeup()? {
             return Ok(None);
         }
+        if self.ring.generation() != self.generation {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "publisher restarted (generation changed)",
+            )));
+        }
         Ok(self.try_receive())
     }
 
@@ -255,21 +270,30 @@ impl Subscriber {
             // Drain the eventfd counter (EFD_SEMAPHORE: returns 1, decrements
             // by 1) so the next poll blocks if no further wakeups are pending.
             crate::waker::linux::eventfd_drain(self.efd.as_raw_fd())?;
-            Ok(())
         }
         #[cfg(not(target_os = "linux"))]
         {
             if timeout_ms < 0 {
                 let mut b = [0u8; 1];
-                self.sock.read_exact(&mut b)
+                self.sock.read_exact(&mut b)?;
             } else {
                 let t = Duration::from_millis(timeout_ms as u64);
                 self.sock.set_read_timeout(Some(t))?;
                 let mut b = [0u8; 1];
                 let r = self.sock.read_exact(&mut b);
                 let _ = self.sock.set_read_timeout(None);
-                r
+                r?;
             }
         }
+        // Publisher-restart check: a fresh publisher reused our mmap and
+        // bumped the generation.  Report EOF so the iterator terminates
+        // cleanly instead of reading from the logically-reset ring.
+        if self.ring.generation() != self.generation {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "publisher restarted (generation changed)",
+            ));
+        }
+        Ok(())
     }
 }

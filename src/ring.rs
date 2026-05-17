@@ -1,16 +1,16 @@
 /// Lock-free SPMC ring buffer over a memory-mapped file.
 ///
-/// # Wire format (v2 — SPMC)
+/// # Wire format (v3 — SPMC + generation counter)
 ///
 /// ```text
 /// Bytes 0..64  — fixed header
 ///   0   u64    magic
-///   8   u32    version (= 2)
+///   8   u32    version (= 3)
 ///  12   u32    capacity (slot count)
 ///  16   u32    slot_payload_size (max bytes per message)
 ///  20   u32    max_subscribers
-///  24   u64    _reserved
-///  32   u64    tail  (AtomicU64, producer cursor)
+///  24   u64    generation  (AtomicU64, incremented on publisher restart)
+///  32   u64    tail        (AtomicU64, producer cursor)
 ///  40   u24    _pad to 64-byte cache line
 ///
 /// Bytes 64 .. 64+8*max_subscribers — subscriber cursor table
@@ -35,7 +35,7 @@ use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub const MAGIC: u64 = 0x6D6D_6275_7300_0002; // "mmbus" + format version 2
+pub const MAGIC: u64 = 0x6D6D_6275_7300_0003; // "mmbus" + format version 3
 pub const CURSOR_UNCLAIMED: u64 = u64::MAX;
 pub const MAX_SUBSCRIBERS_DEFAULT: u32 = 16;
 
@@ -44,6 +44,7 @@ const OFF_VERSION: usize = 8;
 const OFF_CAPACITY: usize = 12;
 const OFF_SLOT_SIZE: usize = 16;
 const OFF_MAX_SUBS: usize = 20;
+const OFF_GENERATION: usize = 24; // AtomicU64 — incremented on publisher restart
 const OFF_TAIL: usize = 32; // AtomicU64 — producer cursor
 const OFF_CURSORS: usize = 64; // AtomicU64[max_subscribers]
 
@@ -89,11 +90,13 @@ impl RingBuffer {
 
         unsafe {
             p.add(OFF_MAGIC).cast::<u64>().write_unaligned(MAGIC);
-            p.add(OFF_VERSION).cast::<u32>().write_unaligned(2);
+            p.add(OFF_VERSION).cast::<u32>().write_unaligned(3);
             p.add(OFF_CAPACITY).cast::<u32>().write_unaligned(capacity);
             p.add(OFF_SLOT_SIZE).cast::<u32>().write_unaligned(slot_payload_size);
             p.add(OFF_MAX_SUBS).cast::<u32>().write_unaligned(max_subscribers);
-            // tail starts at 0 (file is zero-initialized)
+            // generation starts at 1 (file is zero-initialized; bump from 0).
+            (*(p.add(OFF_GENERATION) as *mut AtomicU64)).store(1, Ordering::Release);
+            // tail starts at 0 (file is zero-initialized).
         }
 
         // The file is zero-initialized; cursor slots need CURSOR_UNCLAIMED (u64::MAX).
@@ -117,7 +120,7 @@ impl RingBuffer {
         if magic != MAGIC {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("mmbus: unrecognised magic {magic:#018x} (want {MAGIC:#018x}; is this a v1 ring?)"),
+                format!("mmbus: unrecognised magic {magic:#018x} (want {MAGIC:#018x}; is this an older format?)"),
             ));
         }
         let capacity = unsafe { p.add(OFF_CAPACITY).cast::<u32>().read_unaligned() };
@@ -126,6 +129,46 @@ impl RingBuffer {
         let slots_off = slots_offset(max_subscribers);
 
         Ok(Self { inner: UnsafeCell::new(mmap), capacity, slot_payload_size, max_subscribers, slots_off })
+    }
+
+    /// Publisher entry point: reuse an existing compatible ring (bumping its
+    /// `generation`) or create a fresh one.  Reusing avoids `ftruncate(0)`,
+    /// which would otherwise invalidate any existing subscriber's mmap and
+    /// risk SIGBUS — instead, existing subscribers see the bumped generation
+    /// on their next wakeup and shut down cleanly via `Error::Io(UnexpectedEof)`.
+    pub fn create_or_reuse(
+        path: &Path,
+        capacity: u32,
+        slot_payload_size: u32,
+        max_subscribers: u32,
+    ) -> std::io::Result<Self> {
+        // Reuse path: a compatible v3 ring already exists on disk.
+        if let Ok(existing) = Self::open(path) {
+            if existing.capacity == capacity
+                && existing.slot_payload_size == slot_payload_size
+                && existing.max_subscribers == max_subscribers
+            {
+                existing.generation_atomic().fetch_add(1, Ordering::AcqRel);
+                existing.tail_atomic().store(0, Ordering::Release);
+                // Cursors are NOT reset: leaving them claimed forces stale
+                // subscribers to detect the generation bump and self-release
+                // their slots via `Drop`.
+                return Ok(existing);
+            }
+        }
+        // Fresh path: wrong shape, wrong version, or no file.
+        Self::create(path, capacity, slot_payload_size, max_subscribers)
+    }
+
+    /// Current publisher generation.  Bumped each time the same on-disk ring
+    /// is reused by a new `Publisher::create` (i.e. after the previous
+    /// publisher crashed or shut down).
+    pub fn generation(&self) -> u64 {
+        self.generation_atomic().load(Ordering::Acquire)
+    }
+
+    fn generation_atomic(&self) -> &AtomicU64 {
+        unsafe { &*(self.base().add(OFF_GENERATION) as *const AtomicU64) }
     }
 
     fn stride(&self) -> usize {

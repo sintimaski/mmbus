@@ -56,8 +56,15 @@ impl Publisher {
         let _ = fs::remove_file(&sock_path);
 
         let lock = acquire_producer_lock(name, &dir)?;
-        let ring =
-            RingBuffer::create(&ring_path, cfg.capacity, cfg.slot_size, cfg.max_subscribers)?;
+        // create_or_reuse bumps the in-header `generation` if a compatible
+        // file already exists (i.e. a prior publisher crashed) instead of
+        // truncating it, which would SIGBUS any stale subscriber's mmap.
+        let ring = RingBuffer::create_or_reuse(
+            &ring_path,
+            cfg.capacity,
+            cfg.slot_size,
+            cfg.max_subscribers,
+        )?;
         let listener = UnixListener::bind(&sock_path)?;
         listener.set_nonblocking(true)?;
 
