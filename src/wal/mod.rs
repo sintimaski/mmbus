@@ -12,8 +12,10 @@
 
 mod config;
 pub mod record;
+pub mod segment_reader;
 pub mod segment_writer;
 
 pub use config::{FsyncPolicy, WalConfig};
 pub use record::{Record, SegmentHeader, SegmentHeaderError, MAX_PAYLOAD_LEN, SEGMENT_HEADER_LEN};
+pub use segment_reader::{recover_truncate, ReaderError, RecoveryReport, SegmentReader};
 pub use segment_writer::{SegmentWriter, WriterError};
