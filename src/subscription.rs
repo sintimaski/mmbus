@@ -51,10 +51,10 @@ impl Subscription {
         self.sub.fileno()
     }
 
-    /// The handshake socket fd. On Linux this differs from [`fileno`] and
+    /// The handshake socket fd. On Linux this differs from [`Self::fileno`] and
     /// signals **publisher disconnect** via `POLLHUP`. Register both with
     /// the event loop so disconnect is detected even while idle. On macOS
-    /// it equals [`fileno`].
+    /// it equals [`Self::fileno`].
     pub fn socket_fileno(&self) -> RawFd {
         self.sub.socket_fileno()
     }

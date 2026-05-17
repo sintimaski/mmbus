@@ -1,5 +1,9 @@
 //! Typed Python exception classes + Rust `Error` → `PyErr` mapping.
 
+// pyo3 0.22's create_exception! macro emits `#[cfg(feature = "gil-refs")]`
+// gates; that feature isn't ours and never will be — silence the warnings.
+#![allow(unexpected_cfgs)]
+
 use crate::error::Error;
 use pyo3::prelude::*;
 

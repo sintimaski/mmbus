@@ -194,10 +194,10 @@ impl Subscriber {
         }
     }
 
-    /// The handshake socket fd. On Linux this differs from [`fileno`] (the
+    /// The handshake socket fd. On Linux this differs from [`Self::fileno`] (the
     /// eventfd) and signals **disconnect** via `POLLHUP` — register it with
-    /// the event loop alongside [`fileno`] so publisher death is detected
-    /// even while idle. On macOS it equals [`fileno`].
+    /// the event loop alongside [`Self::fileno`] so publisher death is detected
+    /// even while idle. On macOS it equals [`Self::fileno`].
     pub fn socket_fileno(&self) -> RawFd {
         self.sock.as_raw_fd()
     }
