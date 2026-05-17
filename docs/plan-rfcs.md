@@ -44,7 +44,7 @@ Win32 substitute; this plan slices that into review-sized commits.
 |-------|-------|--------|
 | **B0** | New `bridge/` crate (alongside `fuzz/`); binary `mmbus-bridge`; TOML config; wire-frame codec (RFC §3 `Frame` struct) — 20 round-trip + edge-case tests | shipped |
 | **B1** | `Bridge::start(config)` spawns one subscriber thread per forward-enabled topic + one TCP forwarder thread per peer.  Forwarders connect with exponential backoff, send `PeerHello` on connect, pump frames from an mpsc channel.  Integration test in `tests/forward_smoke.rs` drives the full chain (mmbus publish → bridge → TcpListener decode) | shipped |
-| **B2** | Receive frames from peer, dedupe by `origin_id`, republish locally | next |
+| **B2** | New `listen = "host:port"` config field.  Bridge binds a `TcpListener` (when set), accepts connections, spawns a per-connection reader thread that decodes the frame stream, drops self-originated frames (loop prevention via `origin_id`), and forwards `Msg` frames in receive-listed topics to a single publisher thread that calls `Bus::publish`.  Integration test in `tests/receive_smoke.rs` drives the full chain (test peer → TCP → bridge → local mmbus subscribe) and asserts the loop-prevention drop | shipped |
 | **B3** | Mesh of N peers; per-peer ring buffer; drop-oldest on overflow | |
 | **B4** | QUIC transport (quinn) behind a feature flag; preshared-key auth | |
 | **B5** | Python helper `mmbus.bridge.start(config_path)`; systemd unit | |

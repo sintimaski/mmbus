@@ -39,6 +39,13 @@ pub struct BridgeConfig {
     #[serde(default)]
     pub origin_id: Option<u64>,
 
+    /// Address to bind for incoming peer connections (e.g.
+    /// `"0.0.0.0:4443"`).  When `None`, the bridge runs forward-only:
+    /// it dials configured peers but doesn't accept any.  Set this on
+    /// any bridge that should receive from at least one other peer.
+    #[serde(default)]
+    pub listen: Option<String>,
+
     /// Topics this bridge forwards out / accepts in.  Order is
     /// preserved; duplicate names are not deduplicated (the bridge
     /// loops over the list and a duplicate is wasted work, not a bug).
@@ -154,6 +161,18 @@ mod tests {
         assert!(cfg.peers.is_empty());
         assert_eq!(cfg.base_dir, None);
         assert_eq!(cfg.origin_id, None);
+    }
+
+    #[test]
+    fn parses_listen_field() {
+        let cfg = BridgeConfig::from_str(
+            r#"
+                bus = "demo"
+                listen = "0.0.0.0:4443"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.listen.as_deref(), Some("0.0.0.0:4443"));
     }
 
     #[test]

@@ -1,13 +1,20 @@
-//! The runtime that ties config + mmbus + TCP forwarders together.
+//! The runtime that ties config + mmbus + TCP transports together.
 //!
-//! Threading model (B1, single peer; B3 will generalise to N):
+//! Threading model (B2 — forward + receive, single-peer per direction;
+//! B3 generalises to N-peer mesh):
 //!
 //! ```text
-//!   mmbus topic T  ──[Subscription::recv]──►  subscriber thread
-//!                                              encodes Frame
-//!                                              fan-outs cloned bytes
-//!                                                ├──► peer-1 forwarder thread ──► TCP
-//!                                                └──► peer-N forwarder thread ──► TCP
+//!   forward path:
+//!     mmbus topic T  ──[Subscription::recv]──►  subscriber thread
+//!                                                encodes Frame
+//!                                                fan-outs cloned bytes
+//!                                                  ├──► peer-1 forwarder ──► TCP out
+//!                                                  └──► peer-N forwarder ──► TCP out
+//!
+//!   receive path (only spawned when config.listen is set):
+//!                            ┌──► reader thread ──┐
+//!     TCP in ──► listener ──►│         …          │──► publisher thread ──► Bus::publish
+//!                            └──► reader thread ──┘
 //! ```
 //!
 //! Each forwarder owns its `TcpStream`, reconnects with backoff on
@@ -15,12 +22,19 @@
 //! owns the local mmbus `Subscription` and serialises one `Frame` per
 //! published message into bytes, then `clone()`s the bytes once per
 //! peer for delivery.  No per-message allocation beyond that.
+//!
+//! On the receive side, the single publisher thread is the only one
+//! that holds an `&mut Bus` for publish (acquire_producer_lock is
+//! per-process; sharing the publish duty across threads would deadlock
+//! the second one with `AlreadyPublishing`).  Reader threads funnel
+//! `(topic, payload)` pairs to it via an mpsc channel.
 
 use crate::config::BridgeConfig;
-use crate::frame::Frame;
+use crate::frame::{decode, DecodeError, Frame, FrameType};
 use mmbus::{Bus, BusConfig};
-use std::io::Write;
-use std::net::TcpStream;
+use std::collections::HashSet;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
@@ -32,6 +46,11 @@ pub struct Bridge {
     /// `origin_id` this bridge stamps into outbound frames (loop prevention).
     pub origin_id: u64,
 
+    /// Address the listener bound to, if any.  When [`BridgeConfig::listen`]
+    /// is `"0.0.0.0:0"` this is the resolved ephemeral port — tests use it
+    /// to find the bridge.
+    pub listen_addr: Option<std::net::SocketAddr>,
+
     shutdown: Arc<AtomicBool>,
 
     /// Subscriber threads (one per configured forward-enabled topic).
@@ -40,11 +59,22 @@ pub struct Bridge {
     /// Forwarder threads (one per configured peer).
     fwd_threads: Vec<JoinHandle<()>>,
 
+    /// Listener thread, plus one reader per accepted connection.  All
+    /// joined on shutdown.
+    rx_threads: Vec<JoinHandle<()>>,
+
+    /// The single publisher thread that owns the receive-side mmbus
+    /// publisher.  Joined on shutdown.
+    publish_thread: Option<JoinHandle<()>>,
+
     /// Senders for the bridge to fan a frame's encoded bytes out to all
-    /// peer forwarders.  Kept here to hand a fresh clone to each new
-    /// subscriber thread (in B3 we may rotate this list under config
-    /// reload; for B1 it's set-once-at-start).
+    /// peer forwarders.
     peer_tx: Vec<mpsc::Sender<Vec<u8>>>,
+
+    /// Sender for the receive path; cloned to each reader thread so
+    /// they can forward decoded Msg frames to the publisher.  `None`
+    /// when no listener is configured.
+    publish_tx: Option<mpsc::Sender<(String, Vec<u8>)>>,
 }
 
 impl Bridge {
@@ -100,7 +130,76 @@ impl Bridge {
             }));
         }
 
-        Ok(Self { origin_id, shutdown, sub_threads, fwd_threads, peer_tx })
+        // Receive side — only if config.listen is set.  Spawn one
+        // publisher thread that owns the &mut Bus (the in-process
+        // producer-lock means there can be only one publisher per
+        // (process, topic), so we centralise all incoming traffic into
+        // a single mmbus publisher).  Spawn one listener thread that
+        // accepts incoming connections and spins up a reader per accept.
+        let (rx_threads, publish_thread, publish_tx, listen_addr) =
+            if let Some(listen_str) = &cfg.listen {
+                let receive_topics: HashSet<String> = cfg
+                    .topics
+                    .iter()
+                    .filter(|t| t.receive)
+                    .map(|t| t.name.clone())
+                    .collect();
+                let (ptx, prx) = mpsc::channel::<(String, Vec<u8>)>();
+                let publish_shutdown = shutdown.clone();
+                // Publisher thread.  Owns a fresh mut Bus (cloning
+                // Arc<Bus> wouldn't give us &mut access).
+                let publisher_bus_cfg = bus_config(cfg);
+                let publisher_bus_name = cfg.bus.clone();
+                let publish_handle = thread::spawn(move || {
+                    publisher_main(
+                        publisher_bus_name,
+                        publisher_bus_cfg,
+                        prx,
+                        publish_shutdown,
+                    );
+                });
+
+                let listener = TcpListener::bind(listen_str.as_str())
+                    .map_err(BridgeError::Listen)?;
+                listener
+                    .set_nonblocking(true)
+                    .map_err(BridgeError::Listen)?;
+                let resolved = listener
+                    .local_addr()
+                    .map_err(BridgeError::Listen)?;
+
+                let listener_shutdown = shutdown.clone();
+                let listener_ptx = ptx.clone();
+                let receive_topics_arc = Arc::new(receive_topics);
+                let listen_handle = thread::spawn(move || {
+                    listener_main(
+                        listener,
+                        origin_id,
+                        receive_topics_arc,
+                        listener_ptx,
+                        listener_shutdown,
+                    );
+                });
+                // listener_main itself spawns per-connection readers;
+                // they're tracked inside the listener loop but we just
+                // join the listener at the end (which joins them all
+                // before returning).
+                (vec![listen_handle], Some(publish_handle), Some(ptx), Some(resolved))
+            } else {
+                (Vec::new(), None, None, None)
+            };
+
+        Ok(Self {
+            origin_id,
+            listen_addr,
+            shutdown,
+            sub_threads,
+            fwd_threads,
+            rx_threads,
+            publish_thread,
+            peer_tx,
+            publish_tx,
+        })
     }
 
     /// Signal all threads to stop, then join them.  Idempotent — calling
@@ -111,13 +210,21 @@ impl Bridge {
 
     fn shutdown_inner(&mut self) {
         self.shutdown.store(true, Ordering::Release);
-        // Dropping all senders signals the forwarders that no more
-        // frames are coming (their rx will return Disconnected).
+        // Dropping all senders signals the forwarders / publisher that
+        // no more frames are coming (their rx will return Disconnected
+        // on the next recv).
         self.peer_tx.clear();
+        self.publish_tx = None;
         for h in self.sub_threads.drain(..) {
             let _ = h.join();
         }
         for h in self.fwd_threads.drain(..) {
+            let _ = h.join();
+        }
+        for h in self.rx_threads.drain(..) {
+            let _ = h.join();
+        }
+        if let Some(h) = self.publish_thread.take() {
             let _ = h.join();
         }
     }
@@ -135,16 +242,23 @@ impl Drop for Bridge {
 pub enum BridgeError {
     #[error("mmbus error: {0}")]
     Mmbus(#[from] mmbus::Error),
+
+    #[error("failed to bind listen socket: {0}")]
+    Listen(std::io::Error),
 }
 
 // ── Implementation details ────────────────────────────────────────────────────
 
 fn build_bus(cfg: &BridgeConfig) -> Arc<Bus> {
+    Arc::new(Bus::with_config(cfg.bus.clone(), bus_config(cfg)))
+}
+
+fn bus_config(cfg: &BridgeConfig) -> BusConfig {
     let mut bcfg = BusConfig::default();
     if let Some(dir) = &cfg.base_dir {
         bcfg.base_dir = dir.clone();
     }
-    Arc::new(Bus::with_config(cfg.bus.clone(), bcfg))
+    bcfg
 }
 
 /// Subscriber thread body: read from the local mmbus topic, encode each
@@ -286,6 +400,174 @@ fn sleep_interruptible(total: Duration, shutdown: &AtomicBool) {
         let chunk = left.min(step);
         thread::sleep(chunk);
         left = left.saturating_sub(chunk);
+    }
+}
+
+/// Listener thread body: accept incoming peer connections; each accept
+/// spawns one reader thread.  Exits when shutdown is set; joins all
+/// reader threads on exit so the parent join is sufficient to wait
+/// for the whole receive-side fan-in to drain.
+fn listener_main(
+    listener: TcpListener,
+    our_origin_id: u64,
+    receive_topics: Arc<HashSet<String>>,
+    publish_tx: mpsc::Sender<(String, Vec<u8>)>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let mut readers: Vec<JoinHandle<()>> = Vec::new();
+    while !shutdown.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((stream, addr)) => {
+                eprintln!("bridge: accepted peer from {addr}");
+                if let Err(e) = stream.set_nonblocking(false) {
+                    eprintln!("bridge: set_nonblocking failed: {e}");
+                    continue;
+                }
+                if let Err(e) = stream
+                    .set_read_timeout(Some(Duration::from_millis(200)))
+                {
+                    eprintln!("bridge: set_read_timeout failed: {e}");
+                    continue;
+                }
+                let topics = receive_topics.clone();
+                let tx = publish_tx.clone();
+                let sd = shutdown.clone();
+                readers.push(thread::spawn(move || {
+                    reader_main(stream, our_origin_id, topics, tx, sd);
+                }));
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                eprintln!("bridge: accept failed: {e}; stopping listener");
+                break;
+            }
+        }
+    }
+    // Join all reader threads so a caller awaiting `bridge.shutdown()`
+    // is guaranteed they've all drained.
+    for h in readers {
+        let _ = h.join();
+    }
+}
+
+/// Per-accepted-connection reader: decode the frame stream, drop our
+/// own (loop prevention), and forward Msg frames whose topic is in
+/// the receive set to the publisher.
+fn reader_main(
+    mut stream: TcpStream,
+    our_origin_id: u64,
+    receive_topics: Arc<HashSet<String>>,
+    publish_tx: mpsc::Sender<(String, Vec<u8>)>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let mut tmp = [0u8; 4 * 1024];
+    while !shutdown.load(Ordering::Acquire) {
+        // Refill from the socket; the 200 ms read timeout makes this
+        // loop check the shutdown flag periodically even when the peer
+        // is quiet.
+        match stream.read(&mut tmp) {
+            Ok(0) => {
+                eprintln!("bridge: peer closed cleanly");
+                return;
+            }
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(e) => {
+                eprintln!("bridge: peer read failed: {e}");
+                return;
+            }
+        }
+
+        // Decode every complete frame currently in buf.
+        loop {
+            match decode(&buf) {
+                Ok((frame, n)) => {
+                    handle_frame(&frame, our_origin_id, &receive_topics, &publish_tx);
+                    buf.drain(..n);
+                }
+                Err(DecodeError::Incomplete { .. }) => break, // wait for more bytes
+                Err(e) => {
+                    eprintln!("bridge: protocol error from peer: {e}; closing");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn handle_frame(
+    frame: &Frame,
+    our_origin_id: u64,
+    receive_topics: &HashSet<String>,
+    publish_tx: &mpsc::Sender<(String, Vec<u8>)>,
+) {
+    // Loop prevention: never re-publish a frame we originated.
+    if frame.origin_id == our_origin_id {
+        return;
+    }
+    match frame.frame_type {
+        FrameType::Msg => {
+            // Reject non-UTF-8 topics (mmbus topic names are strings).
+            let topic = match std::str::from_utf8(&frame.topic) {
+                Ok(t) => t,
+                Err(_) => {
+                    eprintln!("bridge: dropping Msg with non-UTF-8 topic");
+                    return;
+                }
+            };
+            if receive_topics.contains(topic) {
+                // Clone the payload to hand ownership to the publisher
+                // thread; `frame` itself is borrowed.
+                let _ = publish_tx
+                    .send((topic.to_string(), frame.payload.clone()));
+            }
+        }
+        FrameType::PeerHello => {
+            eprintln!("bridge: received peer-hello origin_id={}", frame.origin_id);
+        }
+        FrameType::Ping => {
+            // B2 doesn't yet respond; pings are silently absorbed.
+        }
+        FrameType::TopicSubscribe => {
+            // B3 will use this to register peer interest in additional
+            // topics.  For now, ignore.
+        }
+    }
+}
+
+/// Publisher thread body: owns the mut Bus + drains the publish
+/// channel, calling `Bus::publish` for each (topic, payload).
+fn publisher_main(
+    bus_name: String,
+    bus_cfg: BusConfig,
+    rx: mpsc::Receiver<(String, Vec<u8>)>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let mut bus = Bus::with_config(bus_name, bus_cfg);
+    while !shutdown.load(Ordering::Acquire) {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok((topic, payload)) => {
+                if let Err(e) = bus.publish(&topic, &payload) {
+                    eprintln!(
+                        "bridge: republish failed (topic={topic:?}, {} bytes): {e}",
+                        payload.len()
+                    );
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
     }
 }
 
