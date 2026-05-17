@@ -277,6 +277,7 @@ the threat model and how to report issues.
 - [`docs/roadmap.md`](docs/roadmap.md) — development phases
 - [`docs/rfc-wal-replay.md`](docs/rfc-wal-replay.md) — Phase A (in-ring history, shipped)
 - [`docs/rfc-wal-phase-b.md`](docs/rfc-wal-phase-b.md) — Phase B (durable WAL) full spec
+- [`docs/plan-wal-phase-b.md`](docs/plan-wal-phase-b.md) — Phase B implementation plan (W1-0 thru W1-f)
 - [`docs/rfc-multi-machine.md`](docs/rfc-multi-machine.md) — design for the `mmbus-bridge` relay
 - [`docs/rfc-b4b-quic.md`](docs/rfc-b4b-quic.md) — bridge B4b QUIC transport spec
 - [`docs/rfc-windows.md`](docs/rfc-windows.md) — design for Windows support

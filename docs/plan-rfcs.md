@@ -61,6 +61,11 @@ on-disk format (length-prefixed records, per-record CRC32C, segment
 headers), three fsync policies (none / batched / each), rotation
 (size-based, 64 MiB segments), retention (size-based, 1 GiB default),
 in-memory index, ring↔WAL handoff race, crash recovery via
-truncate-on-CRC-mismatch.  Implementation breaks into five staged
-PRs (W1a..W1e); each builds on the previous and ships green
-independently.
+truncate-on-CRC-mismatch.
+
+Implementation plan with full task template:
+[`plan-wal-phase-b.md`](plan-wal-phase-b.md).  Seven mostly-linear
+tasks (W1-0 scaffold → W1-a writer → W1-b reader → W1-c Wal →
+W1-d Publisher → W1-e Subscriber → W1-f acceptance + bench), each
+filled with acceptance criteria, dependencies, validation
+commands, and rollback story.
