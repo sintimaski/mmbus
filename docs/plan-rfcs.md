@@ -46,8 +46,8 @@ Win32 substitute; this plan slices that into review-sized commits.
 | **B1** | `Bridge::start(config)` spawns one subscriber thread per forward-enabled topic + one TCP forwarder thread per peer.  Forwarders connect with exponential backoff, send `PeerHello` on connect, pump frames from an mpsc channel.  Integration test in `tests/forward_smoke.rs` drives the full chain (mmbus publish → bridge → TcpListener decode) | shipped |
 | **B2** | New `listen = "host:port"` config field.  Bridge binds a `TcpListener` (when set), accepts connections, spawns a per-connection reader thread that decodes the frame stream, drops self-originated frames (loop prevention via `origin_id`), and forwards `Msg` frames in receive-listed topics to a single publisher thread that calls `Bus::publish`.  Integration test in `tests/receive_smoke.rs` drives the full chain (test peer → TCP → bridge → local mmbus subscribe) and asserts the loop-prevention drop | shipped |
 | **B3** | New `queue` module: SPMC bounded drop-oldest queue (Mutex+Condvar, returns evicted count from `send`).  Per-peer `queue::channel(cfg.peer_buffer_max)` replaces `std::sync::mpsc` so a slow/disconnected peer can't stall the publisher; default cap 4096 messages per peer, overridable.  Mesh integration test in `tests/mesh_smoke.rs` configures 2 peers and asserts both receive the same hello + 4 Msg frames in order | shipped |
-| **B4** | QUIC transport (quinn) behind a feature flag; preshared-key auth | |
-| **B5** | Python helper `mmbus.bridge.start(config_path)`; systemd unit | |
+| **B4** | QUIC transport (quinn) behind a feature flag; preshared-key auth | open |
+| **B5** | `python/mmbus/bridge.py` (subprocess wrapper: `run` foreground, `spawn` background, `BridgeNotFoundError` on missing binary) + `bridge/systemd/mmbus-bridge.service` template with sane hardening defaults; smoke covers the module import + error path | shipped |
 
 The bridge crate is a standalone workspace (its `Cargo.toml` has an
 empty `[workspace]` block) so the parent `cargo test` does not pull

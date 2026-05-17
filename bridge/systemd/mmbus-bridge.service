@@ -1,0 +1,64 @@
+# mmbus-bridge systemd unit template.
+#
+# Install:
+#   1. cargo install --path /path/to/mmbus/bridge
+#      (binary lands at $HOME/.cargo/bin/mmbus-bridge for the build
+#      user; copy to /usr/local/bin for the service account.)
+#   2. cp mmbus-bridge.service /etc/systemd/system/
+#   3. Edit ExecStart + User + the WorkingDirectory below to point at
+#      your config file and the user the bridge should run as.
+#   4. systemctl daemon-reload
+#      systemctl enable --now mmbus-bridge.service
+#
+# The bridge process opens local IPC files under BusConfig.base_dir
+# (which is overridable in the bridge config TOML).  Ensure the service
+# User has read+write access to that directory.
+
+[Unit]
+Description=mmbus cross-machine relay
+Documentation=https://github.com/OWNER/mmbus/blob/main/docs/rfc-multi-machine.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Replace `mmbus` with whatever local user should own the bridge's
+# IPC files; the bridge talks to local apps through shared-memory
+# files in BusConfig.base_dir, so all of (local apps, bridge) must
+# run as compatible users (same uid OR shared group with rwx).
+User=mmbus
+Group=mmbus
+WorkingDirectory=/var/lib/mmbus
+
+# Edit the config path to point at your deployment.  The binary takes
+# exactly one positional argument.
+ExecStart=/usr/local/bin/mmbus-bridge /etc/mmbus/bridge.toml
+
+# Restart on crash but rate-limit to avoid hammering peers.
+Restart=on-failure
+RestartSec=5s
+StartLimitInterval=60s
+StartLimitBurst=5
+
+# Hardening — the bridge does not need elevated privileges.
+NoNewPrivileges=true
+PrivateTmp=false        # bridge needs /tmp/mmbus by default; flip on
+                        # only if you set BusConfig.base_dir to a
+                        # service-private location.
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/mmbus /tmp/mmbus
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+
+# Logging: the bridge writes its diagnostic stream to stderr; let
+# journald capture it.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mmbus-bridge
+
+[Install]
+WantedBy=multi-user.target

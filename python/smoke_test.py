@@ -152,6 +152,27 @@ def smoke_example_np_pipeline() -> None:
     print("  np_pipeline example PASSED")
 
 
+def smoke_bridge_module() -> None:
+    """`mmbus.bridge` module imports cleanly and raises the documented
+    error when the bridge binary isn't on PATH.  This stays as a
+    structural test: we never actually launch a real bridge here
+    because that requires a full TCP topology + peer."""
+    from mmbus import bridge as _bridge
+
+    # An impossible explicit binary path must raise BridgeNotFoundError.
+    try:
+        _bridge.run("/dev/null/config.toml", binary="/this/does/not/exist")
+    except _bridge.BridgeNotFoundError:
+        pass
+    else:
+        raise SystemExit("BridgeNotFoundError expected for missing binary")
+
+    # Foreground vs background entry points are both exposed.
+    assert callable(_bridge.run)
+    assert callable(_bridge.spawn)
+    print("  bridge module PASSED")
+
+
 def smoke_example_fastapi_broadcast() -> None:
     """Drive examples/fastapi_broadcast:app via Starlette's TestClient
     end-to-end: POST /publish on the HTTP side, recv on a WS connection
@@ -193,6 +214,7 @@ def main() -> None:
     smoke_sync()
     smoke_async()
     smoke_backpressure_kwarg()
+    smoke_bridge_module()
     smoke_example_np_pipeline()
     smoke_example_fastapi_broadcast()
     print("eventfd smoke test PASSED")

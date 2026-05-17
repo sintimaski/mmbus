@@ -19,11 +19,11 @@ This is a **work in progress**.  Stages, in order:
 | Stage | Scope | Status |
 |-------|-------|--------|
 | **B0** | Config parsing + wire-frame codec, no I/O | shipped |
-| B1    | Local subscribe + TCP forward to one peer | next |
-| B2    | Receive from peer + dedupe by `origin_id` + republish locally | |
-| B3    | N-peer mesh + per-peer bounded buffers | |
-| B4    | QUIC (quinn) transport behind a feature flag; preshared-key auth | |
-| B5    | Python helper `mmbus.bridge.start(config_path)`; systemd unit | |
+| B1    | Local subscribe + TCP forward to one peer | shipped |
+| B2    | Receive from peer + drop self-originated (loop prevention) + republish locally | shipped |
+| B3    | N-peer mesh + per-peer drop-oldest bounded buffer | shipped |
+| B4    | QUIC (quinn) transport behind a feature flag; preshared-key auth | open |
+| B5    | Python helper `mmbus.bridge.{run,spawn}` + systemd unit | shipped |
 
 Today the binary loads + validates a TOML config and prints a summary,
 no network traffic.  The frame codec is tested round-trip.
@@ -39,6 +39,36 @@ cargo run -- sample-config.toml
 The `[workspace]` block in `Cargo.toml` keeps the parent `cargo test`
 out — work on the bridge here without retriggering the core mmbus
 build.
+
+## Install
+
+```bash
+cargo install --path .   # places mmbus-bridge on $PATH (~/.cargo/bin)
+```
+
+Then either run it manually:
+
+```bash
+mmbus-bridge /etc/mmbus/bridge.toml
+```
+
+…or drop the [systemd unit](systemd/mmbus-bridge.service) into
+`/etc/systemd/system/` (edit paths first) and `systemctl enable --now
+mmbus-bridge.service`.
+
+From Python:
+
+```python
+from mmbus import bridge
+
+# foreground (blocks):
+bridge.run("/etc/mmbus/bridge.toml")
+
+# background:
+proc = bridge.spawn("/etc/mmbus/bridge.toml")
+# ...later:
+proc.terminate(); proc.wait(timeout=5)
+```
 
 ## Config
 
