@@ -23,7 +23,7 @@ This is a **work in progress**.  Stages, in order:
 | B2    | Receive from peer + drop self-originated (loop prevention) + republish locally | shipped |
 | B3    | N-peer mesh + per-peer drop-oldest bounded buffer | shipped |
 | B4a   | Preshared-key authentication on TCP (PeerHello PSK validation) | shipped |
-| B4b   | QUIC (quinn) transport behind a feature flag | open |
+| B4b   | QUIC (quinn) transport behind a feature flag | RFC: [`../docs/rfc-b4b-quic.md`](../docs/rfc-b4b-quic.md) |
 | B5    | Python helper `mmbus.bridge.{run,spawn}` + systemd unit | shipped |
 
 Today the binary loads + validates a TOML config and prints a summary,
