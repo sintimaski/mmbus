@@ -394,6 +394,180 @@ async fn sleep_interruptible(total: Duration, shutdown: &AtomicBool) {
     }
 }
 
+// ── inbound listener ──────────────────────────────────────────────────────────
+
+/// Async listener: bind a QUIC endpoint, accept incoming connections,
+/// validate each one's PeerHello against the accepted PSK set, and
+/// forward subsequent Msg frames to the bridge's publisher channel.
+///
+/// Symmetric to the TCP `listener_main` in `bridge.rs`.
+#[allow(clippy::too_many_arguments)]
+pub async fn listener_main(
+    bind_addr: SocketAddr,
+    server_config: quinn::ServerConfig,
+    our_origin_id: u64,
+    receive_topics: Arc<std::collections::HashSet<String>>,
+    accepted_psks: Arc<std::collections::HashSet<Vec<u8>>>,
+    publish_tx: std::sync::mpsc::Sender<(String, Vec<u8>)>,
+    shutdown: Arc<AtomicBool>,
+    bound_tx: tokio::sync::oneshot::Sender<SocketAddr>,
+) {
+    let endpoint = match quinn::Endpoint::server(server_config, bind_addr) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("bridge: QUIC listener could not bind {bind_addr}: {e}");
+            return;
+        }
+    };
+    let resolved = match endpoint.local_addr() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("bridge: QUIC listener local_addr failed: {e}");
+            return;
+        }
+    };
+    let _ = bound_tx.send(resolved);
+    eprintln!("bridge: QUIC listening on {resolved}");
+
+    while !shutdown.load(Ordering::Acquire) {
+        let accept = tokio::time::timeout(Duration::from_millis(200), endpoint.accept()).await;
+        let incoming = match accept {
+            Ok(Some(i)) => i,
+            Ok(None) => {
+                // Endpoint closed.
+                return;
+            }
+            Err(_) => continue, // timeout — re-check shutdown
+        };
+        let topics = receive_topics.clone();
+        let psks = accepted_psks.clone();
+        let tx = publish_tx.clone();
+        let sd = shutdown.clone();
+        tokio::spawn(async move {
+            match incoming.await {
+                Ok(conn) => {
+                    handle_connection(conn, our_origin_id, topics, psks, tx, sd).await;
+                }
+                Err(e) => eprintln!("bridge: QUIC handshake failed: {e}"),
+            }
+        });
+    }
+    // Best-effort graceful shutdown: tell peers we're going away.
+    endpoint.close(0u32.into(), b"shutdown");
+}
+
+async fn handle_connection(
+    conn: quinn::Connection,
+    our_origin_id: u64,
+    receive_topics: Arc<std::collections::HashSet<String>>,
+    accepted_psks: Arc<std::collections::HashSet<Vec<u8>>>,
+    publish_tx: std::sync::mpsc::Sender<(String, Vec<u8>)>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let remote = conn.remote_address();
+    eprintln!("bridge: QUIC peer connected from {remote}");
+    let (mut _send, mut recv) = match conn.accept_bi().await {
+        Ok(streams) => streams,
+        Err(e) => {
+            eprintln!("bridge: QUIC accept_bi failed: {e}");
+            return;
+        }
+    };
+
+    let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let mut tmp = [0u8; 4 * 1024];
+    let mut authenticated = false;
+
+    while !shutdown.load(Ordering::Acquire) {
+        let read = tokio::time::timeout(Duration::from_millis(200), recv.read(&mut tmp)).await;
+        match read {
+            Ok(Ok(Some(n))) if n > 0 => {
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            Ok(Ok(Some(_))) | Ok(Ok(None)) => {
+                // EOF.
+                return;
+            }
+            Ok(Err(e)) => {
+                eprintln!("bridge: QUIC stream read failed: {e}");
+                return;
+            }
+            Err(_) => {
+                // Read timeout — re-check shutdown.
+                continue;
+            }
+        }
+
+        loop {
+            match crate::frame::decode(&buf) {
+                Ok((frame, n)) => {
+                    if !authenticated {
+                        if frame.frame_type != crate::frame::FrameType::PeerHello {
+                            eprintln!(
+                                "bridge: QUIC first frame must be PeerHello (got {:?}); closing",
+                                frame.frame_type
+                            );
+                            return;
+                        }
+                        let parsed = match crate::frame::parse_peer_hello(&frame.payload) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!(
+                                    "bridge: QUIC malformed PeerHello: {e}; closing"
+                                );
+                                return;
+                            }
+                        };
+                        if !accepted_psks.contains(parsed.psk) {
+                            eprintln!(
+                                "bridge: QUIC PSK mismatch from origin_id={} ({} byte PSK); closing",
+                                parsed.origin_id,
+                                parsed.psk.len()
+                            );
+                            return;
+                        }
+                        eprintln!(
+                            "bridge: QUIC authenticated peer origin_id={}",
+                            parsed.origin_id
+                        );
+                        authenticated = true;
+                        buf.drain(..n);
+                        continue;
+                    }
+                    handle_inbound_frame(&frame, our_origin_id, &receive_topics, &publish_tx);
+                    buf.drain(..n);
+                }
+                Err(crate::frame::DecodeError::Incomplete { .. }) => break,
+                Err(e) => {
+                    eprintln!("bridge: QUIC protocol error from peer: {e}; closing");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn handle_inbound_frame(
+    frame: &crate::frame::Frame,
+    our_origin_id: u64,
+    receive_topics: &std::collections::HashSet<String>,
+    publish_tx: &std::sync::mpsc::Sender<(String, Vec<u8>)>,
+) {
+    if frame.origin_id == our_origin_id {
+        return;
+    }
+    if !matches!(frame.frame_type, crate::frame::FrameType::Msg) {
+        return;
+    }
+    let topic = match std::str::from_utf8(&frame.topic) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    if receive_topics.contains(topic) {
+        let _ = publish_tx.send((topic.to_string(), frame.payload.clone()));
+    }
+}
+
 // ── sync↔async bridge ────────────────────────────────────────────────────────
 
 /// Drain a sync `queue::Receiver<Vec<u8>>` into a tokio mpsc.  Runs

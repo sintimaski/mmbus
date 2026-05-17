@@ -52,6 +52,11 @@ pub struct Bridge {
     /// to find the bridge.
     pub listen_addr: Option<std::net::SocketAddr>,
 
+    /// QUIC listener address resolved at bind time (mirrors `listen_addr`
+    /// for QUIC).  `None` when no QUIC listener is configured.
+    #[cfg(feature = "quic")]
+    pub quic_listen_addr: Option<std::net::SocketAddr>,
+
     /// SHA-256 fingerprint of the bridge's self-signed QUIC cert,
     /// surfaced for operator logs and tests that need to copy it into
     /// a peer's `peer_cert_fingerprint` config.  `None` when QUIC is
@@ -245,14 +250,24 @@ impl Bridge {
             }));
         }
 
-        // Receive side — only if config.listen is set.  Spawn one
-        // publisher thread that owns the &mut Bus (the in-process
-        // producer-lock means there can be only one publisher per
-        // (process, topic), so we centralise all incoming traffic into
-        // a single mmbus publisher).  Spawn one listener thread that
-        // accepts incoming connections and spins up a reader per accept.
-        let (rx_threads, publish_thread, publish_tx, listen_addr) =
-            if let Some(listen_str) = &cfg.listen {
+        // Receive side — only when at least one listener is configured.
+        // A single publisher thread owns the &mut Bus (acquire_producer_lock
+        // is per-process, so we centralise all incoming traffic into one
+        // mmbus publisher).  Both the TCP and QUIC listeners feed it via
+        // the same publish channel.
+        #[allow(unused_mut)]
+        let mut listen_addr: Option<std::net::SocketAddr> = None;
+        #[cfg(feature = "quic")]
+        let mut quic_listen_addr: Option<std::net::SocketAddr> = None;
+
+        let want_tcp_listen = cfg.listen.is_some();
+        #[cfg(feature = "quic")]
+        let want_quic_listen = cfg.listen_quic.is_some();
+        #[cfg(not(feature = "quic"))]
+        let want_quic_listen = false;
+
+        let (rx_threads, publish_thread, publish_tx) =
+            if want_tcp_listen || want_quic_listen {
                 let receive_topics: HashSet<String> = cfg
                     .topics
                     .iter()
@@ -270,8 +285,6 @@ impl Bridge {
                     .collect();
                 let (ptx, prx) = mpsc::channel::<(String, Vec<u8>)>();
                 let publish_shutdown = shutdown.clone();
-                // Publisher thread.  Owns a fresh mut Bus (cloning
-                // Arc<Bus> wouldn't give us &mut access).
                 let publisher_bus_cfg = bus_config(cfg);
                 let publisher_bus_name = cfg.bus.clone();
                 let publish_handle = thread::spawn(move || {
@@ -283,41 +296,97 @@ impl Bridge {
                     );
                 });
 
-                let listener = TcpListener::bind(listen_str.as_str())
-                    .map_err(BridgeError::Listen)?;
-                listener
-                    .set_nonblocking(true)
-                    .map_err(BridgeError::Listen)?;
-                let resolved = listener
-                    .local_addr()
-                    .map_err(BridgeError::Listen)?;
-
-                let listener_shutdown = shutdown.clone();
-                let listener_ptx = ptx.clone();
                 let receive_topics_arc = Arc::new(receive_topics);
                 let accepted_psks_arc = Arc::new(accepted_psks);
-                let listen_handle = thread::spawn(move || {
-                    listener_main(
-                        listener,
-                        origin_id,
-                        receive_topics_arc,
-                        accepted_psks_arc,
-                        listener_ptx,
-                        listener_shutdown,
-                    );
-                });
-                // listener_main itself spawns per-connection readers;
-                // they're tracked inside the listener loop but we just
-                // join the listener at the end (which joins them all
-                // before returning).
-                (vec![listen_handle], Some(publish_handle), Some(ptx), Some(resolved))
+
+                let mut rx_threads: Vec<JoinHandle<()>> = Vec::new();
+
+                // TCP listener (optional)
+                if let Some(listen_str) = &cfg.listen {
+                    let listener = TcpListener::bind(listen_str.as_str())
+                        .map_err(BridgeError::Listen)?;
+                    listener
+                        .set_nonblocking(true)
+                        .map_err(BridgeError::Listen)?;
+                    let resolved = listener
+                        .local_addr()
+                        .map_err(BridgeError::Listen)?;
+                    listen_addr = Some(resolved);
+
+                    let listener_shutdown = shutdown.clone();
+                    let listener_ptx = ptx.clone();
+                    let topics = receive_topics_arc.clone();
+                    let psks = accepted_psks_arc.clone();
+                    let listen_handle = thread::spawn(move || {
+                        listener_main(
+                            listener,
+                            origin_id,
+                            topics,
+                            psks,
+                            listener_ptx,
+                            listener_shutdown,
+                        );
+                    });
+                    rx_threads.push(listen_handle);
+                }
+
+                // QUIC listener (optional)
+                #[cfg(feature = "quic")]
+                if let Some(listen_str) = &cfg.listen_quic {
+                    let bind_addr: std::net::SocketAddr = listen_str.parse().map_err(|e| {
+                        BridgeError::QuicSetup(format!(
+                            "listen_quic={listen_str:?}: {e}"
+                        ))
+                    })?;
+                    let id = quic_identity.as_ref().ok_or_else(|| {
+                        BridgeError::QuicSetup(
+                            "identity missing for QUIC listener".to_owned(),
+                        )
+                    })?;
+                    let server_config = crate::quic::server_config_from_identity(id)
+                        .map_err(quic_err_to_bridge)?;
+                    let rt = quic_runtime.as_ref().expect("runtime must exist if QUIC requested");
+                    let (bound_tx, bound_rx) =
+                        tokio::sync::oneshot::channel::<std::net::SocketAddr>();
+                    let topics = receive_topics_arc.clone();
+                    let psks = accepted_psks_arc.clone();
+                    let ptx_clone = ptx.clone();
+                    let sd = shutdown.clone();
+                    rt.spawn(async move {
+                        crate::quic::listener_main(
+                            bind_addr,
+                            server_config,
+                            origin_id,
+                            topics,
+                            psks,
+                            ptx_clone,
+                            sd,
+                            bound_tx,
+                        )
+                        .await;
+                    });
+                    // Wait for the listener to actually bind before
+                    // returning to the caller — tests rely on
+                    // quic_listen_addr being populated right after
+                    // Bridge::start.
+                    quic_listen_addr = rt.block_on(async move {
+                        tokio::time::timeout(Duration::from_secs(5), bound_rx)
+                            .await
+                            .ok()
+                            .and_then(|r| r.ok())
+                    });
+                }
+
+                (rx_threads, Some(publish_handle), Some(ptx))
             } else {
-                (Vec::new(), None, None, None)
+                (Vec::new(), None, None)
             };
 
         Ok(Self {
             origin_id,
             listen_addr,
+            #[cfg(feature = "quic")]
+            quic_listen_addr,
             #[cfg(feature = "quic")]
             quic_fingerprint: quic_identity.as_ref().map(|i| i.fingerprint.clone()),
             shutdown,
