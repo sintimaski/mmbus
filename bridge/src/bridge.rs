@@ -31,6 +31,7 @@
 
 use crate::config::BridgeConfig;
 use crate::frame::{decode, DecodeError, Frame, FrameType};
+use crate::queue;
 use mmbus::{Bus, BusConfig};
 use std::collections::HashSet;
 use std::io::{Read, Write};
@@ -68,8 +69,11 @@ pub struct Bridge {
     publish_thread: Option<JoinHandle<()>>,
 
     /// Senders for the bridge to fan a frame's encoded bytes out to all
-    /// peer forwarders.
-    peer_tx: Vec<mpsc::Sender<Vec<u8>>>,
+    /// peer forwarders.  Drop-oldest semantics — a slow/disconnected
+    /// peer cannot stall the publisher; its buffer fills up to
+    /// `config.peer_buffer_max` then evicts the oldest entry on each
+    /// new send.
+    peer_tx: Vec<queue::Sender<Vec<u8>>>,
 
     /// Sender for the receive path; cloned to each reader thread so
     /// they can forward decoded Msg frames to the publisher.  `None`
@@ -88,11 +92,12 @@ impl Bridge {
         // is internally Sync for the parts we touch).
         let bus = build_bus(cfg);
 
-        // One outbound channel per peer.
+        // One outbound channel per peer.  Drop-oldest bounded queue —
+        // slow peers cannot stall the publisher.
         let mut peer_tx = Vec::new();
         let mut fwd_threads = Vec::new();
         for peer in &cfg.peers {
-            let (tx, rx) = mpsc::channel::<Vec<u8>>();
+            let (tx, rx) = queue::channel::<Vec<u8>>(cfg.peer_buffer_max);
             peer_tx.push(tx);
             let endpoint = peer.endpoint.clone();
             let name = peer.name.clone();
@@ -270,7 +275,7 @@ fn subscriber_main(
     topic: String,
     origin_id: u64,
     seq: Arc<AtomicU64>,
-    peer_tx: Vec<mpsc::Sender<Vec<u8>>>,
+    peer_tx: Vec<queue::Sender<Vec<u8>>>,
     shutdown: Arc<AtomicBool>,
 ) {
     // Tight-loop reconnect: if the local publisher dies, wait for it to
@@ -296,8 +301,12 @@ fn subscriber_main(
                     let frame = Frame::msg(origin_id, s, topic.as_bytes().to_vec(), payload);
                     let mut buf = Vec::with_capacity(frame.encoded_len());
                     frame.encode(&mut buf);
-                    // Fan out — clone once per peer.  A peer that's
-                    // disconnected/slow drops here when its rx is gone.
+                    // Fan out — clone once per peer.  Drop-oldest at
+                    // the queue means a slow/disconnected peer evicts
+                    // its oldest queued frame instead of stalling the
+                    // publisher; the return value of `send` is the
+                    // count of evicted frames (currently unused, but
+                    // available for per-peer drop metrics).
                     for tx in &peer_tx {
                         let _ = tx.send(buf.clone());
                     }
@@ -316,7 +325,7 @@ fn forwarder_main(
     peer_name: String,
     endpoint: String,
     hello_bytes: Vec<u8>,
-    rx: mpsc::Receiver<Vec<u8>>,
+    rx: queue::Receiver<Vec<u8>>,
     shutdown: Arc<AtomicBool>,
 ) {
     let mut backoff = Duration::from_millis(50);
@@ -360,7 +369,7 @@ fn run_connection(
     peer_name: &str,
     mut stream: TcpStream,
     hello_bytes: &[u8],
-    rx: &mpsc::Receiver<Vec<u8>>,
+    rx: &queue::Receiver<Vec<u8>>,
     shutdown: &AtomicBool,
 ) -> std::io::Result<()> {
     // Reasonable defaults; v1 doesn't expose tuning knobs.
@@ -374,15 +383,20 @@ fn run_connection(
             return Ok(());
         }
         // recv_timeout: lets us periodically observe the shutdown flag
-        // even when no frames are queued.
+        // even when no frames are queued.  `None` means either timeout
+        // OR all senders dropped — we distinguish by re-checking the
+        // shutdown flag at the top of the loop.
         match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(bytes) => stream.write_all(&bytes)?,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                eprintln!(
-                    "bridge: peer {peer_name:?} channel closed; closing TCP cleanly"
-                );
-                return Ok(());
+            Some(bytes) => stream.write_all(&bytes)?,
+            None => {
+                if shutdown.load(Ordering::Acquire) {
+                    eprintln!(
+                        "bridge: peer {peer_name:?} channel closed; closing TCP cleanly"
+                    );
+                    return Ok(());
+                }
+                // Plain timeout — re-loop.
+                continue;
             }
         }
     }

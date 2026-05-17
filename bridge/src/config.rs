@@ -46,6 +46,15 @@ pub struct BridgeConfig {
     #[serde(default)]
     pub listen: Option<String>,
 
+    /// Per-peer outbound buffer (in message count).  A slow or
+    /// disconnected peer accumulates up to this many encoded frames
+    /// before the bridge starts dropping the oldest entry on each
+    /// new send.  Default: 4096.  Set lower for memory-constrained
+    /// deployments; set higher for bursty workloads where you'd
+    /// rather pay memory than drop.
+    #[serde(default = "default_peer_buffer_max")]
+    pub peer_buffer_max: usize,
+
     /// Topics this bridge forwards out / accepts in.  Order is
     /// preserved; duplicate names are not deduplicated (the bridge
     /// loops over the list and a duplicate is wasted work, not a bug).
@@ -89,6 +98,10 @@ pub struct PeerConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_peer_buffer_max() -> usize {
+    4096
 }
 
 #[derive(Debug, Error)]
@@ -173,6 +186,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.listen.as_deref(), Some("0.0.0.0:4443"));
+    }
+
+    #[test]
+    fn peer_buffer_max_defaults_and_overrides() {
+        let default = BridgeConfig::from_str(r#"bus = "demo""#).unwrap();
+        assert_eq!(default.peer_buffer_max, 4096);
+        let overridden = BridgeConfig::from_str(
+            r#"
+                bus = "demo"
+                peer_buffer_max = 32
+            "#,
+        )
+        .unwrap();
+        assert_eq!(overridden.peer_buffer_max, 32);
     }
 
     #[test]

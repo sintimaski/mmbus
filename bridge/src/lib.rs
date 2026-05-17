@@ -15,6 +15,7 @@
 pub mod bridge;
 pub mod config;
 pub mod frame;
+pub mod queue;
 
 pub use bridge::{Bridge, BridgeError};
 pub use config::{BridgeConfig, ConfigError, PeerConfig, TopicConfig};
