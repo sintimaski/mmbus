@@ -1,14 +1,14 @@
-/// Linux-only eventfd wakeup helpers + SCM_RIGHTS fd-passing.
+/// Platform-specific wakeup primitives.
 ///
-/// On Linux each subscriber creates an `eventfd(2)` and passes the write-end
-/// to the publisher via SCM_RIGHTS over the handshake Unix socket.  The
-/// publisher writes `1` to the eventfd on every message; the subscriber uses
-/// `poll(2)` on *both* the eventfd and the handshake socket so that publisher
-/// death (POLLHUP on the socket) is detected even when no messages are in
-/// flight.
-///
-/// On macOS the module is empty — the Unix socket byte-per-message scheme is
-/// used directly in `bus.rs`.
+/// * **Linux**: `eventfd(2)` + `SCM_RIGHTS` fd-passing over the handshake
+///   socket.  Subscribers `poll(2)` both the eventfd and the socket so
+///   publisher death (POLLHUP) is detected even while idle.
+/// * **Windows**: `CreateSemaphore` + named pipes + `DuplicateHandle`.
+///   Subscribers `WaitForMultipleObjects` on (semaphore, pipe) so peer
+///   process death (`ERROR_BROKEN_PIPE` on the pipe) is detected even
+///   while idle.
+/// * **macOS / other Unix**: no helpers here — the byte-per-message Unix
+///   socket scheme is used directly in `publisher.rs` / `subscriber.rs`.
 #[cfg(target_os = "linux")]
 pub(crate) mod linux {
     use std::io;
@@ -182,5 +182,333 @@ pub(crate) mod linux {
             let raw: libc::c_int = std::ptr::read(libc::CMSG_DATA(cmsg) as *const libc::c_int);
             Ok(OwnedFd::from_raw_fd(raw))
         }
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) mod windows {
+    //! Windows wakeup primitives — `CreateSemaphore` mirrors Linux's
+    //! `eventfd(EFD_SEMAPHORE)`: each `ReleaseSemaphore(h, 1)` increments
+    //! the count by 1; each successful wait decrements by 1.  Multiple
+    //! `Release`s queue up the same way multiple `eventfd_write(1)`s do.
+    //!
+    //! The handshake transport is a named pipe (`\\.\pipe\mmbus-<bus>-
+    //! <topic>-signal`).  After accept, the publisher and subscriber
+    //! exchange a fixed 12-byte message:
+    //!
+    //!   * `u32 pid_le`  — subscriber's `GetCurrentProcessId`
+    //!   * `u64 handle_le` — subscriber's semaphore handle value
+    //!
+    //! The publisher then `OpenProcess(PROCESS_DUP_HANDLE)` on the
+    //! subscriber and `DuplicateHandle` to pull the semaphore into its
+    //! own handle table.  No reply needed.
+    use std::ffi::CString;
+    use std::io;
+    use std::os::windows::io::{
+        AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle, RawHandle,
+    };
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, ERROR_PIPE_CONNECTED, FALSE, HANDLE,
+        INVALID_HANDLE_VALUE, TRUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileA, ReadFile, WriteFile, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+    };
+    use windows_sys::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeA, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+        PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CreateSemaphoreA, GetCurrentProcess, GetCurrentProcessId, OpenProcess, ReleaseSemaphore,
+        WaitForMultipleObjects, WaitForSingleObject, INFINITE, PROCESS_DUP_HANDLE,
+    };
+
+    // ── Semaphore primitives ──────────────────────────────────────────────────
+
+    /// Create a counting semaphore initialised to 0.  Max count
+    /// `i32::MAX` matches the practical ceiling of `eventfd_write` (a
+    /// subscriber that lets ~2 G unread wakeups accumulate has bigger
+    /// problems than counter saturation).
+    pub fn create_semaphore() -> io::Result<OwnedHandle> {
+        // SAFETY: name=NULL → unnamed semaphore (private to the process
+        // until duplicated); initial_count=0 so first wait blocks;
+        // max_count=i32::MAX bounded above the realistic queue depth;
+        // attributes=NULL = default security descriptor.
+        let h = unsafe { CreateSemaphoreA(std::ptr::null(), 0, i32::MAX, std::ptr::null()) };
+        if h.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: CreateSemaphoreA returned a fresh handle owned by this
+        // process; FromRawHandle takes exclusive ownership and CloseHandle
+        // will run on Drop.
+        Ok(unsafe { OwnedHandle::from_raw_handle(h as RawHandle) })
+    }
+
+    /// Increment the semaphore count by 1 (analog of `eventfd_wake`).
+    /// Returns `false` if the call fails (e.g. peer's handle was closed).
+    pub fn semaphore_wake(h: HANDLE) -> bool {
+        // SAFETY: caller holds the HANDLE open for the duration of the
+        // call; ReleaseSemaphore reads it and writes through the second
+        // arg (NULL = don't return previous count).
+        let ok = unsafe { ReleaseSemaphore(h, 1, std::ptr::null_mut()) };
+        ok != 0
+    }
+
+    /// Non-blocking drain of one semaphore unit.  Returns `Ok(true)` if a
+    /// unit was drained, `Ok(false)` if the semaphore was empty.
+    pub fn semaphore_drain(h: HANDLE) -> io::Result<bool> {
+        // SAFETY: caller-owned HANDLE; WaitForSingleObject with timeout=0
+        // returns WAIT_OBJECT_0 (decremented) or WAIT_TIMEOUT (empty).
+        match unsafe { WaitForSingleObject(h, 0) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+
+    /// Block until the semaphore has at least one unit **or** the pipe
+    /// signals (the latter typically meaning peer disconnect — a read
+    /// from a closed pipe returns 0 bytes / ERROR_BROKEN_PIPE).
+    ///
+    /// * `timeout_ms < 0` → INFINITE.
+    /// * Returns `Err(WouldBlock)` on timeout.
+    /// * Returns `Err(UnexpectedEof)` when the pipe is the wakeup source
+    ///   (peer has disconnected).
+    pub fn wait_wakeup(sem: HANDLE, pipe: HANDLE, timeout_ms: i32) -> io::Result<()> {
+        let handles = [sem, pipe];
+        let timeout = if timeout_ms < 0 { INFINITE } else { timeout_ms as u32 };
+        // SAFETY: handles points to a 2-element stack array of HANDLEs that
+        // are valid for the duration of the call (owned by the caller).
+        let r = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), FALSE, timeout) };
+        match r {
+            WAIT_TIMEOUT => Err(io::Error::new(io::ErrorKind::WouldBlock, "wait timeout")),
+            w if w == WAIT_OBJECT_0 => Ok(()), // semaphore signaled
+            w if w == WAIT_OBJECT_0 + 1 => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "publisher disconnected (pipe broken)",
+            )),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+
+    // ── Named pipe primitives (handshake transport) ───────────────────────────
+
+    /// Path for the handshake pipe.  Local-machine namespace (`\\.\pipe\`);
+    /// the user-SID prefix lives in the bus name so two users on the
+    /// same machine don't collide.
+    pub fn pipe_name(bus_dir_name: &str) -> String {
+        format!(r"\\.\pipe\mmbus-{bus_dir_name}-signal")
+    }
+
+    /// Create the first instance of a named pipe (publisher side).
+    /// Subsequent accepts must call `create_pipe_instance` again — each
+    /// `CreateNamedPipeA` returns a single instance.
+    pub fn create_pipe_instance(name: &str) -> io::Result<OwnedHandle> {
+        let c_name = CString::new(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        // SAFETY: c_name lives for the call; remaining args are
+        // primitive constants.  PIPE_REJECT_REMOTE_CLIENTS keeps the
+        // pipe local-only; PIPE_UNLIMITED_INSTANCES lets us call this
+        // function once per accept.  4096-byte buffers are ample for
+        // the 12-byte handshake.  Timeout=0 means use the default
+        // (50 ms; only matters for WaitNamedPipe).
+        let h = unsafe {
+            CreateNamedPipeA(
+                c_name.as_ptr() as *const u8,
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                PIPE_UNLIMITED_INSTANCES,
+                4096,
+                4096,
+                0,
+                std::ptr::null(),
+            )
+        };
+        if h == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: CreateNamedPipeA returned a fresh handle owned by this
+        // process.
+        Ok(unsafe { OwnedHandle::from_raw_handle(h as RawHandle) })
+    }
+
+    /// Block until a client connects to this pipe instance.  Returns
+    /// `Ok(())` once the connection is established.  `ERROR_PIPE_CONNECTED`
+    /// (already connected before ConnectNamedPipe ran) is treated as success.
+    pub fn accept_pipe(h: HANDLE) -> io::Result<()> {
+        // SAFETY: caller-owned HANDLE; overlapped=NULL → synchronous wait.
+        let ok = unsafe { ConnectNamedPipe(h, std::ptr::null_mut()) };
+        if ok != 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(ERROR_PIPE_CONNECTED as i32) {
+            return Ok(());
+        }
+        Err(err)
+    }
+
+    /// Subscriber-side: connect to a publisher's named pipe instance.
+    pub fn connect_pipe(name: &str) -> io::Result<OwnedHandle> {
+        let c_name = CString::new(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        // SAFETY: c_name lives for the call.  Open for both read + write
+        // (we exchange a fixed handshake message + later detect peer
+        // closure via ReadFile returning 0 bytes).
+        let h = unsafe {
+            CreateFileA(
+                c_name.as_ptr() as *const u8,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if h == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: CreateFileA returned a fresh handle owned by this process.
+        Ok(unsafe { OwnedHandle::from_raw_handle(h as RawHandle) })
+    }
+
+    // ── Handshake message (12 bytes: u32 pid + u64 handle value) ──────────────
+
+    /// Subscriber-side: tell the publisher which process we are and the
+    /// value of our semaphore handle (so the publisher can dup it).
+    pub fn send_handshake(pipe: HANDLE, sem: HANDLE) -> io::Result<()> {
+        // SAFETY: pipe is caller-owned and open for write; GetCurrentProcessId
+        // is a pure read of the current TEB.  We send a 12-byte buffer of
+        // (pid_le u32, handle_value_le u64) — handle values are pointer-
+        // sized on Windows but kernel handle numbers are always within
+        // the first 32 bits in practice; we encode as u64 for cross-
+        // architecture safety.
+        let pid = unsafe { GetCurrentProcessId() };
+        let mut buf = [0u8; 12];
+        buf[0..4].copy_from_slice(&pid.to_le_bytes());
+        buf[4..12].copy_from_slice(&(sem as usize as u64).to_le_bytes());
+        write_all(pipe, &buf)
+    }
+
+    /// Publisher-side: read the subscriber's handshake and dup the
+    /// subscriber's semaphore into our handle table.  Returns an owned
+    /// handle to the duplicated semaphore (drop = `CloseHandle`).
+    pub fn recv_handshake_and_dup(pipe: HANDLE) -> io::Result<OwnedHandle> {
+        let mut buf = [0u8; 12];
+        read_exact(pipe, &mut buf)?;
+        let pid = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let sub_sem_val = u64::from_le_bytes(buf[4..12].try_into().unwrap());
+
+        // SAFETY: OpenProcess with PROCESS_DUP_HANDLE returns a handle we
+        // own (must CloseHandle); pid is just an integer.  inherit_handle=
+        // FALSE.
+        let sub_proc = unsafe { OpenProcess(PROCESS_DUP_HANDLE, FALSE, pid) };
+        if sub_proc.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut dup_handle: HANDLE = std::ptr::null_mut();
+        // SAFETY: sub_proc was just OpenProcess'd; the source handle value
+        // came over the pipe from the same subscriber that owns sub_proc;
+        // GetCurrentProcess is a constant pseudo-handle; we get back a
+        // real handle in our own process via dup_handle.  Options=0 +
+        // access=0 + DUPLICATE_SAME_ACCESS asks the kernel to copy the
+        // source handle's access mask verbatim.
+        let dup_ok = unsafe {
+            DuplicateHandle(
+                sub_proc,
+                sub_sem_val as HANDLE,
+                GetCurrentProcess(),
+                &mut dup_handle,
+                0,
+                FALSE,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        // We're done with the process handle no matter what.
+        // SAFETY: sub_proc is owned by us (returned from OpenProcess); we
+        // haven't stored it anywhere else.
+        unsafe { CloseHandle(sub_proc) };
+        if dup_ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: dup_handle was just written by DuplicateHandle into our
+        // own process; ownership transfers to OwnedHandle which will
+        // CloseHandle on Drop.
+        Ok(unsafe { OwnedHandle::from_raw_handle(dup_handle as RawHandle) })
+    }
+
+    // ── Synchronous I/O helpers over a pipe HANDLE ────────────────────────────
+
+    fn write_all(pipe: HANDLE, mut data: &[u8]) -> io::Result<()> {
+        while !data.is_empty() {
+            let mut written: u32 = 0;
+            // SAFETY: pipe is caller-owned; data is a slice we hold for
+            // the duration of the call; &mut written is a stack u32.
+            let ok = unsafe {
+                WriteFile(
+                    pipe,
+                    data.as_ptr(),
+                    data.len() as u32,
+                    &mut written,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if written == 0 {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "WriteFile wrote 0"));
+            }
+            data = &data[written as usize..];
+        }
+        Ok(())
+    }
+
+    fn read_exact(pipe: HANDLE, mut buf: &mut [u8]) -> io::Result<()> {
+        while !buf.is_empty() {
+            let mut read: u32 = 0;
+            // SAFETY: pipe is caller-owned; buf is a mut slice we hold
+            // for the duration of the call; &mut read is a stack u32.
+            let ok = unsafe {
+                ReadFile(
+                    pipe,
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                    &mut read,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if read == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "pipe closed"));
+            }
+            buf = &mut buf[read as usize..];
+        }
+        Ok(())
+    }
+
+    // ── Sanity: unused-warning suppression for the constants we re-export ────
+    #[allow(dead_code)]
+    const _SUPPRESS_UNUSED: (u32, u32) = (TRUE as u32, INFINITE);
+
+    // Re-export some types for callers in publisher.rs / subscriber.rs that
+    // would otherwise need their own `use windows_sys::...` blocks.
+    pub use windows_sys::Win32::Foundation::HANDLE as RawWinHandle;
+
+    /// Helper: convert an `OwnedHandle` to a `RawWinHandle` borrow that
+    /// stays valid for the OwnedHandle's lifetime.
+    pub fn as_handle(h: &OwnedHandle) -> RawWinHandle {
+        h.as_raw_handle() as RawWinHandle
+    }
+
+    /// Helper: take an `OwnedHandle` apart into its raw value (caller
+    /// promises to wrap it again before drop).  Used when handing a
+    /// handle off to a Client struct that owns it via a separate path.
+    pub fn into_raw(h: OwnedHandle) -> RawWinHandle {
+        h.into_raw_handle() as RawWinHandle
     }
 }
