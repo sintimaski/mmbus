@@ -19,12 +19,12 @@ Win32 substitute; this plan slices that into review-sized commits.
 
 | Stage | Scope | Verification | Status |
 |-------|-------|-------------|--------|
-| **W0** | Plan doc + CI scaffold (Windows runner, `continue-on-error: true`) so build signal starts surfacing | `actions/runs` shows Windows job | next |
-| **W1** | `producer_lock.rs` — split into `unix` / `windows` modules; `LockFileEx` for Windows.  `config.rs` default `base_dir` → `%LOCALAPPDATA%\mmbus` on Windows | `cargo check --target x86_64-pc-windows-msvc` locally; CI green |  |
-| **W2** | Restructure `src/waker.rs` → `src/waker/{linux,windows,socket}.rs`.  Add `windows::{create_semaphore, semaphore_wake, semaphore_drain, wait_multi, bind_pipe, accept_pipe, connect_pipe, dup_handle_to_peer}` | Unit tests in `tests/waker_windows.rs` (Windows-gated) |  |
-| **W3** | `publisher.rs` Windows path: `Client.handle: HANDLE` field, `accept_clients` uses `ConnectNamedPipe`, `wake()` releases the semaphore | `tests/spsc.rs` passes on Windows CI |  |
-| **W4** | `subscriber.rs` Windows path: `CreateFile` on the pipe, `WaitForMultipleObjects(2, [semaphore, pipe], ...)`, `fileno()` returns `RawHandle`.  PyO3 wrapper: surface `fileno()` as the handle int; document that asyncio `add_reader` won't work on Windows (IOCP-only) — that's a follow-up | `tests/crash_recovery.rs` passes on Windows CI |  |
-| **W5** | Wheels: add `windows-latest` × `x86_64-pc-windows-msvc` to `wheels.yml`.  CI: move Windows from `continue-on-error` to required.  Smoke: `python/smoke_test.py` on Windows runner (sync + backpressure paths; async + fastapi gated to non-Windows for now) | Tagged release builds a Windows wheel |  |
+| **W0** | Plan doc + CI scaffold (Windows runner, `continue-on-error: true`) so build signal starts surfacing | `actions/runs` shows Windows job | shipped (b3a2b43) |
+| **W1** | `producer_lock.rs` split per platform; `LockFileEx` for Windows.  `config.rs` default `base_dir` → `%LOCALAPPDATA%\mmbus` on Windows | `cargo check --target x86_64-pc-windows-msvc` locally; CI green | shipped (a67260f) |
+| **W2** | `src/waker.rs` gains a `windows` module mirroring `linux`: `create_semaphore`, `semaphore_wake`, `semaphore_drain`, `wait_wakeup`, plus named-pipe (`create_pipe_instance`, `accept_pipe`, `connect_pipe`) + handshake (`send_handshake`, `recv_handshake_and_dup`) helpers | Cross-check on Windows target compiles clean | shipped (d849c90) |
+| **W3** | `publisher.rs` Windows path: `Client.{_pipe, sem}`, dedicated accept-thread + `mpsc::Receiver<Client>`, `wake()` calls `semaphore_wake`, `Drop` joins the thread | type-check + clippy on Windows target | shipped (7de72b7) |
+| **W4** | `subscriber.rs` Windows path: `connect_pipe` + `create_semaphore` + `send_handshake` at connect; `wait_wakeup` on (sem, pipe); `try_drain_wakeup` via `semaphore_drain`; `fileno()` returns `isize` (HANDLE value) on Windows | type-check + clippy on Windows target | shipped (7de72b7) |
+| **W5** | Wheels: `windows-latest` × `x86_64-pc-windows-msvc` in `wheels.yml`.  CI: build + install via `pip install .` (uses maturin build backend) + run `python/smoke_test.py` on all three OSes (Windows-incompatible smokes skip themselves).  CI Windows job kept `continue-on-error: true` until the first green run; flip then. | First CI run shows Windows green; tagged release builds a Windows wheel | shipped (this commit), continue-on-error pending |
 
 ### Open design questions for later stages
 

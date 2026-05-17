@@ -37,7 +37,16 @@ def smoke_sync() -> None:
 
 def smoke_async() -> None:
     """asyncio loop.add_reader path — proves the async surface works
-    end-to-end without falling back to a thread pool."""
+    end-to-end without falling back to a thread pool.
+
+    Windows uses ProactorEventLoop by default in Python 3.8+ and does
+    not support `add_reader` on file descriptors — Windows async on
+    mmbus is planned via an IOCP-backed path; for now the smoke skips
+    on Windows.
+    """
+    if sys.platform == "win32":
+        print("  async add_reader SKIPPED (Windows: asyncio uses IOCP, not add_reader)")
+        return
     n_messages = 5
 
     async def subscriber_main(seen: list[bytes]) -> None:
@@ -82,8 +91,9 @@ def smoke_backpressure_kwarg() -> None:
     # drop_oldest lets the publisher outrun a slow reader without raising
     # BusFullError; the reader receives some prefix and the publisher
     # completes the full send.
-    base = "/tmp/mmbus_smoke_bp"
     import shutil
+    import tempfile
+    base = os.path.join(tempfile.gettempdir(), "mmbus_smoke_bp")
     shutil.rmtree(base, ignore_errors=True)
     bus = mmbus.Bus(
         "drop-smoke", base_dir=base,

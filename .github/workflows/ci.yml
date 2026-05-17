@@ -39,3 +39,23 @@ jobs:
 
       - name: cargo clippy
         run: cargo clippy --all-features -- -D warnings
+
+      # Build the Python extension and run the cross-platform smoke
+      # harness on every OS.  Windows-incompatible smokes
+      # (asyncio.add_reader, fastapi without httpx, np_pipeline without
+      # numpy) skip themselves with a logged reason.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build + install Python extension
+        # `pip install .` triggers the maturin build backend declared in
+        # pyproject.toml — no manual `maturin develop` (which needs a
+        # venv) required.  `[tool.maturin]` already pins
+        # `features = ["python"]`.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+
+      - name: Python smoke
+        run: python python/smoke_test.py
