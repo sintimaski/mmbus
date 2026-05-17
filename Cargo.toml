@@ -23,6 +23,13 @@ pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# CRC32C with hardware acceleration on x86 (SSE 4.2) and aarch64 (ARMv8
+# CRC) — used by the WAL Phase B segment writer / reader.  Tiny dep
+# (~300 LOC of Rust + intrinsics), zero impact on the no-WAL build path
+# since BusConfig.wal defaults to disabled.
+[dependencies.crc32c]
+version = "0.6"
+
 # Windows uses windows-sys for LockFileEx, CreateNamedPipe, CreateSemaphore,
 # DuplicateHandle, WaitForMultipleObjects.  Feature gates keep the
 # downloaded surface area small.

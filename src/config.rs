@@ -1,3 +1,4 @@
+use crate::wal::WalConfig;
 use std::path::PathBuf;
 
 /// What the publisher does when the ring buffer is full.
@@ -30,6 +31,13 @@ pub struct BusConfig {
 
     /// What to do when the ring is full (default: `BackpressurePolicy::Error`).
     pub backpressure: BackpressurePolicy,
+
+    /// Write-ahead log configuration (default: disabled).  When
+    /// `wal.enabled = true` the publisher records every message
+    /// to disk before the ring write, enabling crash-safe durable
+    /// replay for late-joining subscribers.  See
+    /// [`crate::wal::WalConfig`] and `docs/rfc-wal-phase-b.md`.
+    pub wal: WalConfig,
 }
 
 impl Default for BusConfig {
@@ -40,6 +48,7 @@ impl Default for BusConfig {
             base_dir: default_base_dir(),
             max_subscribers: 16,
             backpressure: BackpressurePolicy::Error,
+            wal: WalConfig::default(),
         }
     }
 }

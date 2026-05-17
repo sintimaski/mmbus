@@ -5,6 +5,7 @@
 //! direct control over a single topic.
 
 pub mod ring;
+pub mod wal;
 
 mod bus;
 mod config;
@@ -24,6 +25,7 @@ pub use ring::{RingBuffer, RingStats};
 pub use stats::TopicStats;
 pub use subscriber::{StartPos, Subscriber};
 pub use subscription::Subscription;
+pub use wal::{FsyncPolicy, WalConfig};
 
 #[cfg(feature = "python")]
 mod python;
