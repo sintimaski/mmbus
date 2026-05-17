@@ -243,7 +243,13 @@ docker compose run --rm test
 ## Status
 
 Pre-release.  Core protocol is stable; API may still change before 1.0.
-See [`docs/roadmap.md`](docs/roadmap.md).
+See [`CHANGELOG.md`](CHANGELOG.md) for what's in the current release and
+[`docs/roadmap.md`](docs/roadmap.md) for what's planned.
+
+## Security
+
+Single-machine, same-user IPC.  See [`SECURITY.md`](SECURITY.md) for
+the threat model and how to report issues.
 
 ## Docs
 
