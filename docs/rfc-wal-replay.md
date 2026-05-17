@@ -1,7 +1,8 @@
 # RFC: Replay for late subscribers
 
-**Status:** Draft.  Phase A is small enough to ship in v0.2; Phase B is a
-separate project worth its own RFC.
+**Status:** Phase A **shipped** (see `Bus::subscribe_with_history` /
+`Bus::subscribe_from`).  Phase B (durable WAL) remains a separate
+project worth its own RFC.
 **Owner:** _unassigned_
 
 ## 1. Problem

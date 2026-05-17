@@ -22,7 +22,7 @@ pub use error::{Error, Result};
 pub use publisher::Publisher;
 pub use ring::{RingBuffer, RingStats};
 pub use stats::TopicStats;
-pub use subscriber::Subscriber;
+pub use subscriber::{StartPos, Subscriber};
 pub use subscription::Subscription;
 
 #[cfg(feature = "python")]

@@ -61,6 +61,44 @@ impl PyBus {
             .map_err(mmbus_err)
     }
 
+    /// Subscribe starting ``n_messages_back`` behind the current tail.
+    /// Replays recent in-ring history (best effort, capped at ring capacity).
+    /// Releases the GIL while waiting for the publisher.
+    #[pyo3(signature = (topic, n_messages_back, timeout_secs=30.0))]
+    fn subscribe_with_history(
+        &self,
+        py: Python<'_>,
+        topic: &str,
+        n_messages_back: u64,
+        timeout_secs: f64,
+    ) -> PyResult<PySubscription> {
+        let timeout = Duration::from_secs_f64(timeout_secs);
+        py.allow_threads(|| {
+            self.inner.subscribe_with_history_timeout(topic, n_messages_back, timeout)
+        })
+        .map(PySubscription::new)
+        .map_err(mmbus_err)
+    }
+
+    /// Subscribe starting at an explicit ``cursor`` value.  Raises
+    /// :exc:`OSError` (Error::CursorTooOld) if the cursor is older than
+    /// the oldest in-ring slot at connect time.  Releases the GIL.
+    #[pyo3(signature = (topic, cursor, timeout_secs=30.0))]
+    fn subscribe_from(
+        &self,
+        py: Python<'_>,
+        topic: &str,
+        cursor: u64,
+        timeout_secs: f64,
+    ) -> PyResult<PySubscription> {
+        let timeout = Duration::from_secs_f64(timeout_secs);
+        py.allow_threads(|| {
+            self.inner.subscribe_from_timeout(topic, cursor, timeout)
+        })
+        .map(PySubscription::new)
+        .map_err(mmbus_err)
+    }
+
     /// Block until ``n`` subscribers are connected to ``topic``.
     /// Releases the GIL while polling.
     #[pyo3(signature = (topic, n=1, timeout_secs=30.0))]

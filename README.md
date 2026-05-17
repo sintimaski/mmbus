@@ -209,12 +209,17 @@ See [`docs/architecture.md`](docs/architecture.md) for the full design.
 | `Bus(name)`                                | open a named bus namespace                         |
 | `bus.publish(topic, bytes)`                | publish a message                                  |
 | `bus.subscribe(topic) -> Subscription`     | sync subscription (iterator + context manager)     |
+| `bus.subscribe_with_history(topic, n)`     | sync subscription replaying the last *n* in-ring messages |
+| `bus.subscribe_from(topic, cursor)`        | sync subscription starting at an explicit cursor   |
 | `bus.subscribe_async(topic)`               | asyncio subscription using `add_reader`            |
+| `bus.subscribe_anyio(topic)`               | cross-backend (trio + asyncio) via `anyio.to_thread` |
 | `bus.wait_for_subscribers(topic, n)`       | block until *n* subscribers connect                |
 | `bus.stats(topic) -> TopicStats`           | ring + socket snapshot                             |
+| `bus.clean_topic(topic)`                   | wipe on-disk state (dev/test tooling)              |
 
 Typed exceptions: `BusFullError`, `MessageTooLargeError`,
-`ConnectTimeoutError`, `TooManySubscribersError`, `AlreadyPublishingError`.
+`ConnectTimeoutError`, `TooManySubscribersError`, `AlreadyPublishingError`,
+`CursorTooOldError`.
 
 ## Development
 

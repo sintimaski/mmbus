@@ -37,8 +37,30 @@ impl Drop for Subscriber {
     }
 }
 
+/// Where the subscriber's cursor starts.  Used by `Subscriber::connect_with`.
+#[derive(Clone, Copy, Debug)]
+pub enum StartPos {
+    /// Start at the current tail — receive only messages published from now on.
+    Now,
+    /// Start `n_messages_back` behind the current tail (capped at ring capacity).
+    /// Best-effort replay of recent in-ring history.
+    HistoryBack(u64),
+    /// Start at an explicit cursor value.  Returns
+    /// [`crate::Error::CursorTooOld`] if the cursor is older than the
+    /// oldest in-ring slot at connect time.
+    Explicit(u64),
+}
+
 impl Subscriber {
-    /// Connect to a named bus, retrying until `timeout` expires.
+    /// Connect to a named bus, retrying until `timeout` expires.  Receives
+    /// only messages published from the connect moment forward.
+    ///
+    /// Shorthand for [`Subscriber::connect_with`] with [`StartPos::Now`].
+    pub fn connect(name: &str, cfg: &BusConfig, timeout: Duration) -> Result<Self> {
+        Self::connect_with(name, cfg, timeout, StartPos::Now)
+    }
+
+    /// Connect with a custom start position.
     ///
     /// The cursor is claimed in the ring *before* completing the socket
     /// handshake, so that by the time `Publisher::wait_for_subscribers` returns,
@@ -46,7 +68,12 @@ impl Subscriber {
     ///
     /// On Linux an `eventfd(2)` is created before connecting and its write-end
     /// is passed to the publisher via `SCM_RIGHTS` over the handshake socket.
-    pub fn connect(name: &str, cfg: &BusConfig, timeout: Duration) -> Result<Self> {
+    pub fn connect_with(
+        name: &str,
+        cfg: &BusConfig,
+        timeout: Duration,
+        start: StartPos,
+    ) -> Result<Self> {
         let dir = cfg.base_dir.join(name);
         let ring_path = dir.join("ring.mmap");
         let sock_path = dir.join("signal.sock");
@@ -106,7 +133,19 @@ impl Subscriber {
         // points at the *old* tail and would block forever waiting for
         // messages that never arrive.  Reading tail + generation now
         // captures the post-handshake state.
-        let cursor = ring.current_tail();
+        let tail = ring.current_tail();
+        let cursor = match start {
+            StartPos::Now => tail,
+            StartPos::HistoryBack(n) => tail.saturating_sub(n),
+            StartPos::Explicit(c) => {
+                let oldest = tail.saturating_sub(ring.capacity as u64);
+                if c < oldest {
+                    ring.release_cursor(cursor_idx);
+                    return Err(Error::CursorTooOld { requested: c, oldest });
+                }
+                c
+            }
+        };
         ring.set_cursor(cursor_idx, cursor);
         let generation = ring.generation();
 
@@ -125,24 +164,41 @@ impl Subscriber {
     pub fn receive(&mut self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         loop {
-            self.wait_wakeup(-1)?;
+            // Try first — handles two cases that would otherwise hang:
+            //   1) Replay: cursor < tail because we used `subscribe_with_history`
+            //      or `subscribe_from`; the messages are already in the ring,
+            //      no wakeup will arrive for them.
+            //   2) Subscriber connected while the publisher's accept_clients
+            //      hadn't run yet; the publisher isn't sending wakeups to us
+            //      until the next publish.
             if let Some(new_cursor) =
                 self.ring.try_receive(self.cursor_idx, self.cursor, &mut out)
             {
                 self.cursor = new_cursor;
                 return Ok(out);
             }
-            // Wakeup consumed but ring slot not yet visible (e.g. DropOldest
-            // race). Loop for the next wakeup.
+            // Ring is empty for us — wait for a wakeup.
+            self.wait_wakeup(-1)?;
         }
     }
 
     /// Block with a timeout. Returns `Ok(None)` if the timeout elapses.
     pub fn receive_timeout(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>> {
-        let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+        let deadline = Instant::now() + timeout;
         let mut out = Vec::new();
         loop {
-            match self.wait_wakeup(timeout_ms) {
+            if let Some(new_cursor) =
+                self.ring.try_receive(self.cursor_idx, self.cursor, &mut out)
+            {
+                self.cursor = new_cursor;
+                return Ok(Some(out));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+            match self.wait_wakeup(ms) {
                 Ok(()) => {}
                 Err(e)
                     if e.kind() == io::ErrorKind::WouldBlock
@@ -151,12 +207,6 @@ impl Subscriber {
                     return Ok(None);
                 }
                 Err(e) => return Err(e.into()),
-            }
-            if let Some(new_cursor) =
-                self.ring.try_receive(self.cursor_idx, self.cursor, &mut out)
-            {
-                self.cursor = new_cursor;
-                return Ok(Some(out));
             }
         }
     }

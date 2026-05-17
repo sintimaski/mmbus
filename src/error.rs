@@ -26,6 +26,11 @@ pub enum Error {
     /// Another process or in-process `Publisher` already owns this topic.
     #[error("a publisher is already running for topic '{0}'")]
     AlreadyPublishing(String),
+
+    /// `subscribe_from` requested a cursor older than the oldest in-ring slot.
+    /// The caller should retry from `tail`, fail, or use a WAL (future work).
+    #[error("cursor {requested} is older than the oldest in-ring slot ({oldest})")]
+    CursorTooOld { requested: u64, oldest: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

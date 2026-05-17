@@ -37,6 +37,7 @@ from mmbus._mmbus import (  # noqa: F401
     AlreadyPublishingError,
     BusFullError,
     ConnectTimeoutError,
+    CursorTooOldError,
     MessageTooLargeError,
     TooManySubscribersError,
 )
@@ -72,6 +73,31 @@ class Bus:
                     process(msg)
         """
         return self._bus.subscribe(topic, timeout_secs=timeout_secs)
+
+    def subscribe_with_history(
+        self, topic: str, n_messages_back: int, timeout_secs: float = 30.0
+    ) -> Subscription:
+        """Subscribe and replay up to *n_messages_back* messages from before
+        the connect moment.  Best effort — capped at the ring's capacity.
+
+        Useful for late-joining workers / aggregators that want to see what
+        happened in the last few moments without standing up a durable log.
+        """
+        return self._bus.subscribe_with_history(
+            topic, n_messages_back, timeout_secs=timeout_secs
+        )
+
+    def subscribe_from(
+        self, topic: str, cursor: int, timeout_secs: float = 30.0
+    ) -> Subscription:
+        """Subscribe starting at an explicit *cursor* value (e.g. one obtained
+        from a previous :attr:`Subscription.cursor` checkpoint).
+
+        Raises :exc:`CursorTooOldError` if *cursor* is older than the oldest
+        in-ring slot.  Cursor stability is per-publisher-generation: a
+        checkpoint taken before a publisher restart is invalid afterwards.
+        """
+        return self._bus.subscribe_from(topic, cursor, timeout_secs=timeout_secs)
 
     # ── Async subscribe ───────────────────────────────────────────────────────
 
@@ -313,6 +339,7 @@ __all__ = [
     "AlreadyPublishingError",
     "BusFullError",
     "ConnectTimeoutError",
+    "CursorTooOldError",
     "MessageTooLargeError",
     "TooManySubscribersError",
 ]

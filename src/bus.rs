@@ -3,7 +3,7 @@ use crate::error::{Error, Result};
 use crate::producer_lock::acquire_producer_lock;
 use crate::publisher::Publisher;
 use crate::stats::TopicStats;
-use crate::subscriber::Subscriber;
+use crate::subscriber::{StartPos, Subscriber};
 use crate::subscription::Subscription;
 use std::collections::HashMap;
 use std::fs;
@@ -59,6 +59,68 @@ impl Bus {
     /// Subscribe to `topic` with a custom connection timeout.
     pub fn subscribe_timeout(&self, topic: &str, timeout: Duration) -> Result<Subscription> {
         let sub = Subscriber::connect(topic, &self.topic_config(topic), timeout)?;
+        Ok(Subscription::new(sub))
+    }
+
+    /// Subscribe starting `n_messages_back` behind the current tail.  Replays
+    /// recent in-ring history; capped at the ring capacity (older messages
+    /// have been overwritten).  Uses a 30-second connection timeout.
+    ///
+    /// Note: this is a *best-effort* replay.  If `n_messages_back` exceeds
+    /// what's still in the ring, the seqlock in [`Subscription::recv`] will
+    /// skip forward to the oldest available slot on the first read — you
+    /// won't observe an error, just fewer messages than requested.
+    pub fn subscribe_with_history(
+        &self,
+        topic: &str,
+        n_messages_back: u64,
+    ) -> Result<Subscription> {
+        self.subscribe_with_history_timeout(
+            topic,
+            n_messages_back,
+            Duration::from_secs(30),
+        )
+    }
+
+    /// `subscribe_with_history` with a custom connection timeout.
+    pub fn subscribe_with_history_timeout(
+        &self,
+        topic: &str,
+        n_messages_back: u64,
+        timeout: Duration,
+    ) -> Result<Subscription> {
+        let sub = Subscriber::connect_with(
+            topic,
+            &self.topic_config(topic),
+            timeout,
+            StartPos::HistoryBack(n_messages_back),
+        )?;
+        Ok(Subscription::new(sub))
+    }
+
+    /// Subscribe starting at an explicit cursor value.  Returns
+    /// [`Error::CursorTooOld`] if `cursor` is older than the oldest slot
+    /// still in the ring.  Uses a 30-second connection timeout.
+    ///
+    /// Cursor stability is per-publisher-generation: a cursor obtained
+    /// before a publisher restart is invalid after restart.
+    pub fn subscribe_from(&self, topic: &str, cursor: u64) -> Result<Subscription> {
+        self.subscribe_from_timeout(topic, cursor, Duration::from_secs(30))
+    }
+
+    /// `subscribe_from` with a custom connection timeout.
+    pub fn subscribe_from_timeout(
+        &self,
+        topic: &str,
+        cursor: u64,
+        timeout: Duration,
+    ) -> Result<Subscription> {
+        let sub = Subscriber::connect_with(
+            topic,
+            &self.topic_config(topic),
+            timeout,
+            StartPos::Explicit(cursor),
+        )?;
         Ok(Subscription::new(sub))
     }
 

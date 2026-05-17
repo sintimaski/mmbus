@@ -12,6 +12,7 @@ pyo3::create_exception!(mmbus, MessageTooLargeError, pyo3::exceptions::PyExcepti
 pyo3::create_exception!(mmbus, ConnectTimeoutError, pyo3::exceptions::PyException);
 pyo3::create_exception!(mmbus, TooManySubscribersError, pyo3::exceptions::PyException);
 pyo3::create_exception!(mmbus, AlreadyPublishingError, pyo3::exceptions::PyException);
+pyo3::create_exception!(mmbus, CursorTooOldError, pyo3::exceptions::PyException);
 
 /// Convert a Rust [`Error`] into the corresponding Python exception.
 pub(crate) fn mmbus_err(e: Error) -> PyErr {
@@ -29,6 +30,9 @@ pub(crate) fn mmbus_err(e: Error) -> PyErr {
         Error::AlreadyPublishing(topic) => AlreadyPublishingError::new_err(format!(
             "a publisher is already active for topic '{topic}'"
         )),
+        Error::CursorTooOld { requested, oldest } => CursorTooOldError::new_err(format!(
+            "cursor {requested} is older than the oldest in-ring slot ({oldest})"
+        )),
         Error::Io(e) => PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()),
     }
 }
@@ -41,5 +45,6 @@ pub(crate) fn register(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     m.add("ConnectTimeoutError", py.get_type_bound::<ConnectTimeoutError>())?;
     m.add("TooManySubscribersError", py.get_type_bound::<TooManySubscribersError>())?;
     m.add("AlreadyPublishingError", py.get_type_bound::<AlreadyPublishingError>())?;
+    m.add("CursorTooOldError", py.get_type_bound::<CursorTooOldError>())?;
     Ok(())
 }

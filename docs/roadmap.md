@@ -61,8 +61,24 @@ Goal: expose Rust core to Python with correct GIL semantics.
       socket macOS); zero thread pool usage for `recv`
 - [x] Disconnect detection: second `add_reader` on handshake socket on Linux
       so publisher `POLLHUP` cancels in-flight `await sub.recv()`
-- [ ] `anyio` / `trio` compatibility layer
+- [x] `anyio` / `trio` compatibility via `AnyioSubscription` (one
+      worker thread per recv; trade-off vs. zero-thread asyncio path)
 - [x] FastAPI WebSocket-broadcast example (`examples/fastapi_broadcast.py`)
+
+---
+
+## Phase 4.5 — Replay (Phase A of rfc-wal-replay.md) ✓
+
+- [x] `Bus::subscribe_with_history(topic, n_messages_back)` — best-
+      effort replay of recent in-ring history
+- [x] `Bus::subscribe_from(topic, cursor)` — explicit cursor; returns
+      `Error::CursorTooOld` if older than the oldest in-ring slot
+- [x] New `CursorTooOldError` Python exception class
+- [x] `receive()` / `receive_timeout()` now try the ring before
+      blocking on a wakeup — also fixes the "subscriber connects but
+      the publisher's accept_clients hasn't run yet, so no wakeup
+      arrives" hang
+- [ ] Phase B durable WAL — separate project per RFC
 
 ---
 
