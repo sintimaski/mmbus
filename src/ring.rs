@@ -442,6 +442,23 @@ impl RingBuffer {
         self.tail_atomic().load(Ordering::Acquire)
     }
 
+    /// Per-subscriber `(cursor_idx, lag)` for every claimed cursor, where
+    /// `lag = tail - cursor`.  Used by `Bus::slow_subscribers` to identify
+    /// laggards by stable index across subsequent calls.
+    pub fn lags_with_idx(&self) -> Vec<(usize, u64)> {
+        let tail = self.tail_atomic().load(Ordering::Acquire);
+        (0..self.max_subscribers as usize)
+            .filter_map(|i| {
+                let c = self.cursor_atomic(i).load(Ordering::Acquire);
+                if c == CURSOR_UNCLAIMED {
+                    None
+                } else {
+                    Some((i, tail.saturating_sub(c)))
+                }
+            })
+            .collect()
+    }
+
     /// Snapshot of the ring's backpressure state.
     pub fn stats(&self) -> RingStats {
         let tail = self.tail_atomic().load(Ordering::Acquire);

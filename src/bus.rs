@@ -142,6 +142,26 @@ impl Bus {
         self.publishers.get(topic).map(|p| p.stats())
     }
 
+    /// `(cursor_idx, lag)` pairs for subscribers on `topic` whose lag is
+    /// `>= threshold` messages.  Returns an empty Vec if no publisher
+    /// exists for `topic` in this `Bus`, or if every subscriber is
+    /// caught up to within `threshold`.
+    ///
+    /// Intended for periodic monitoring — call from a background thread
+    /// and emit metrics / warnings when the returned Vec is non-empty.
+    /// `cursor_idx` is stable across calls for the same subscriber, so
+    /// it can be used to track which one is consistently slow.
+    pub fn slow_subscribers(
+        &self,
+        topic: &str,
+        threshold: u64,
+    ) -> Vec<(usize, u64)> {
+        self.publishers
+            .get(topic)
+            .map(|p| p.slow_subscribers(threshold))
+            .unwrap_or_default()
+    }
+
     /// Remove all on-disk state for `topic` (ring file, signal socket,
     /// producer lock).  Refuses with `Error::AlreadyPublishing` if any
     /// process — including this one — is currently publishing.

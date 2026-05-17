@@ -120,6 +120,13 @@ impl PyBus {
         self.inner.stats(topic).map(PyTopicStats::from)
     }
 
+    /// Return ``(cursor_idx, lag)`` tuples for subscribers on ``topic``
+    /// whose lag is ``>= threshold`` messages.  Empty list if no
+    /// subscriber is behind or no publisher exists for this topic.
+    fn slow_subscribers(&self, topic: &str, threshold: u64) -> Vec<(usize, u64)> {
+        self.inner.slow_subscribers(topic, threshold)
+    }
+
     /// Remove all on-disk state for ``topic``.  Raises
     /// :exc:`AlreadyPublishingError` if a publisher is active anywhere
     /// (including this process).  For test setup / dev tooling only.

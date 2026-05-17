@@ -130,6 +130,16 @@ impl Publisher {
         TopicStats { ring: self.ring.stats(), connected_sockets: self.clients.len() }
     }
 
+    /// `(cursor_idx, lag)` pairs for active subscribers whose lag is
+    /// `>= threshold` messages.  Empty Vec when nothing is lagging.
+    pub fn slow_subscribers(&self, threshold: u64) -> Vec<(usize, u64)> {
+        self.ring
+            .lags_with_idx()
+            .into_iter()
+            .filter(|(_, lag)| *lag >= threshold)
+            .collect()
+    }
+
     pub fn slot_size(&self) -> u32 {
         self.ring.slot_payload_size
     }

@@ -215,6 +215,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the full design.
 | `bus.subscribe_anyio(topic)`               | cross-backend (trio + asyncio) via `anyio.to_thread` |
 | `bus.wait_for_subscribers(topic, n)`       | block until *n* subscribers connect                |
 | `bus.stats(topic) -> TopicStats`           | ring + socket snapshot                             |
+| `bus.slow_subscribers(topic, threshold)`   | `(cursor_idx, lag)` for laggards (monitoring)      |
 | `bus.clean_topic(topic)`                   | wipe on-disk state (dev/test tooling)              |
 
 Typed exceptions: `BusFullError`, `MessageTooLargeError`,

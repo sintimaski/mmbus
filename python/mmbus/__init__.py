@@ -148,6 +148,18 @@ class Bus:
         """Return a :class:`TopicStats` snapshot, or ``None`` if no publisher."""
         return self._bus.stats(topic)
 
+    def slow_subscribers(
+        self, topic: str, threshold: int
+    ) -> list[tuple[int, int]]:
+        """Return ``[(cursor_idx, lag), ...]`` for subscribers on *topic*
+        whose lag is ``>= threshold`` messages.  Empty list when caught up.
+
+        Intended for periodic monitoring — call from a background thread
+        and emit warnings / metrics when the returned list is non-empty.
+        ``cursor_idx`` is stable across calls for the same subscriber.
+        """
+        return self._bus.slow_subscribers(topic, threshold)
+
     def clean_topic(self, topic: str) -> None:
         """Remove all on-disk state for *topic* (ring file, signal socket,
         producer lock).  Raises :exc:`AlreadyPublishingError` if a publisher
