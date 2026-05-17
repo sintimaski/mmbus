@@ -190,8 +190,8 @@ See [`docs/architecture.md`](docs/architecture.md) for the full design.
 
 ## Target use cases
 
-- **ML inference pipelines** — pass tensors between workers without pickle copies
-- **Multi-worker web apps** — WebSocket broadcast without standing up Redis
+- **ML inference pipelines** — pass tensors between workers without pickle copies ([`examples/np_pipeline.py`](examples/np_pipeline.py))
+- **Multi-worker web apps** — WebSocket broadcast without standing up Redis ([`examples/fastapi_broadcast.py`](examples/fastapi_broadcast.py))
 - **Edge / embedded Python** — Raspberry Pi, Jetson; no daemon required
 - **Desktop apps** — cross-process events without a server
 - **Dev/test environments** — production-quality local pub/sub, no Docker
