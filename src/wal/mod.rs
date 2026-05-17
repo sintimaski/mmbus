@@ -11,5 +11,9 @@
 //! Full design: `docs/rfc-wal-phase-b.md`.
 
 mod config;
+pub mod record;
+pub mod segment_writer;
 
 pub use config::{FsyncPolicy, WalConfig};
+pub use record::{Record, SegmentHeader, SegmentHeaderError, MAX_PAYLOAD_LEN, SEGMENT_HEADER_LEN};
+pub use segment_writer::{SegmentWriter, WriterError};
