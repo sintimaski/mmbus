@@ -476,6 +476,25 @@ impl RingBuffer {
         self.tail_atomic().load(Ordering::Acquire)
     }
 
+    /// Overwrite the producer tail.  Only the publisher may call this,
+    /// and only before its first `try_publish` in the current process
+    /// (used by WAL recovery to align the ring cursor with the WAL's
+    /// global cursor numbering on publisher restart).
+    pub fn set_tail(&self, value: u64) {
+        self.tail_atomic().store(value, Ordering::Release);
+    }
+
+    /// Best-effort check: would a `try_publish` reject because the
+    /// slowest active subscriber is `capacity` behind?  Used by the
+    /// publisher to pre-check before WAL-appending a record that
+    /// would only be rejected from the ring anyway (avoids a phantom
+    /// WAL entry under `BackpressurePolicy::Error`).
+    pub fn is_full(&self) -> bool {
+        let tail = self.tail_atomic().load(Ordering::Relaxed);
+        let effective_min = self.min_active_cursor().unwrap_or(tail);
+        tail.wrapping_sub(effective_min) >= self.capacity as u64
+    }
+
     /// Per-subscriber `(cursor_idx, lag)` for every claimed cursor, where
     /// `lag = tail - cursor`.  Used by `Bus::slow_subscribers` to identify
     /// laggards by stable index across subsequent calls.

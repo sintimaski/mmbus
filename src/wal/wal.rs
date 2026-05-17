@@ -62,6 +62,11 @@ pub struct Wal {
     /// Each + by the flusher thread under Batched).  Subscribers
     /// under Batched are clamped to this value.
     durable_cursor: Arc<AtomicU64>,
+    /// Next cursor to be written.  Mirrors the writer's pending_cursor
+    /// when a writer exists, and survives the deferred-writer case
+    /// (Wal::open with empty/no segments holds this at the right
+    /// value before the first append).
+    pending_cursor: Arc<AtomicU64>,
     /// Flusher thread shutdown flag (only spawned under Batched).
     shutdown: Arc<AtomicBool>,
     /// Flusher thread handle.  None when fsync_policy != Batched.
@@ -159,6 +164,7 @@ impl Wal {
         };
 
         let durable_cursor = Arc::new(AtomicU64::new(pending_cursor));
+        let pending_cursor_atomic = Arc::new(AtomicU64::new(pending_cursor));
         let inner = Arc::new(Mutex::new(Inner { segments, segment_sizes, writer }));
         let shutdown = Arc::new(AtomicBool::new(false));
         let poisoned = Arc::new(AtomicBool::new(false));
@@ -181,6 +187,7 @@ impl Wal {
             cfg,
             inner,
             durable_cursor,
+            pending_cursor: pending_cursor_atomic,
             shutdown,
             flusher_thread,
             poisoned,
@@ -237,7 +244,9 @@ impl Wal {
             w.append(cursor, ts_unix_nanos, payload)?;
             let first = w.first_cursor();
             let bytes = w.bytes_written();
+            let new_pending = w.pending_cursor();
             inner.segment_sizes.insert(first, bytes);
+            self.pending_cursor.store(new_pending, Ordering::Release);
         }
 
         // Under Each, fsync inline and advance durable_cursor.
@@ -284,6 +293,15 @@ impl Wal {
         self.durable_cursor.load(Ordering::Acquire)
     }
 
+    /// Next cursor that will be assigned by the next `append()`.
+    /// Equal to `0` for a fresh WAL; otherwise one past the highest
+    /// cursor ever appended (or `first_cursor` of an empty resumed
+    /// segment).  Used by the publisher to align the ring tail with
+    /// the WAL's global cursor numbering on restart.
+    pub fn pending_cursor(&self) -> u64 {
+        self.pending_cursor.load(Ordering::Acquire)
+    }
+
     /// First cursor still in any segment on disk.  Returns 0 when
     /// the WAL is empty (no segments yet).
     pub fn oldest_cursor(&self) -> u64 {
@@ -326,14 +344,13 @@ impl Wal {
     /// Snapshot of internal state for monitoring.
     pub fn stats(&self) -> WalStats {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let pending_cursor = inner.writer.as_ref().map(|w| w.pending_cursor()).unwrap_or(0);
         let oldest_cursor = inner.segments.keys().next().copied().unwrap_or(0);
         let active_segment_bytes =
             inner.writer.as_ref().map(|w| w.bytes_written()).unwrap_or(0);
         let total_wal_bytes: u64 = inner.segment_sizes.values().sum();
         let segments = inner.segments.len();
         WalStats {
-            pending_cursor,
+            pending_cursor: self.pending_cursor.load(Ordering::Acquire),
             durable_cursor: self.durable_cursor.load(Ordering::Acquire),
             oldest_cursor,
             active_segment_bytes,

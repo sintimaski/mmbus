@@ -3,9 +3,10 @@ use crate::error::{Error, Result};
 use crate::producer_lock::{acquire_producer_lock, ProducerLock};
 use crate::ring::RingBuffer;
 use crate::stats::TopicStats;
+use crate::wal::Wal;
 use std::fs;
 use std::io;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
@@ -91,6 +92,11 @@ pub struct Publisher {
     clients: Vec<Client>,
     backpressure: BackpressurePolicy,
     _lock: ProducerLock,
+    /// Optional write-ahead log.  Present when `BusConfig::wal.enabled`
+    /// was set at create-time.  On publish, the record is appended to
+    /// the WAL *before* the ring write — a failed WAL append leaves
+    /// the ring untouched (caller can retry).
+    wal: Option<Wal>,
 }
 
 impl Publisher {
@@ -111,6 +117,23 @@ impl Publisher {
             cfg.slot_size,
             cfg.max_subscribers,
         )?;
+
+        // Open the WAL when enabled.  recover_truncate runs on every
+        // segment as part of Wal::open so a power-loss-torn tail is
+        // already dropped here.  When the WAL holds prior records, the
+        // ring's tail (just reset to 0 by create_or_reuse) is bumped
+        // forward to the WAL's next cursor so subscribers see a
+        // monotonic cursor stream across publisher restarts.
+        let wal = if cfg.wal.enabled {
+            let w = Wal::open(&dir, cfg.wal.clone())?;
+            let next = w.pending_cursor();
+            if next > ring.current_tail() {
+                ring.set_tail(next);
+            }
+            Some(w)
+        } else {
+            None
+        };
 
         #[cfg(unix)]
         let listener = {
@@ -143,11 +166,19 @@ impl Publisher {
             clients: Vec::new(),
             backpressure: cfg.backpressure,
             _lock: lock,
+            wal,
         })
     }
 
     /// Publish a message. Returns `Err(Error::Full)` if the ring is saturated
     /// and the backpressure policy is `Error`.
+    ///
+    /// When a WAL is enabled, the record is appended (and fsynced per the
+    /// configured policy) BEFORE the ring write — a WAL append failure
+    /// returns `Error::Wal` and the ring is not advanced.  Conversely a
+    /// ring-full reject (`BackpressurePolicy::Error`) skips the WAL write
+    /// entirely so the on-disk log never contains a record that no
+    /// subscriber will ever observe via the live ring.
     pub fn publish(&mut self, data: &[u8]) -> Result<()> {
         if data.len() > self.ring.slot_payload_size as usize {
             return Err(Error::TooLarge {
@@ -157,6 +188,22 @@ impl Publisher {
         }
 
         self.accept_clients()?;
+
+        // For Error backpressure: pre-check ring capacity before the
+        // WAL append so a full ring doesn't write a phantom WAL record.
+        // DropOldest never rejects so we always WAL-append + ring-publish.
+        if matches!(self.backpressure, BackpressurePolicy::Error) && self.ring.is_full() {
+            return Err(Error::Full);
+        }
+
+        if let Some(wal) = self.wal.as_ref() {
+            let cursor = self.ring.current_tail();
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            wal.append(cursor, ts, data)?;
+        }
 
         let published = match self.backpressure {
             BackpressurePolicy::Error => self.ring.try_publish(data),
@@ -196,7 +243,11 @@ impl Publisher {
 
     /// Snapshot of ring and socket stats for this topic.
     pub fn stats(&self) -> TopicStats {
-        TopicStats { ring: self.ring.stats(), connected_sockets: self.clients.len() }
+        TopicStats {
+            ring: self.ring.stats(),
+            connected_sockets: self.clients.len(),
+            wal: self.wal.as_ref().map(|w| w.stats()),
+        }
     }
 
     /// `(cursor_idx, lag)` pairs for active subscribers whose lag is

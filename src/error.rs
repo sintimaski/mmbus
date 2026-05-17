@@ -31,6 +31,11 @@ pub enum Error {
     /// The caller should retry from `tail`, fail, or use a WAL (future work).
     #[error("cursor {requested} is older than the oldest in-ring slot ({oldest})")]
     CursorTooOld { requested: u64, oldest: u64 },
+
+    /// WAL append failed (disk full, fsync error, flusher poisoned).
+    /// The matching ring publish did NOT happen — caller can retry.
+    #[error("WAL error: {0}")]
+    Wal(#[from] crate::wal::WalError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
