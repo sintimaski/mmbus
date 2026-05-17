@@ -2,24 +2,45 @@ use crate::config::BusConfig;
 use crate::error::{Error, Result};
 use crate::ring::RingBuffer;
 use std::io;
-use std::os::unix::io::{AsRawFd, RawFd};
-use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 
 #[cfg(target_os = "linux")]
 use std::os::fd::OwnedFd;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 use std::io::Read;
+
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, OwnedHandle};
 
 /// Low-level consumer handle. Prefer [`crate::Bus::subscribe`] for most use-cases.
 pub struct Subscriber {
     ring: RingBuffer,
+
+    /// Unix handshake socket — also carries the byte-wakeup on macOS.
+    #[cfg(unix)]
     sock: UnixStream,
 
-    /// On Linux: the subscriber-owned read-end of the eventfd.
+    /// Linux: subscriber-owned read-end of the eventfd.
     #[cfg(target_os = "linux")]
     efd: OwnedFd,
+
+    /// Windows: handshake pipe (kept open so peer-disconnect is observable
+    /// via `WaitForMultipleObjects` returning the pipe slot).
+    #[cfg(windows)]
+    pipe: OwnedHandle,
+
+    /// Windows: our half of the semaphore.  We pass a handle value to
+    /// the publisher during the handshake; the publisher then
+    /// `DuplicateHandle`'s its own copy into its process.  We retain
+    /// this one for `WaitForMultipleObjects`.
+    #[cfg(windows)]
+    sem: OwnedHandle,
 
     cursor: u64,
     cursor_idx: usize,
@@ -62,12 +83,9 @@ impl Subscriber {
 
     /// Connect with a custom start position.
     ///
-    /// The cursor is claimed in the ring *before* completing the socket
-    /// handshake, so that by the time `Publisher::wait_for_subscribers` returns,
+    /// The cursor is claimed in the ring *before* completing the handshake,
+    /// so that by the time `Publisher::wait_for_subscribers` returns,
     /// the cursor is already visible to the producer's backpressure check.
-    ///
-    /// On Linux an `eventfd(2)` is created before connecting and its write-end
-    /// is passed to the publisher via `SCM_RIGHTS` over the handshake socket.
     pub fn connect_with(
         name: &str,
         cfg: &BusConfig,
@@ -76,7 +94,6 @@ impl Subscriber {
     ) -> Result<Self> {
         let dir = cfg.base_dir.join(name);
         let ring_path = dir.join("ring.mmap");
-        let sock_path = dir.join("signal.sock");
         let deadline = Instant::now() + timeout;
 
         let ring = loop {
@@ -89,50 +106,100 @@ impl Subscriber {
             }
         };
 
-        // Claim cursor before socket connect so the producer sees our position
-        // as soon as it accepts the connection.
+        // Claim cursor before transport handshake so the producer sees our
+        // position as soon as it accepts the connection.
         let cursor = ring.current_tail();
         let cursor_idx = ring
             .claim_cursor(cursor)
             .ok_or(Error::TooManySubscribers(ring.max_subscribers))?;
 
-        // On Linux: create the eventfd now so we can pass it during the
-        // socket handshake.
+        // ── Linux: eventfd + Unix socket + SCM_RIGHTS handshake ──────────────
         #[cfg(target_os = "linux")]
-        let efd = match crate::waker::linux::create_eventfd() {
-            Ok(fd) => fd,
-            Err(e) => {
+        let (sock, efd) = {
+            let sock_path = dir.join("signal.sock");
+            let efd = match crate::waker::linux::create_eventfd() {
+                Ok(fd) => fd,
+                Err(e) => {
+                    ring.release_cursor(cursor_idx);
+                    return Err(Error::Io(e));
+                }
+            };
+            let sock = loop {
+                match UnixStream::connect(&sock_path) {
+                    Ok(s) => break s,
+                    Err(_) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => {
+                        ring.release_cursor(cursor_idx);
+                        return Err(Error::Timeout(name.to_owned()));
+                    }
+                }
+            };
+            if let Err(e) = crate::waker::linux::send_fd(&sock, efd.as_raw_fd()) {
                 ring.release_cursor(cursor_idx);
                 return Err(Error::Io(e));
             }
+            (sock, efd)
         };
 
-        let sock = loop {
-            match UnixStream::connect(&sock_path) {
-                Ok(s) => break s,
-                Err(_) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(_) => {
-                    ring.release_cursor(cursor_idx);
-                    return Err(Error::Timeout(name.to_owned()));
+        // ── macOS: Unix socket only; the publisher byte-wakes per message ────
+        #[cfg(target_os = "macos")]
+        let sock = {
+            let sock_path = dir.join("signal.sock");
+            loop {
+                match UnixStream::connect(&sock_path) {
+                    Ok(s) => break s,
+                    Err(_) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => {
+                        ring.release_cursor(cursor_idx);
+                        return Err(Error::Timeout(name.to_owned()));
+                    }
                 }
             }
         };
 
-        // Pass the eventfd write-end to the publisher so it can wake us.
-        #[cfg(target_os = "linux")]
-        if let Err(e) = crate::waker::linux::send_fd(&sock, efd.as_raw_fd()) {
-            ring.release_cursor(cursor_idx);
-            return Err(Error::Io(e));
-        }
+        // ── Windows: named pipe + semaphore handshake ────────────────────────
+        #[cfg(windows)]
+        let (pipe, sem) = {
+            let pipe_name = crate::waker::windows::pipe_name(name);
+            let sem = match crate::waker::windows::create_semaphore() {
+                Ok(h) => h,
+                Err(e) => {
+                    ring.release_cursor(cursor_idx);
+                    return Err(Error::Io(e));
+                }
+            };
+            let pipe = loop {
+                match crate::waker::windows::connect_pipe(&pipe_name) {
+                    Ok(h) => break h,
+                    Err(_) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => {
+                        ring.release_cursor(cursor_idx);
+                        return Err(Error::Timeout(name.to_owned()));
+                    }
+                }
+            };
+            // Send our (pid, sem) so the publisher can DuplicateHandle.
+            if let Err(e) = crate::waker::windows::send_handshake(
+                pipe.as_raw_handle() as crate::waker::windows::RawWinHandle,
+                sem.as_raw_handle() as crate::waker::windows::RawWinHandle,
+            ) {
+                ring.release_cursor(cursor_idx);
+                return Err(Error::Io(e));
+            }
+            (pipe, sem)
+        };
 
         // Re-synchronise after the handshake completes.  If the publisher
         // restarted between our initial `current_tail` read above and the
-        // socket connect, the tail was reset to 0 — but our cursor still
+        // handshake, the tail was reset to 0 — but our cursor still
         // points at the *old* tail and would block forever waiting for
-        // messages that never arrive.  Reading tail + generation now
-        // captures the post-handshake state.
+        // messages that never arrive.
         let tail = ring.current_tail();
         let cursor = match start {
             StartPos::Now => tail,
@@ -151,9 +218,14 @@ impl Subscriber {
 
         Ok(Self {
             ring,
+            #[cfg(unix)]
             sock,
             #[cfg(target_os = "linux")]
             efd,
+            #[cfg(windows)]
+            pipe,
+            #[cfg(windows)]
+            sem,
             cursor,
             cursor_idx,
             generation,
@@ -164,20 +236,12 @@ impl Subscriber {
     pub fn receive(&mut self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         loop {
-            // Try first — handles two cases that would otherwise hang:
-            //   1) Replay: cursor < tail because we used `subscribe_with_history`
-            //      or `subscribe_from`; the messages are already in the ring,
-            //      no wakeup will arrive for them.
-            //   2) Subscriber connected while the publisher's accept_clients
-            //      hadn't run yet; the publisher isn't sending wakeups to us
-            //      until the next publish.
             if let Some(new_cursor) =
                 self.ring.try_receive(self.cursor_idx, self.cursor, &mut out)
             {
                 self.cursor = new_cursor;
                 return Ok(out);
             }
-            // Ring is empty for us — wait for a wakeup.
             self.wait_wakeup(-1)?;
         }
     }
@@ -231,33 +295,45 @@ impl Subscriber {
         self.cursor
     }
 
-    /// The underlying wakeup fd: eventfd on Linux, Unix socket on macOS.
-    /// Becomes readable when at least one message is available.
+    /// The underlying wakeup primitive.  On Unix this is a `RawFd`
+    /// (eventfd on Linux, the handshake socket on macOS) that asyncio's
+    /// `loop.add_reader` can register.  On Windows this is the semaphore
+    /// HANDLE value — asyncio on Windows uses IOCP, not file descriptors,
+    /// so this number is mostly useful for diagnostics; the async path
+    /// on Windows is planned as a follow-up.
+    #[cfg(unix)]
     pub fn fileno(&self) -> RawFd {
         #[cfg(target_os = "linux")]
         {
             self.efd.as_raw_fd()
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         {
             self.sock.as_raw_fd()
         }
     }
+    #[cfg(windows)]
+    pub fn fileno(&self) -> isize {
+        self.sem.as_raw_handle() as isize
+    }
 
-    /// The handshake socket fd. On Linux this differs from [`Self::fileno`] (the
-    /// eventfd) and signals **disconnect** via `POLLHUP` — register it with
-    /// the event loop alongside [`Self::fileno`] so publisher death is detected
-    /// even while idle. On macOS it equals [`Self::fileno`].
+    /// The handshake fd/handle. On Linux this differs from
+    /// [`Self::fileno`] (the eventfd) and signals **disconnect** via
+    /// `POLLHUP` — register it with the event loop alongside
+    /// [`Self::fileno`] so publisher death is detected even while idle.
+    /// On macOS it equals [`Self::fileno`].  On Windows this is the
+    /// named-pipe handle value (also distinct from `fileno()`).
+    #[cfg(unix)]
     pub fn socket_fileno(&self) -> RawFd {
         self.sock.as_raw_fd()
+    }
+    #[cfg(windows)]
+    pub fn socket_fileno(&self) -> isize {
+        self.pipe.as_raw_handle() as isize
     }
 
     /// Non-blocking: drain at most one wakeup signal and attempt one ring
     /// read.  Designed for event-loop callbacks (`asyncio.add_reader`).
-    ///
-    /// * `Ok(Some(msg))` — a message was received.
-    /// * `Ok(None)`      — no wakeup was pending (spurious wake or already drained).
-    /// * `Err(_)`        — publisher disconnected or I/O error.
     pub fn poll_recv(&mut self) -> Result<Option<Vec<u8>>> {
         if !self.try_drain_wakeup()? {
             return Ok(None);
@@ -271,22 +347,18 @@ impl Subscriber {
         Ok(self.try_receive())
     }
 
-    /// Drain exactly one wakeup unit without blocking.  Returns `Ok(true)`
-    /// if a wakeup was consumed, `Ok(false)` if none was pending.
+    /// Drain exactly one wakeup unit without blocking.
     fn try_drain_wakeup(&mut self) -> io::Result<bool> {
         #[cfg(target_os = "linux")]
         {
-            // eventfd is EFD_NONBLOCK | EFD_SEMAPHORE — read decrements by 1.
             match crate::waker::linux::eventfd_drain(self.efd.as_raw_fd()) {
                 Ok(_) => Ok(true),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(false),
                 Err(e) => Err(e),
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         {
-            // Use MSG_DONTWAIT so we don't have to toggle O_NONBLOCK on a
-            // socket that the blocking `receive()` path also uses.
             let mut byte = 0u8;
             // SAFETY: self.sock is an owned UnixStream (fd open); &mut byte
             // points to one stack byte; libc::recv writes at most 1 byte
@@ -303,7 +375,6 @@ impl Subscriber {
             if ret == 1 {
                 Ok(true)
             } else if ret == 0 {
-                // EOF: peer closed.
                 Err(io::Error::new(io::ErrorKind::UnexpectedEof, "publisher closed"))
             } else {
                 let e = io::Error::last_os_error();
@@ -314,13 +385,17 @@ impl Subscriber {
                 }
             }
         }
+        #[cfg(windows)]
+        {
+            crate::waker::windows::semaphore_drain(
+                self.sem.as_raw_handle() as crate::waker::windows::RawWinHandle,
+            )
+        }
     }
 
     // ── Internal wakeup helpers ───────────────────────────────────────────────
 
     /// Wait for one wakeup signal. `timeout_ms = -1` blocks indefinitely.
-    /// On Linux: `poll(2)` on eventfd + socket (disconnect detection).
-    /// On macOS: `read_exact(1)` on the socket (with optional read timeout).
     fn wait_wakeup(&mut self, timeout_ms: i32) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         {
@@ -329,11 +404,9 @@ impl Subscriber {
                 self.sock.as_raw_fd(),
                 timeout_ms,
             )?;
-            // Drain the eventfd counter (EFD_SEMAPHORE: returns 1, decrements
-            // by 1) so the next poll blocks if no further wakeups are pending.
             crate::waker::linux::eventfd_drain(self.efd.as_raw_fd())?;
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         {
             if timeout_ms < 0 {
                 let mut b = [0u8; 1];
@@ -347,9 +420,16 @@ impl Subscriber {
                 r?;
             }
         }
+        #[cfg(windows)]
+        {
+            crate::waker::windows::wait_wakeup(
+                self.sem.as_raw_handle() as crate::waker::windows::RawWinHandle,
+                self.pipe.as_raw_handle() as crate::waker::windows::RawWinHandle,
+                timeout_ms,
+            )?;
+        }
         // Publisher-restart check: a fresh publisher reused our mmap and
-        // bumped the generation.  Report EOF so the iterator terminates
-        // cleanly instead of reading from the logically-reset ring.
+        // bumped the generation.
         if self.ring.generation() != self.generation {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,

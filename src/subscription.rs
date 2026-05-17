@@ -1,8 +1,10 @@
 use crate::error::{Error, Result};
 use crate::subscriber::Subscriber;
 use std::io;
-use std::os::unix::io::RawFd;
 use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::unix::io::RawFd;
 
 /// A live subscription to a topic. Returned by [`crate::Bus::subscribe`].
 /// Implements `Iterator<Item = Result<Vec<u8>>>` for ergonomic loops.
@@ -40,22 +42,35 @@ impl Subscription {
         self.sub.cursor()
     }
 
-    /// The underlying wakeup file descriptor.
+    /// The underlying wakeup primitive.
     ///
-    /// On Linux this is the subscriber's `eventfd(2)`; on macOS it is the Unix
-    /// domain socket. Either way the fd becomes readable when a new message
-    /// is available, so callers can pass it to
-    /// `asyncio.get_event_loop().add_reader()` or any `epoll`/`kqueue`-based
-    /// poller for truly non-blocking receive.
+    /// On Unix this is a `RawFd` (eventfd on Linux, handshake socket on
+    /// macOS) — pass it to `asyncio.get_event_loop().add_reader()` or
+    /// any `epoll`/`kqueue`-based poller for non-blocking receive.
+    /// On Windows this is the semaphore HANDLE value as an `isize` —
+    /// asyncio on Windows uses IOCP, not file descriptors, so this
+    /// number is mostly diagnostic; a Windows-native async path is a
+    /// planned follow-up.
+    #[cfg(unix)]
     pub fn fileno(&self) -> RawFd {
         self.sub.fileno()
     }
+    #[cfg(windows)]
+    pub fn fileno(&self) -> isize {
+        self.sub.fileno()
+    }
 
-    /// The handshake socket fd. On Linux this differs from [`Self::fileno`] and
-    /// signals **publisher disconnect** via `POLLHUP`. Register both with
-    /// the event loop so disconnect is detected even while idle. On macOS
-    /// it equals [`Self::fileno`].
+    /// The handshake fd/handle.  On Linux this differs from
+    /// [`Self::fileno`] (the eventfd) and signals **publisher
+    /// disconnect** via `POLLHUP`; register both with the event loop so
+    /// disconnect is detected even while idle.  On macOS it equals
+    /// [`Self::fileno`].  On Windows this is the named-pipe HANDLE.
+    #[cfg(unix)]
     pub fn socket_fileno(&self) -> RawFd {
+        self.sub.socket_fileno()
+    }
+    #[cfg(windows)]
+    pub fn socket_fileno(&self) -> isize {
         self.sub.socket_fileno()
     }
 

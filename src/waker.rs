@@ -204,13 +204,11 @@ pub(crate) mod windows {
     //! own handle table.  No reply needed.
     use std::ffi::CString;
     use std::io;
-    use std::os::windows::io::{
-        AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle, RawHandle,
-    };
+    use std::os::windows::io::{FromRawHandle, OwnedHandle, RawHandle};
 
     use windows_sys::Win32::Foundation::{
         CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, ERROR_PIPE_CONNECTED, FALSE, HANDLE,
-        INVALID_HANDLE_VALUE, TRUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileA, ReadFile, WriteFile, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
@@ -491,24 +489,8 @@ pub(crate) mod windows {
         Ok(())
     }
 
-    // ── Sanity: unused-warning suppression for the constants we re-export ────
-    #[allow(dead_code)]
-    const _SUPPRESS_UNUSED: (u32, u32) = (TRUE as u32, INFINITE);
-
-    // Re-export some types for callers in publisher.rs / subscriber.rs that
-    // would otherwise need their own `use windows_sys::...` blocks.
+    // Re-export the raw HANDLE type so callers in publisher.rs /
+    // subscriber.rs can cast `as_raw_handle()` results without their
+    // own `use windows_sys::...` block.
     pub use windows_sys::Win32::Foundation::HANDLE as RawWinHandle;
-
-    /// Helper: convert an `OwnedHandle` to a `RawWinHandle` borrow that
-    /// stays valid for the OwnedHandle's lifetime.
-    pub fn as_handle(h: &OwnedHandle) -> RawWinHandle {
-        h.as_raw_handle() as RawWinHandle
-    }
-
-    /// Helper: take an `OwnedHandle` apart into its raw value (caller
-    /// promises to wrap it again before drop).  Used when handing a
-    /// handle off to a Client struct that owns it via a separate path.
-    pub fn into_raw(h: OwnedHandle) -> RawWinHandle {
-        h.into_raw_handle() as RawWinHandle
-    }
 }
