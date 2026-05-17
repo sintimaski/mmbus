@@ -20,6 +20,28 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+/// Per-peer transport selector.  Used as a TOML enum (lowercase
+/// strings) via serde rename_all.
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TransportKind {
+    /// Plain TCP — default; works without any Cargo features enabled.
+    #[default]
+    Tcp,
+    /// QUIC + TLS 1.3 with self-signed peer-pinned certs.  Requires
+    /// the bridge to be built with `--features quic`.
+    Quic,
+}
+
+impl TransportKind {
+    pub fn is_tcp(self) -> bool {
+        matches!(self, TransportKind::Tcp)
+    }
+    pub fn is_quic(self) -> bool {
+        matches!(self, TransportKind::Quic)
+    }
+}
+
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BridgeConfig {
@@ -54,6 +76,31 @@ pub struct BridgeConfig {
     /// rather pay memory than drop.
     #[serde(default = "default_peer_buffer_max")]
     pub peer_buffer_max: usize,
+
+    /// QUIC listen address (separate from TCP `listen`).  When `None`,
+    /// the bridge doesn't accept incoming QUIC connections.  Requires
+    /// `--features quic` to actually serve traffic; a config that
+    /// sets this without the feature is rejected at startup.
+    #[serde(default)]
+    pub listen_quic: Option<String>,
+
+    /// Path to the bridge's self-signed QUIC certificate (PEM-encoded).
+    /// Created at first start if missing.  Default: `bridge.cert.pem`
+    /// next to `base_dir`.
+    #[serde(default)]
+    pub quic_cert_path: Option<PathBuf>,
+
+    /// Path to the bridge's QUIC private key (PEM-encoded).
+    /// Created at first start if missing; chmod 600.  Default:
+    /// `bridge.key.pem` next to `base_dir`.
+    #[serde(default)]
+    pub quic_key_path: Option<PathBuf>,
+
+    /// Worker threads for the bridge's QUIC tokio runtime.  Default 2.
+    /// Most workloads don't need to tune this; bump only if you're
+    /// driving high QUIC traffic and see the runtime saturating.
+    #[serde(default = "default_quic_worker_threads")]
+    pub quic_worker_threads: usize,
 
     /// Topics this bridge forwards out / accepts in.  Order is
     /// preserved; duplicate names are not deduplicated (the bridge
@@ -94,6 +141,14 @@ pub struct PeerConfig {
     /// Pre-shared key the bridge sends in `peer-hello`.  Symmetric +
     /// out-of-band-distributed in v1; no PKI, no rotation.
     pub preshared_key: String,
+    /// Wire transport for this peer.  Default: TCP.
+    #[serde(default)]
+    pub transport: TransportKind,
+    /// QUIC peer cert fingerprint (`sha256:HEX...`).  Required when
+    /// `transport = "quic"`; ignored for TCP.  The bridge pins the
+    /// remote's cert to this value (SSH-known_hosts-style trust).
+    #[serde(default)]
+    pub peer_cert_fingerprint: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -102,6 +157,10 @@ fn default_true() -> bool {
 
 fn default_peer_buffer_max() -> usize {
     4096
+}
+
+fn default_quic_worker_threads() -> usize {
+    2
 }
 
 #[derive(Debug, Error)]
@@ -120,6 +179,17 @@ pub enum ConfigError {
 
     #[error("two peers share the name {0:?} — names must be unique")]
     DuplicatePeerName(String),
+
+    #[error(
+        "peer {0:?} uses transport=\"quic\" but has no peer_cert_fingerprint — pin the remote's cert"
+    )]
+    QuicPeerMissingFingerprint(String),
+
+    #[error("peer_cert_fingerprint on {peer:?} must look like \"sha256:HEX\" — got {got:?}")]
+    BadCertFingerprint { peer: String, got: String },
+
+    #[error("quic_worker_threads must be >= 1")]
+    QuicWorkerThreadsZero,
 }
 
 impl BridgeConfig {
@@ -151,6 +221,13 @@ impl BridgeConfig {
             if !peer.endpoint.contains(':') {
                 return Err(ConfigError::BadEndpoint(peer.endpoint.clone()));
             }
+            if peer.transport.is_quic() {
+                let fp = peer
+                    .peer_cert_fingerprint
+                    .as_deref()
+                    .ok_or_else(|| ConfigError::QuicPeerMissingFingerprint(peer.name.clone()))?;
+                validate_cert_fingerprint(&peer.name, fp)?;
+            }
         }
         let mut seen = std::collections::HashSet::new();
         for peer in &self.peers {
@@ -158,8 +235,33 @@ impl BridgeConfig {
                 return Err(ConfigError::DuplicatePeerName(peer.name.clone()));
             }
         }
+        if self.quic_worker_threads == 0 {
+            return Err(ConfigError::QuicWorkerThreadsZero);
+        }
         Ok(())
     }
+}
+
+/// Loose validation: the fingerprint must start with `sha256:` and have
+/// at least one hex byte.  We don't decode here — `transport::quic`
+/// will reject a bad-on-decode value at startup.
+fn validate_cert_fingerprint(peer: &str, fp: &str) -> Result<(), ConfigError> {
+    let rest = match fp.strip_prefix("sha256:") {
+        Some(r) => r,
+        None => {
+            return Err(ConfigError::BadCertFingerprint {
+                peer: peer.to_owned(),
+                got: fp.to_owned(),
+            });
+        }
+    };
+    if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ConfigError::BadCertFingerprint {
+            peer: peer.to_owned(),
+            got: fp.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -284,6 +386,99 @@ mod tests {
         "#;
         let err = BridgeConfig::from_str(text).unwrap_err();
         assert!(matches!(err, ConfigError::Toml(_)), "expected Toml parse error, got {err:?}");
+    }
+
+    #[test]
+    fn quic_peer_requires_fingerprint() {
+        let text = r#"
+            bus = "demo"
+            [[peers]]
+            name = "p"
+            endpoint = "h:1"
+            preshared_key = "k"
+            transport = "quic"
+        "#;
+        match BridgeConfig::from_str(text) {
+            Err(ConfigError::QuicPeerMissingFingerprint(s)) => assert_eq!(s, "p"),
+            other => panic!("expected QuicPeerMissingFingerprint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quic_peer_with_good_fingerprint_parses() {
+        let text = r#"
+            bus = "demo"
+            [[peers]]
+            name = "p"
+            endpoint = "h:1"
+            preshared_key = "k"
+            transport = "quic"
+            peer_cert_fingerprint = "sha256:DEADBEEF"
+        "#;
+        let cfg = BridgeConfig::from_str(text).unwrap();
+        assert_eq!(cfg.peers[0].transport, TransportKind::Quic);
+        assert_eq!(
+            cfg.peers[0].peer_cert_fingerprint.as_deref(),
+            Some("sha256:DEADBEEF")
+        );
+    }
+
+    #[test]
+    fn quic_peer_with_bad_fingerprint_rejected() {
+        for fp in ["sha256:XYZ", "md5:abc", "no-prefix", "sha256:"] {
+            let text = format!(
+                r#"
+                    bus = "demo"
+                    [[peers]]
+                    name = "p"
+                    endpoint = "h:1"
+                    preshared_key = "k"
+                    transport = "quic"
+                    peer_cert_fingerprint = "{fp}"
+                "#,
+            );
+            match BridgeConfig::from_str(&text) {
+                Err(ConfigError::BadCertFingerprint { peer, got }) => {
+                    assert_eq!(peer, "p");
+                    assert_eq!(got, fp);
+                }
+                other => panic!("fp={fp:?} expected BadCertFingerprint, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn quic_listen_and_paths_parse() {
+        let text = r#"
+            bus = "demo"
+            listen_quic = "0.0.0.0:4443"
+            quic_cert_path = "/etc/mmbus/cert.pem"
+            quic_key_path = "/etc/mmbus/key.pem"
+            quic_worker_threads = 4
+        "#;
+        let cfg = BridgeConfig::from_str(text).unwrap();
+        assert_eq!(cfg.listen_quic.as_deref(), Some("0.0.0.0:4443"));
+        assert_eq!(
+            cfg.quic_cert_path.as_deref(),
+            Some(Path::new("/etc/mmbus/cert.pem"))
+        );
+        assert_eq!(
+            cfg.quic_key_path.as_deref(),
+            Some(Path::new("/etc/mmbus/key.pem"))
+        );
+        assert_eq!(cfg.quic_worker_threads, 4);
+    }
+
+    #[test]
+    fn quic_worker_threads_zero_rejected() {
+        let text = r#"
+            bus = "demo"
+            quic_worker_threads = 0
+        "#;
+        match BridgeConfig::from_str(text) {
+            Err(ConfigError::QuicWorkerThreadsZero) => (),
+            other => panic!("expected QuicWorkerThreadsZero, got {other:?}"),
+        }
     }
 
     #[test]

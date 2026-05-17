@@ -6,11 +6,25 @@ description = "Cross-machine relay for mmbus topics over TCP/QUIC"
 license = "MIT"
 publish = false
 
+[features]
+default = []
+# Enable the QUIC transport behind `--features quic`.  Pulls in tokio,
+# quinn, rustls, and rcgen; the TCP-only build stays slim.  See
+# `docs/rfc-b4b-quic.md` for the design.
+quic = ["dep:quinn", "dep:tokio", "dep:rustls", "dep:rcgen", "dep:rustls-pki-types"]
+
 [dependencies]
 mmbus = { path = ".." }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 thiserror = "1"
+
+# `quic` feature dependencies — all optional + off by default.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"], optional = true }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "io-util", "sync", "time", "net"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+rustls-pki-types = { version = "1", optional = true }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

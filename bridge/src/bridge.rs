@@ -29,7 +29,7 @@
 //! the second one with `AlreadyPublishing`).  Reader threads funnel
 //! `(topic, payload)` pairs to it via an mpsc channel.
 
-use crate::config::BridgeConfig;
+use crate::config::{BridgeConfig, TransportKind};
 use crate::frame::{decode, parse_peer_hello, DecodeError, Frame, FrameType};
 use crate::queue;
 use mmbus::{Bus, BusConfig};
@@ -85,6 +85,23 @@ impl Bridge {
     /// Spin up subscriber + forwarder threads.  Returns once threads
     /// are running (does NOT block on traffic).
     pub fn start(cfg: &BridgeConfig) -> Result<Self, BridgeError> {
+        // Fail fast if the config asks for QUIC features the build
+        // can't deliver.  Better an explicit startup error than a
+        // mysterious "peer never connects" later.
+        #[cfg(not(feature = "quic"))]
+        {
+            if cfg.listen_quic.is_some() {
+                return Err(BridgeError::QuicNotCompiled {
+                    reason: "listen_quic is set",
+                });
+            }
+            if cfg.peers.iter().any(|p| p.transport.is_quic()) {
+                return Err(BridgeError::QuicNotCompiled {
+                    reason: "one or more peers use transport = \"quic\"",
+                });
+            }
+        }
+
         let origin_id = cfg.origin_id.unwrap_or_else(random_origin_id);
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -95,24 +112,46 @@ impl Bridge {
         // One outbound channel per peer.  Drop-oldest bounded queue —
         // slow peers cannot stall the publisher.  Each forwarder
         // sends a PeerHello stamped with that peer's PSK so the
-        // receiving bridge can authenticate the connection.
+        // receiving bridge can authenticate the connection.  TCP peers
+        // get a sync forwarder thread; QUIC peers will get hooked into
+        // the QUIC runtime in B4b-2.
         let mut peer_tx = Vec::new();
         let mut fwd_threads = Vec::new();
         for peer in &cfg.peers {
             let (tx, rx) = queue::channel::<Vec<u8>>(cfg.peer_buffer_max);
             peer_tx.push(tx);
-            let endpoint = peer.endpoint.clone();
-            let name = peer.name.clone();
-            let shutdown_clone = shutdown.clone();
-            let hello = {
-                let mut buf = Vec::new();
-                Frame::peer_hello_with_psk(origin_id, peer.preshared_key.as_bytes())
-                    .encode(&mut buf);
-                buf
-            };
-            fwd_threads.push(thread::spawn(move || {
-                forwarder_main(name, endpoint, hello, rx, shutdown_clone);
-            }));
+            match peer.transport {
+                TransportKind::Tcp => {
+                    let endpoint = peer.endpoint.clone();
+                    let name = peer.name.clone();
+                    let shutdown_clone = shutdown.clone();
+                    let hello = {
+                        let mut buf = Vec::new();
+                        Frame::peer_hello_with_psk(
+                            origin_id,
+                            peer.preshared_key.as_bytes(),
+                        )
+                        .encode(&mut buf);
+                        buf
+                    };
+                    fwd_threads.push(thread::spawn(move || {
+                        forwarder_main(name, endpoint, hello, rx, shutdown_clone);
+                    }));
+                }
+                TransportKind::Quic => {
+                    // B4b-2 hooks this rx into the QUIC runtime.  Until
+                    // then we drop the rx — any bytes the subscriber
+                    // sends to it just queue + evict.  This branch is
+                    // unreachable in the TCP-only build (we already
+                    // rejected QUIC peers above).
+                    let _ = rx;
+                    eprintln!(
+                        "bridge: peer {:?} requests QUIC transport — \
+                         not yet wired (B4b-2 in progress)",
+                        peer.name
+                    );
+                }
+            }
         }
 
         // One subscriber per topic with `forward = true`.
@@ -264,6 +303,15 @@ pub enum BridgeError {
 
     #[error("failed to bind listen socket: {0}")]
     Listen(std::io::Error),
+
+    /// Config asks for QUIC behaviour but this binary was built
+    /// without `--features quic`.  Rebuild with the feature on, or
+    /// remove the QUIC config entries.
+    #[error(
+        "QUIC requested in config ({reason}) but this build lacks `--features quic`; \
+         rebuild with `cargo build --features quic`"
+    )]
+    QuicNotCompiled { reason: &'static str },
 }
 
 // ── Implementation details ────────────────────────────────────────────────────
