@@ -23,7 +23,7 @@ This is a **work in progress**.  Stages, in order:
 | B2    | Receive from peer + drop self-originated (loop prevention) + republish locally | shipped |
 | B3    | N-peer mesh + per-peer drop-oldest bounded buffer | shipped |
 | B4a   | Preshared-key authentication on TCP (PeerHello PSK validation) | shipped |
-| B4b   | QUIC (quinn) transport behind a feature flag | RFC: [`../docs/rfc-b4b-quic.md`](../docs/rfc-b4b-quic.md) |
+| B4b   | QUIC (quinn) transport behind a feature flag | shipped (see [`../docs/rfc-b4b-quic.md`](../docs/rfc-b4b-quic.md) for the design) |
 | B5    | Python helper `mmbus.bridge.{run,spawn}` + systemd unit | shipped |
 
 Today the binary loads + validates a TOML config and prints a summary,
@@ -44,8 +44,16 @@ build.
 ## Install
 
 ```bash
-cargo install --path .   # places mmbus-bridge on $PATH (~/.cargo/bin)
+# TCP-only build (default, no extra deps).
+cargo install --path .
+
+# TCP + QUIC build (adds quinn + tokio + rustls + rcgen ~ 10 s
+# longer cold build; runtime cost is zero when no QUIC peers are
+# configured).
+cargo install --path . --features quic
 ```
+
+…both place `mmbus-bridge` on `$PATH` (`~/.cargo/bin` by default).
 
 Then either run it manually:
 
@@ -77,3 +85,22 @@ See [`sample-config.toml`](sample-config.toml) for an annotated
 example.  Required fields: `bus`.  Everything else has sensible
 defaults; the validator rejects empty bus names, malformed endpoints,
 and duplicate peer names.
+
+### QUIC peer example
+
+```toml
+[[peers]]
+name = "machine-b-quic"
+endpoint = "machine-b.internal:4443"
+preshared_key = "..."
+transport = "quic"
+peer_cert_fingerprint = "sha256:DEADBEEF..."   # see "Cert pinning"
+```
+
+A bridge that wants to *receive* QUIC traffic adds the top-level
+`listen_quic = "0.0.0.0:4443"` field.  On first start the bridge
+generates a self-signed cert at `${base_dir}/bridge.cert.der` +
+`bridge.key.der` (paths overridable via `quic_cert_path` /
+`quic_key_path`) and logs its SHA-256 fingerprint.  Copy that
+fingerprint into the peer bridge's `peer_cert_fingerprint` — same
+trust model as SSH known_hosts.

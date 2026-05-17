@@ -1,7 +1,7 @@
 # mmbus-bridge systemd unit template.
 #
 # Install:
-#   1. cargo install --path /path/to/mmbus/bridge
+#   1. cargo install --path /path/to/mmbus/bridge [--features quic]
 #      (binary lands at $HOME/.cargo/bin/mmbus-bridge for the build
 #      user; copy to /usr/local/bin for the service account.)
 #   2. cp mmbus-bridge.service /etc/systemd/system/
@@ -13,6 +13,11 @@
 # The bridge process opens local IPC files under BusConfig.base_dir
 # (which is overridable in the bridge config TOML).  Ensure the service
 # User has read+write access to that directory.
+#
+# QUIC builds additionally read/write two files at quic_cert_path and
+# quic_key_path (default base_dir/bridge.cert.der + bridge.key.der).
+# The key file is chmod 600 by the bridge on first start; the service
+# User must own both paths.
 
 [Unit]
 Description=mmbus cross-machine relay

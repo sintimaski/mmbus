@@ -15,6 +15,15 @@ bus = "demo"
 # windows reset after a restart, which is fine for most use cases.
 # origin_id = 1234567890123456789
 
+# Optional QUIC settings (require `cargo install --features quic`).
+# Uncomment to accept incoming QUIC connections; the bridge creates a
+# self-signed cert at first start and logs its fingerprint — copy that
+# fingerprint into the peer bridge's `peer_cert_fingerprint`.
+# listen_quic = "0.0.0.0:4443"
+# quic_cert_path = "/var/lib/mmbus/bridge.cert.der"   # default: base_dir/bridge.cert.der
+# quic_key_path  = "/var/lib/mmbus/bridge.key.der"    # default: base_dir/bridge.key.der
+# quic_worker_threads = 2                              # default: 2
+
 # Topics this bridge cares about.  `forward = true` (the default) sends
 # locally-published messages to all peers; `receive = true` (the
 # default) republishes peer-originated messages locally.
@@ -43,3 +52,13 @@ receive = false   # ingest-only: alerts only flow OUT to peers
 name = "machine-b"
 endpoint = "machine-b.internal:4443"
 preshared_key = "REPLACE-ME-WITH-A-LONG-RANDOM-STRING"
+# transport = "tcp"   # default; "quic" requires the matching feature
+                       # build + a peer_cert_fingerprint below.
+
+# Example QUIC peer.  Uncomment + edit to enable.
+# [[peers]]
+# name = "machine-c-quic"
+# endpoint = "machine-c.internal:4443"
+# preshared_key = "REPLACE-ME"
+# transport = "quic"
+# peer_cert_fingerprint = "sha256:DEADBEEFCAFE..."   # from the peer's startup log

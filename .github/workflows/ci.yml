@@ -56,3 +56,40 @@ jobs:
 
       - name: Python smoke
         run: python python/smoke_test.py
+
+  bridge:
+    name: Bridge (${{ matrix.os }}, ${{ matrix.features }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The bridge crate is a standalone workspace, so it needs its
+        # own job.  We test both feature configurations: TCP-only (the
+        # default) and TCP+QUIC.  Windows is excluded for now — quinn
+        # builds on Windows but our QUIC code hasn't been validated
+        # there; the TCP-only path is exercised under the main `test`
+        # job's `cargo test --all-features` invocation.
+        os: [ubuntu-latest, macos-latest]
+        features: ["", "--features quic"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "bridge -> target"
+          prefix-key: "v0-rust-bridge"
+          key: ${{ matrix.features }}
+
+      - name: cargo test
+        working-directory: bridge
+        run: cargo test ${{ matrix.features }}
+
+      - name: cargo clippy
+        working-directory: bridge
+        run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
