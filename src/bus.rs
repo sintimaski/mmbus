@@ -1,10 +1,12 @@
 use crate::config::BusConfig;
-use crate::error::Result;
+use crate::error::{Error, Result};
+use crate::producer_lock::acquire_producer_lock;
 use crate::publisher::Publisher;
 use crate::stats::TopicStats;
 use crate::subscriber::Subscriber;
 use crate::subscription::Subscription;
 use std::collections::HashMap;
+use std::fs;
 use std::time::Duration;
 
 /// Named pub-sub namespace. Topics are independent channels within the
@@ -76,6 +78,31 @@ impl Bus {
     /// Returns `None` if no publisher has been created for `topic` in this Bus.
     pub fn stats(&self, topic: &str) -> Option<TopicStats> {
         self.publishers.get(topic).map(|p| p.stats())
+    }
+
+    /// Remove all on-disk state for `topic` (ring file, signal socket,
+    /// producer lock).  Refuses with `Error::AlreadyPublishing` if any
+    /// process — including this one — is currently publishing.
+    ///
+    /// Intended for test setup / dev tooling.  Existing subscribers keep
+    /// working from their already-mmap'd pages until they drop; new
+    /// subscribers will see "no such topic" until something publishes
+    /// again.  Never call this against a topic in active production use.
+    pub fn clean_topic(&mut self, topic: &str) -> Result<()> {
+        // Drop our own cached publisher first so the in-process lock is
+        // released — otherwise `acquire_producer_lock` below would refuse.
+        self.publishers.remove(topic);
+
+        let dir = self.config.base_dir.join(&self.name).join(topic);
+        if !dir.exists() {
+            return Ok(());
+        }
+        // Acquire the producer lock as a "no-one is publishing" gate.  We
+        // hold it across `remove_dir_all`; the lock file gets unlinked too,
+        // but our fd keeps `flock` semantics until `_guard` drops.
+        let _guard = acquire_producer_lock(topic, &dir)?;
+        fs::remove_dir_all(&dir).map_err(Error::Io)?;
+        Ok(())
     }
 
     // ── Internal ──────────────────────────────────────────────────────────────

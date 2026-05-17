@@ -81,4 +81,11 @@ impl PyBus {
     fn stats(&self, topic: &str) -> Option<PyTopicStats> {
         self.inner.stats(topic).map(PyTopicStats::from)
     }
+
+    /// Remove all on-disk state for ``topic``.  Raises
+    /// :exc:`AlreadyPublishingError` if a publisher is active anywhere
+    /// (including this process).  For test setup / dev tooling only.
+    fn clean_topic(&mut self, topic: &str) -> PyResult<()> {
+        self.inner.clean_topic(topic).map_err(mmbus_err)
+    }
 }

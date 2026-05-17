@@ -104,6 +104,12 @@ class Bus:
         """Return a :class:`TopicStats` snapshot, or ``None`` if no publisher."""
         return self._bus.stats(topic)
 
+    def clean_topic(self, topic: str) -> None:
+        """Remove all on-disk state for *topic* (ring file, signal socket,
+        producer lock).  Raises :exc:`AlreadyPublishingError` if a publisher
+        is currently active.  For test setup and dev tooling only."""
+        self._bus.clean_topic(topic)
+
     # ── Context-manager protocol ──────────────────────────────────────────────
 
     def __enter__(self):
