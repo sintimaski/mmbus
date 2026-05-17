@@ -245,6 +245,9 @@ See [`docs/roadmap.md`](docs/roadmap.md).
 - [`docs/architecture.md`](docs/architecture.md) — technical design
 - [`docs/research.md`](docs/research.md) — competitive landscape and signals
 - [`docs/roadmap.md`](docs/roadmap.md) — development phases
+- [`docs/rfc-wal-replay.md`](docs/rfc-wal-replay.md) — design for late-subscriber replay
+- [`docs/rfc-multi-machine.md`](docs/rfc-multi-machine.md) — design for the `mmbus-bridge` relay
+- [`docs/rfc-windows.md`](docs/rfc-windows.md) — design for Windows support
 
 ## License
 
