@@ -131,10 +131,11 @@ Needs `pip install anyio`; the import is lazy so it's a true opt-in.
 
 ## Performance
 
-Two layers worth measuring separately. Numbers from `cargo bench` on an
-Apple M-series laptop (`benches/ring.rs` + `benches/e2e.rs`).
+Three regimes worth measuring separately.  Numbers from `cargo bench` /
+`benches/compare.py` on an Apple M-series laptop.
 
-**Ring layer alone** — in-process publish + receive of a slot, no IPC wakeup:
+**1. Rust ring layer alone** — in-process publish + receive of a slot,
+no IPC wakeup:
 
 | Payload | Per-op cost | Throughput   |
 |---------|-------------|--------------|
@@ -144,28 +145,40 @@ Apple M-series laptop (`benches/ring.rs` + `benches/e2e.rs`).
 
 Single-message round-trip latency (publish + read, 32 B payload): **~11 ns**.
 
-**End-to-end** — separate publisher and subscriber threads, including the
-per-message wakeup syscall (`eventfd` on Linux, Unix-socket byte on macOS):
+**2. Rust end-to-end** — separate publisher and subscriber threads
+including the per-message wakeup syscall (`eventfd` Linux, Unix-socket
+byte macOS):
 
 | Payload | Per-msg cost | Throughput     |
 |---------|--------------|----------------|
 | 32 B    | ~740 ns      | ~1.36M msg/s   |
 | 256 B   | ~720 ns      | ~1.39M msg/s   |
 
-The wakeup syscall dominates the e2e number; for fan-out workloads where
-the publisher is faster than any single subscriber, the ring-layer
-numbers are what matters in practice.  Reference points from public IPC
-benchmarks (arXiv 2508.07934 and Linux IPC shootouts) for comparison:
+The wakeup syscall dominates; for fan-out workloads where the publisher
+outpaces any single subscriber, the ring-layer numbers in (1) are what
+matter in practice.
 
-| Transport               | P50 latency | Throughput      |
-|-------------------------|-------------|-----------------|
-| **mmbus (e2e)**         | **~740 ns** | **~1.36M msg/s**|
-| POSIX message queue     | ~2.7 µs     | 364K msg/s      |
-| ZeroMQ IPC              | ~20–40 µs   | 481K msg/s      |
-| Redis pub/sub           | ~17 µs      | 59K msg/s       |
-| `multiprocessing.Queue` | ~6 µs       | 80–175K msg/s   |
+**3. From Python** — `benches/compare.py` runs an apples-to-apples
+cross-thread bench against `pyzmq` over `ipc://`, 10 000 messages each:
 
-Reproduce: `cargo bench --bench ring && cargo bench --bench e2e`.
+| Payload | mmbus              | pyzmq              | gap |
+|---------|--------------------|--------------------|-----|
+| 64 B    | ~272 K msg/s       | ~889 K msg/s       | pyzmq ~3× faster |
+| 1024 B  | ~198 K msg/s       | ~746 K msg/s       | pyzmq ~4× faster |
+| 16384 B | ~17 K msg/s        | ~204 K msg/s       | pyzmq ~12× faster |
+
+**Honest take:** for small Python publishes, pyzmq today is faster than
+mmbus.  Its Cython wrapper batches messages into a single socket write
+on a background I/O thread, while mmbus does one PyO3 call + one
+wakeup syscall + one `PyBytes` allocation per message.  Where mmbus
+wins is at the **Rust level** (table 1: ~40M ops/s, ~25 ns
+roundtrip) and in the operational story: no broker, no daemon, single
+`pip install`.  Until we add a zero-copy `memoryview` recv path (open;
+see roadmap), pyzmq is the right pick for high-rate small-payload
+Python pub/sub.
+
+Reproduce: `cargo bench --bench ring && cargo bench --bench e2e &&
+python benches/compare.py`.
 
 ## How it works
 

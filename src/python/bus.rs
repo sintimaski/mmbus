@@ -40,8 +40,14 @@ impl PyBus {
     ///
     /// Raises :exc:`BusFullError` if the ring is saturated (backpressure
     /// policy ``Error``, the default).
-    fn publish(&mut self, topic: &str, data: &[u8]) -> PyResult<()> {
-        self.inner.publish(topic, data).map_err(mmbus_err)
+    ///
+    /// Releases the GIL: the wakeup-broadcast step can block briefly if a
+    /// subscriber's wakeup-channel buffer is full (macOS socket SO_SNDBUF
+    /// or Linux eventfd at U64::MAX).  Holding the GIL across that
+    /// would deadlock against a Python subscriber thread trying to drain.
+    fn publish(&mut self, py: Python<'_>, topic: &str, data: &[u8]) -> PyResult<()> {
+        py.allow_threads(|| self.inner.publish(topic, data))
+            .map_err(mmbus_err)
     }
 
     /// Subscribe to ``topic`` with a custom connection timeout (seconds).

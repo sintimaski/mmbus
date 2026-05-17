@@ -112,7 +112,12 @@ All notable changes to mmbus are recorded here.  Format follows
 - **Buffer protocol / `memoryview`**: `recv()` copies the payload out
   of the ring into a Python `bytes` object.  A zero-copy `memoryview`
   path would require pinning slots against publisher overwrite — a
-  significant ring redesign; deferred.
+  significant ring redesign; deferred.  This copy + lack of message
+  batching is the main reason `pyzmq` outperforms mmbus 3–12× for
+  small-payload Python pub/sub today (see README "Performance" §3).
+  Where mmbus already wins is at the Rust API level (~40M ring ops/s,
+  ~25 ns roundtrip) and operationally (no broker / single `pip
+  install`).
 
 ### Breaking changes from pre-release
 
