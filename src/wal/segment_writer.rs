@@ -61,6 +61,11 @@ impl SegmentWriter {
         let mut file = BufWriter::new(file);
         let header = encode_segment_header(first_cursor);
         file.write_all(&header)?;
+        // Flush + fsync the header so the segment is immediately
+        // visible to concurrent readers (and durable across a crash
+        // mid-rotation).  One-time cost per segment open.
+        file.flush()?;
+        file.get_ref().sync_data()?;
         Ok(Self {
             path: path.to_owned(),
             file,

@@ -65,6 +65,15 @@ pub struct SegmentReader {
     /// can compare to the running position and surface ShortRead
     /// before issuing the read.
     file_len: u64,
+    /// Current byte offset for the next `next_record()` call.
+    /// Survives across `iter()` calls so a SegmentReader can act as
+    /// a stateful cursor without re-reading from the header on every
+    /// borrow.  Initialised to `SEGMENT_HEADER_LEN`.
+    pos: u64,
+    /// Sticky error flag — once a record fails to decode, subsequent
+    /// `next_record()` calls return `None` (the caller should run
+    /// recovery if needed).
+    halted: bool,
 }
 
 impl SegmentReader {
@@ -83,7 +92,35 @@ impl SegmentReader {
             Err(e) => return Err(ReaderError::Io(e)),
         };
         let header = SegmentHeader::parse(&header_bytes)?;
-        Ok(Self { path: path.to_owned(), header, file, file_len })
+        Ok(Self {
+            path: path.to_owned(),
+            header,
+            file,
+            file_len,
+            pos: SEGMENT_HEADER_LEN as u64,
+            halted: false,
+        })
+    }
+
+    /// Advance one record and return it.  Returns `None` at clean EOF
+    /// (or after any prior error halted the reader).  Position is
+    /// owned by the reader, so this can be called across multiple
+    /// scopes / iterators without re-seeking from the header.
+    pub fn next_record(&mut self) -> Option<Result<Record, ReaderError>> {
+        if self.halted {
+            return None;
+        }
+        match read_one_record(&mut self.file, self.pos, self.file_len) {
+            Ok(Some((record, advance))) => {
+                self.pos += advance;
+                Some(Ok(record))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                self.halted = true;
+                Some(Err(e))
+            }
+        }
     }
 
     pub fn header(&self) -> &SegmentHeader {
@@ -98,41 +135,27 @@ impl SegmentReader {
         self.file_len
     }
 
-    /// Yield records in order from the current position.  Stops at
-    /// the first error (the caller decides whether to give up or
-    /// invoke `recover_truncate`).
+    /// Yield records in order from the reader's current position.
+    /// Position is owned by the SegmentReader, so calling `iter()`
+    /// twice continues where the first left off — it does NOT rewind.
+    /// Halts on the first error.
     pub fn iter(&mut self) -> RecordIter<'_> {
-        RecordIter { reader: self, pos: SEGMENT_HEADER_LEN as u64, halted: false }
+        RecordIter { reader: self }
     }
 }
 
 /// Iterator returned by [`SegmentReader::iter`].  Yields
 /// `Result<Record, ReaderError>`; halts permanently on the first
-/// error.
+/// error.  Position is owned by the underlying SegmentReader.
 pub struct RecordIter<'a> {
     reader: &'a mut SegmentReader,
-    pos: u64,
-    halted: bool,
 }
 
 impl<'a> Iterator for RecordIter<'a> {
     type Item = Result<Record, ReaderError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.halted {
-            return None;
-        }
-        match read_one_record(&mut self.reader.file, self.pos, self.reader.file_len) {
-            Ok(Some((record, advance))) => {
-                self.pos += advance;
-                Some(Ok(record))
-            }
-            Ok(None) => None, // clean EOF
-            Err(e) => {
-                self.halted = true;
-                Some(Err(e))
-            }
-        }
+        self.reader.next_record()
     }
 }
 
