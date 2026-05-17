@@ -53,11 +53,13 @@ The bridge crate is a standalone workspace (its `Cargo.toml` has an
 empty `[workspace]` block) so the parent `cargo test` does not pull
 in its network deps.  Build via `cd bridge && cargo test`.
 
-## WAL Phase B — write a real RFC first
+## WAL Phase B
 
-The current `rfc-wal-replay.md` defers Phase B explicitly.  Before
-writing code, draft `rfc-wal-phase-b.md` that answers: file format
-(length prefix, CRC, magic), fsync policy (per publish vs periodic),
-rotation (size vs time), retention, index strategy, ring↔WAL handoff
-race, crash recovery scan.  Each question has multi-way trade-offs;
-the spec is the deliverable for the first session.
+RFC drafted at [`rfc-wal-phase-b.md`](rfc-wal-phase-b.md).  Covers:
+on-disk format (length-prefixed records, per-record CRC32C, segment
+headers), three fsync policies (none / batched / each), rotation
+(size-based, 64 MiB segments), retention (size-based, 1 GiB default),
+in-memory index, ring↔WAL handoff race, crash recovery via
+truncate-on-CRC-mismatch.  Implementation breaks into five staged
+PRs (W1a..W1e); each builds on the previous and ships green
+independently.

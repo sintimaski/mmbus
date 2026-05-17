@@ -275,7 +275,8 @@ the threat model and how to report issues.
 - [`docs/architecture.md`](docs/architecture.md) — technical design
 - [`docs/research.md`](docs/research.md) — competitive landscape and signals
 - [`docs/roadmap.md`](docs/roadmap.md) — development phases
-- [`docs/rfc-wal-replay.md`](docs/rfc-wal-replay.md) — design for late-subscriber replay
+- [`docs/rfc-wal-replay.md`](docs/rfc-wal-replay.md) — Phase A (in-ring history, shipped)
+- [`docs/rfc-wal-phase-b.md`](docs/rfc-wal-phase-b.md) — Phase B (durable WAL) full spec
 - [`docs/rfc-multi-machine.md`](docs/rfc-multi-machine.md) — design for the `mmbus-bridge` relay
 - [`docs/rfc-windows.md`](docs/rfc-windows.md) — design for Windows support
 

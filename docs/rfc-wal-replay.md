@@ -1,8 +1,9 @@
 # RFC: Replay for late subscribers
 
 **Status:** Phase A **shipped** (see `Bus::subscribe_with_history` /
-`Bus::subscribe_from`).  Phase B (durable WAL) remains a separate
-project worth its own RFC.
+`Bus::subscribe_from`).  Phase B (durable WAL) is specified in
+[`rfc-wal-phase-b.md`](rfc-wal-phase-b.md); implementation is the next
+multi-week chunk of work.
 **Owner:** _unassigned_
 
 ## 1. Problem
