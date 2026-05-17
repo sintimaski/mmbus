@@ -29,7 +29,6 @@ All notable changes to mmbus are recorded here.  Format follows
   connected sockets.
 - `bus.clean_topic(topic)` — dev/test helper that wipes on-disk state;
   refuses if a publisher is active.
-- `BackpressurePolicy::{Error, DropOldest}` selectable per-bus.
 - Typed exceptions: `BusFullError`, `MessageTooLargeError`,
   `ConnectTimeoutError`, `TooManySubscribersError`,
   `AlreadyPublishingError`, `CursorTooOldError`.
@@ -104,6 +103,13 @@ All notable changes to mmbus are recorded here.  Format follows
   backed Phase B is designed but unimplemented.
 - **`AnyioSubscription` perf**: uses a worker thread per recv; for
   asyncio-only workloads `AsyncSubscription` is strictly cheaper.
+- **`BackpressurePolicy` from Python**: the Rust core supports both
+  `Error` and `DropOldest`, but `PyBus::new` only exposes the default
+  `Error` policy in 0.1.0.  A `backpressure="error" | "drop_oldest"`
+  kwarg is a small addition planned for the next release; `DropOldest`
+  is a deliberate footgun for naive Python users and we'd rather ship
+  it with the recv-side "you skipped N messages" signal at the same
+  time.
 - **macOS `kqueue` wakeup**: the macOS path uses a Unix-socket byte
   per message.  `kqueue` is not a substitute (it's a multiplexer, not
   a cross-process primitive); a true equivalent of Linux's `eventfd`
@@ -123,5 +129,5 @@ All notable changes to mmbus are recorded here.  Format follows
 
 This is the first public release.  Wire format starts at v4.
 
-[Unreleased]: https://OWNER/mmbus/compare/v0.1.0...HEAD
-[0.1.0]: https://OWNER/mmbus/releases/tag/v0.1.0
+[Unreleased]: https://github.com/OWNER/mmbus/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/OWNER/mmbus/releases/tag/v0.1.0

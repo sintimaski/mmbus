@@ -300,6 +300,28 @@ fn stress_content_integrity() {
     cleanup(&cfg);
 }
 
+#[test]
+fn subscriber_connect_times_out_when_no_publisher() {
+    // No Publisher::create call → handshake socket never appears → the
+    // subscriber must surface Error::Timeout, not hang forever or panic.
+    let cfg = make_cfg("connect_timeout");
+    cleanup(&cfg);
+    let started = std::time::Instant::now();
+    let result = Subscriber::connect("bus", &cfg, Duration::from_millis(200));
+    let elapsed = started.elapsed();
+    cleanup(&cfg);
+    match result {
+        Err(Error::Timeout(topic)) => assert_eq!(topic, "bus"),
+        Err(other) => panic!("expected Error::Timeout, got {other}"),
+        Ok(_) => panic!("expected Error::Timeout, got Ok(Subscriber)"),
+    }
+    // Should not have over-slept the deadline by more than 1s.
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "connect waited too long ({elapsed:?})"
+    );
+}
+
 // ── Bus API tests ─────────────────────────────────────────────────────────────
 
 fn bus_cfg(label: &str) -> BusConfig {

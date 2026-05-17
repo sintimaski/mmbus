@@ -87,8 +87,8 @@ impl PyBus {
     }
 
     /// Subscribe starting at an explicit ``cursor`` value.  Raises
-    /// :exc:`OSError` (Error::CursorTooOld) if the cursor is older than
-    /// the oldest in-ring slot at connect time.  Releases the GIL.
+    /// :exc:`CursorTooOldError` if the cursor is older than the oldest
+    /// in-ring slot at connect time.  Releases the GIL.
     #[pyo3(signature = (topic, cursor, timeout_secs=30.0))]
     fn subscribe_from(
         &self,

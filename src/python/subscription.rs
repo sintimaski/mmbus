@@ -17,7 +17,7 @@ use std::time::Duration;
 ///             print(msg)
 ///
 /// Use :class:`mmbus.AsyncSubscription` for asyncio.
-#[pyclass(name = "Subscription")]
+#[pyclass(name = "Subscription", module = "mmbus._mmbus")]
 pub struct PySubscription {
     inner: Subscription,
 }
@@ -132,7 +132,7 @@ impl PySubscription {
 // ── TopicStats ────────────────────────────────────────────────────────────────
 
 /// Ring-buffer and socket snapshot for a topic.
-#[pyclass(name = "TopicStats")]
+#[pyclass(name = "TopicStats", module = "mmbus._mmbus")]
 #[derive(Clone)]
 pub struct PyTopicStats {
     #[pyo3(get)]

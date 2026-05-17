@@ -9,7 +9,7 @@ WORKDIR /app
 # Cache dependency build: copy manifests first, then source.
 # examples/ and benches/ are required because Cargo.toml declares [[example]]
 # and [[bench]] targets — cargo metadata fails otherwise.
-COPY Cargo.toml Cargo.lock pyproject.toml ./
+COPY Cargo.toml Cargo.lock pyproject.toml README.md LICENSE ./
 COPY src/ src/
 COPY python/ python/
 COPY tests/ tests/

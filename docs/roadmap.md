@@ -13,10 +13,14 @@ Goal: a working lock-free ring buffer over mmap with Unix socket signaling.
 - [x] `flock` producer lock (per-process `HashSet` for macOS BSD semantics)
 - [x] Rust benchmarks: `cargo bench --bench ring && cargo bench --bench e2e`
 - [x] SPMC fan-out: per-subscriber cursor table in mmap header
-- [x] Crash-safe publisher restart: header `generation` counter (v3 wire
+- [x] Crash-safe publisher restart: header `generation` counter (v4 wire
       format).  Subscribers detect the bump on next wakeup and return
       `UnexpectedEof` instead of reading from the logically-reset ring.
       Tests in `tests/crash_recovery.rs`.
+- [x] Per-slot seqlock for `DropOldest` torn-read safety (v4): publisher
+      brackets the payload write with two Release stores of `seq` (the
+      second tagged with a high `WRITING` bit), subscribers retry on
+      mismatch.  Validated by `fuzz/fuzz_targets/ring_concurrent.rs`.
 
 Throughput on M-series macOS: ~36M ring ops/s (32 B), ~1.4M msg/s e2e.
 
@@ -88,12 +92,15 @@ Goal: expose Rust core to Python with correct GIL semantics.
 - [x] `Bus.stats(topic)` — `tail`, `active_subscribers`, per-cursor `lags`,
       `connected_sockets`
 - [x] `subscription.lag` / `.cursor` exposed for slow-consumer detection
-- [ ] Warn when a subscriber's `lag` exceeds threshold (today: caller
-      must poll `stats` and decide)
+- [x] `Bus.slow_subscribers(topic, threshold)` — `[(cursor_idx, lag), ...]`
+      for laggards; intended to be called from a periodic monitor thread
+      and emit warnings / metrics when non-empty
 - [ ] Prometheus metrics export (optional dependency)
 - [ ] Structured logging (tracing in Rust, `logging` in Python)
-- [ ] Fuzz testing of ring buffer under concurrent access (cargo-fuzz +
-      nightly Rust; out of scope for v0.1)
+- [x] Fuzz testing of ring buffer under concurrent access — two
+      cargo-fuzz targets (`ring_publish_receive` for API-shape coverage,
+      `ring_concurrent` for the publisher×subscriber seqlock race that
+      surfaced the v4 WRITING-bit fix); both run in `.github/workflows/fuzz.yml`
 - [x] Stress tests: `cargo test --release --test stress -- --ignored`
       (fan-out 100k×4, drop-oldest 50k×3, 50× rapid restart cycles)
 - [ ] ~~macOS: switch wakeup to `kqueue` for efficiency~~ — *not viable as
