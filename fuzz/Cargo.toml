@@ -24,3 +24,10 @@ path = "fuzz_targets/ring_publish_receive.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ring_concurrent"
+path = "fuzz_targets/ring_concurrent.rs"
+test = false
+doc = false
+bench = false

@@ -47,6 +47,14 @@ pub const MAGIC: u64 = 0x6D6D_6275_7300_0004; // "mmbus" + format version 4
 pub const CURSOR_UNCLAIMED: u64 = u64::MAX;
 pub const MAX_SUBSCRIBERS_DEFAULT: u32 = 16;
 
+/// High bit of a slot's `seq` field: when set, the publisher is currently
+/// writing the slot's payload.  Subscribers that observe this bit retry.
+///
+/// At 1 G publishes/s a u64 tail would take ~292 years to roll over bit 63,
+/// so we can safely steal it as a flag for as long as the lifetime of any
+/// realistic on-disk mmap.
+const SEQ_WRITING_BIT: u64 = 1 << 63;
+
 const OFF_MAGIC: usize = 0;
 const OFF_VERSION: usize = 8;
 const OFF_CAPACITY: usize = 12;
@@ -330,8 +338,10 @@ impl RingBuffer {
     }
 
     /// Write `data` into the ring slot for `tail` and stamp it with
-    /// `seq = tail`.  The seq Release-store goes last so subscribers
-    /// observing it via Acquire see the new len + payload.
+    /// `seq = tail`.  Two seq stores frame the payload write to give
+    /// subscribers a non-racy view: a `tail | SEQ_WRITING_BIT` marker
+    /// before the payload tells in-flight readers to retry, and a clean
+    /// `tail` after acts as the seqlock commit point.
     fn write_slot(&self, tail: u64, data: &[u8]) {
         let idx = (tail % self.capacity as u64) as usize;
         // SAFETY: idx < capacity (modulo); slot_offset + idx*stride <
@@ -339,18 +349,29 @@ impl RingBuffer {
         // 8-byte aligned via `slot_stride()` padding, so the seq cast
         // is well-aligned.
         let slot = unsafe { self.base().add(self.slots_off + idx * self.stride()) };
+        // SAFETY: seq lives at slot+0, naturally aligned; this `&AtomicU64`
+        // is short-lived and used only for the two ordered stores below.
+        let seq_atomic = unsafe { &*(slot as *const AtomicU64) };
         // SAFETY (write order):
+        //   0. seq = tail | SEQ_WRITING_BIT (Release): subscribers that
+        //      observe the bit retry instead of reading mid-write payload.
+        //      This bracket-store is the fix for the race where a Release
+        //      seq-store happens AFTER the payload write: without it, a
+        //      reader on a slot being overwritten can see seq_before ==
+        //      seq_after (both equal to the prior tail value) while the
+        //      payload bytes already belong to the next write.
         //   1. len at slot+8 (4 B; unaligned-safe via write_unaligned).
         //   2. payload at slot+12 (up to slot_payload_size bytes — the
         //      caller upholds `data.len() <= slot_payload_size`).
-        //   3. seq at slot+0 with Release: subscribers' Acquire-load of
-        //      seq sees the new len + payload.
+        //   3. seq = tail (Release): commit; subscribers' Acquire-load of
+        //      seq seeing this value happens-after the payload write.
         // Publisher is single (SPMC); no concurrent writer to this slot.
+        seq_atomic.store(tail | SEQ_WRITING_BIT, Ordering::Release);
         unsafe {
             (slot.add(8) as *mut u32).write_unaligned(data.len() as u32);
             std::ptr::copy_nonoverlapping(data.as_ptr(), slot.add(12), data.len());
-            (*(slot as *const AtomicU64)).store(tail, Ordering::Release);
         }
+        seq_atomic.store(tail, Ordering::Release);
     }
 
     // ── Subscriber helpers ────────────────────────────────────────────────────
@@ -390,6 +411,14 @@ impl RingBuffer {
             let seq_atomic = unsafe { &*(slot as *const AtomicU64) };
 
             let seq_before = seq_atomic.load(Ordering::Acquire);
+            if seq_before & SEQ_WRITING_BIT != 0 {
+                // Publisher is currently writing this slot.  Spin-retry:
+                // the bit clears as soon as the publisher's second seq
+                // store lands, and only the seq_after check can validate
+                // a payload read against it.
+                std::hint::spin_loop();
+                continue;
+            }
             if seq_before > effective {
                 // Publisher overwrote this slot with a newer message.
                 // Skip forward to whatever's there now.
@@ -402,9 +431,11 @@ impl RingBuffer {
                 return None;
             }
             // SAFETY (read-after-seq-Acquire): paired with the publisher's
-            // Release-store of `seq`; we therefore observe the len + payload
-            // that was current at the seq_before time.  Mid-copy overwrite
-            // by the publisher is detected by the seq_after re-check below.
+            // Release-store of `seq = tail`; that store happens-after the
+            // payload write, so we observe the len + payload that was
+            // current at the seq_before time.  Mid-copy overwrite by the
+            // publisher is detected by the seq_after re-check below (the
+            // next write's SEQ_WRITING_BIT|tail or final tail differs).
             let len =
                 unsafe { (slot.add(8) as *const u32).read_unaligned() as usize };
             if len > self.slot_payload_size as usize {
@@ -421,10 +452,13 @@ impl RingBuffer {
             }
             let seq_after = seq_atomic.load(Ordering::Acquire);
             if seq_after != seq_before {
-                // Slot was overwritten during the payload copy — retry,
-                // possibly at the new seq if it leapt ahead.
-                if seq_after > effective {
-                    effective = seq_after;
+                // Slot was overwritten (or is being overwritten) during the
+                // payload copy — retry, possibly at the new seq if it leapt
+                // ahead.  Mask the WRITING bit so we advance to the new
+                // tail value rather than treating it as cursor 1<<63.
+                let seq_after_clean = seq_after & !SEQ_WRITING_BIT;
+                if seq_after_clean > effective {
+                    effective = seq_after_clean;
                 }
                 continue;
             }
