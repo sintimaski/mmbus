@@ -11,7 +11,7 @@ default = []
 # Enable the QUIC transport behind `--features quic`.  Pulls in tokio,
 # quinn, rustls, and rcgen; the TCP-only build stays slim.  See
 # `docs/rfc-b4b-quic.md` for the design.
-quic = ["dep:quinn", "dep:tokio", "dep:rustls", "dep:rcgen", "dep:rustls-pki-types"]
+quic = ["dep:quinn", "dep:tokio", "dep:rustls", "dep:rcgen", "dep:rustls-pki-types", "dep:ring"]
 
 [dependencies]
 mmbus = { path = ".." }
@@ -25,6 +25,9 @@ tokio = { version = "1", default-features = false, features = ["rt-multi-thread"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
 rustls-pki-types = { version = "1", optional = true }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"], optional = true }
+# Reused for the SHA-256 fingerprint helper; ring is already in the
+# tree via rustls so this doesn't add download time.
+ring = { version = "0.17", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

@@ -17,6 +17,9 @@ pub mod config;
 pub mod frame;
 pub mod queue;
 
+#[cfg(feature = "quic")]
+pub mod quic;
+
 pub use bridge::{Bridge, BridgeError};
-pub use config::{BridgeConfig, ConfigError, PeerConfig, TopicConfig};
+pub use config::{BridgeConfig, ConfigError, PeerConfig, TopicConfig, TransportKind};
 pub use frame::{DecodeError, Frame, FrameType, FRAME_VERSION, HEADER_LEN};

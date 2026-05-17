@@ -52,6 +52,13 @@ pub struct Bridge {
     /// to find the bridge.
     pub listen_addr: Option<std::net::SocketAddr>,
 
+    /// SHA-256 fingerprint of the bridge's self-signed QUIC cert,
+    /// surfaced for operator logs and tests that need to copy it into
+    /// a peer's `peer_cert_fingerprint` config.  `None` when QUIC is
+    /// not enabled.
+    #[cfg(feature = "quic")]
+    pub quic_fingerprint: Option<String>,
+
     shutdown: Arc<AtomicBool>,
 
     /// Subscriber threads (one per configured forward-enabled topic).
@@ -79,6 +86,17 @@ pub struct Bridge {
     /// they can forward decoded Msg frames to the publisher.  `None`
     /// when no listener is configured.
     publish_tx: Option<mpsc::Sender<(String, Vec<u8>)>>,
+
+    /// Threads bridging the sync `queue::Receiver<Vec<u8>>` of each
+    /// QUIC peer into the tokio runtime's mpsc.  One per QUIC peer.
+    #[cfg(feature = "quic")]
+    quic_bridge_threads: Vec<JoinHandle<()>>,
+
+    /// Dedicated tokio runtime owning every QUIC connection.  Kept
+    /// here so `Drop` can shut it down cleanly.  `None` when QUIC is
+    /// not in use (no QUIC peers and no `listen_quic`).
+    #[cfg(feature = "quic")]
+    quic_runtime: Option<Arc<tokio::runtime::Runtime>>,
 }
 
 impl Bridge {
@@ -109,14 +127,24 @@ impl Bridge {
         // is internally Sync for the parts we touch).
         let bus = build_bus(cfg);
 
+        // Spin up the QUIC runtime + identity if any peer needs it.
+        // The runtime stays parked when no QUIC traffic is in flight;
+        // the worker threads are bounded so this is cheap when unused.
+        #[cfg(feature = "quic")]
+        let (quic_runtime, quic_identity) = build_quic_runtime_and_identity(cfg)?;
+
         // One outbound channel per peer.  Drop-oldest bounded queue —
         // slow peers cannot stall the publisher.  Each forwarder
         // sends a PeerHello stamped with that peer's PSK so the
         // receiving bridge can authenticate the connection.  TCP peers
-        // get a sync forwarder thread; QUIC peers will get hooked into
-        // the QUIC runtime in B4b-2.
+        // get a sync forwarder thread; QUIC peers each get a sync→async
+        // bridge thread that drains the queue into a tokio mpsc which
+        // the QUIC runtime then writes onto a quinn bidirectional
+        // stream.
         let mut peer_tx = Vec::new();
         let mut fwd_threads = Vec::new();
+        #[cfg(feature = "quic")]
+        let mut quic_bridge_threads: Vec<JoinHandle<()>> = Vec::new();
         for peer in &cfg.peers {
             let (tx, rx) = queue::channel::<Vec<u8>>(cfg.peer_buffer_max);
             peer_tx.push(tx);
@@ -139,17 +167,57 @@ impl Bridge {
                     }));
                 }
                 TransportKind::Quic => {
-                    // B4b-2 hooks this rx into the QUIC runtime.  Until
-                    // then we drop the rx — any bytes the subscriber
-                    // sends to it just queue + evict.  This branch is
-                    // unreachable in the TCP-only build (we already
-                    // rejected QUIC peers above).
-                    let _ = rx;
-                    eprintln!(
-                        "bridge: peer {:?} requests QUIC transport — \
-                         not yet wired (B4b-2 in progress)",
-                        peer.name
-                    );
+                    #[cfg(feature = "quic")]
+                    {
+                        let _ = &quic_identity; // suppress unused warning when only outbound peers exist
+                        let rt = quic_runtime
+                            .as_ref()
+                            .expect("quic_runtime must exist if any quic peer is configured");
+                        let (tok_tx, tok_rx) =
+                            tokio::sync::mpsc::channel::<Vec<u8>>(cfg.peer_buffer_max.max(1));
+                        let bridge_handle =
+                            crate::quic::spawn_queue_bridge(rx, tok_tx, shutdown.clone());
+                        quic_bridge_threads.push(bridge_handle);
+
+                        let hello = {
+                            let mut buf = Vec::new();
+                            Frame::peer_hello_with_psk(
+                                origin_id,
+                                peer.preshared_key.as_bytes(),
+                            )
+                            .encode(&mut buf);
+                            buf
+                        };
+                        let name = peer.name.clone();
+                        let endpoint = peer.endpoint.clone();
+                        let pinned_fp = peer
+                            .peer_cert_fingerprint
+                            .clone()
+                            .expect("validated at config parse time");
+                        let server_name = "mmbus-bridge".to_owned();
+                        let shutdown_clone = shutdown.clone();
+                        rt.spawn(async move {
+                            crate::quic::outbound_main(
+                                name,
+                                endpoint,
+                                server_name,
+                                pinned_fp,
+                                hello,
+                                tok_rx,
+                                shutdown_clone,
+                            )
+                            .await;
+                        });
+                    }
+                    #[cfg(not(feature = "quic"))]
+                    {
+                        // Unreachable under the startup guard above,
+                        // but the compiler still wants this arm to do
+                        // *something* with `rx` so the borrow
+                        // disappears.
+                        let _ = rx;
+                        unreachable!("QuicNotCompiled guard should have fired");
+                    }
                 }
             }
         }
@@ -250,6 +318,8 @@ impl Bridge {
         Ok(Self {
             origin_id,
             listen_addr,
+            #[cfg(feature = "quic")]
+            quic_fingerprint: quic_identity.as_ref().map(|i| i.fingerprint.clone()),
             shutdown,
             sub_threads,
             fwd_threads,
@@ -257,6 +327,10 @@ impl Bridge {
             publish_thread,
             peer_tx,
             publish_tx,
+            #[cfg(feature = "quic")]
+            quic_bridge_threads,
+            #[cfg(feature = "quic")]
+            quic_runtime,
         })
     }
 
@@ -285,6 +359,24 @@ impl Bridge {
         if let Some(h) = self.publish_thread.take() {
             let _ = h.join();
         }
+        #[cfg(feature = "quic")]
+        {
+            for h in self.quic_bridge_threads.drain(..) {
+                let _ = h.join();
+            }
+            // Drop the Arc to the runtime — when refcount hits 0 the
+            // runtime drops + halts any spawned tasks.  We use the
+            // Arc form so spawn() calls from the quic outbound code
+            // can keep the runtime alive for their own use.
+            if let Some(rt) = self.quic_runtime.take() {
+                // shutdown_background returns immediately and shuts
+                // down the runtime in the background.  Good enough
+                // for a bridge that's exiting.
+                if let Ok(rt) = Arc::try_unwrap(rt) {
+                    rt.shutdown_background();
+                }
+            }
+        }
     }
 }
 
@@ -312,6 +404,11 @@ pub enum BridgeError {
          rebuild with `cargo build --features quic`"
     )]
     QuicNotCompiled { reason: &'static str },
+
+    /// QUIC setup (cert gen/load, runtime build, endpoint bind)
+    /// failed at startup.
+    #[error("QUIC setup failed: {0}")]
+    QuicSetup(String),
 }
 
 // ── Implementation details ────────────────────────────────────────────────────
@@ -691,6 +788,52 @@ fn publisher_main(
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
     }
+}
+
+/// Build the QUIC runtime + identity if any peer/listener needs them.
+/// Returns `(None, None)` when the bridge has no QUIC traffic to handle.
+#[cfg(feature = "quic")]
+fn build_quic_runtime_and_identity(
+    cfg: &BridgeConfig,
+) -> Result<(Option<Arc<tokio::runtime::Runtime>>, Option<crate::quic::Identity>), BridgeError>
+{
+    let any_quic_peer = cfg.peers.iter().any(|p| p.transport.is_quic());
+    let want_listen = cfg.listen_quic.is_some();
+    if !any_quic_peer && !want_listen {
+        return Ok((None, None));
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(cfg.quic_worker_threads)
+        .enable_all()
+        .thread_name("mmbus-bridge-quic")
+        .build()
+        .map_err(BridgeError::Listen)?;
+    let id = if want_listen {
+        let base = cfg
+            .base_dir
+            .clone()
+            .unwrap_or_else(std::env::temp_dir);
+        let cert_path = cfg
+            .quic_cert_path
+            .clone()
+            .unwrap_or_else(|| base.join("bridge.cert.der"));
+        let key_path = cfg
+            .quic_key_path
+            .clone()
+            .unwrap_or_else(|| base.join("bridge.key.der"));
+        Some(
+            crate::quic::gen_or_load_identity(&cert_path, &key_path)
+                .map_err(quic_err_to_bridge)?,
+        )
+    } else {
+        None
+    };
+    Ok((Some(Arc::new(rt)), id))
+}
+
+#[cfg(feature = "quic")]
+fn quic_err_to_bridge(e: crate::quic::QuicError) -> BridgeError {
+    BridgeError::QuicSetup(format!("{e}"))
 }
 
 /// Non-cryptographic 64-bit ID derived from clock + pid.  Collision risk

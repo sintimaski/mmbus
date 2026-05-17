@@ -291,6 +291,7 @@ dependencies = [
  "mmbus",
  "quinn",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-pki-types",
  "serde",
