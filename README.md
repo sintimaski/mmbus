@@ -221,6 +221,11 @@ Typed exceptions: `BusFullError`, `MessageTooLargeError`,
 ```bash
 # Rust core
 cargo test
+cargo bench --bench ring && cargo bench --bench e2e   # local perf
+cargo test --release --test stress -- --ignored       # stress tests
+
+# Fuzz the ring-buffer API (needs nightly + cargo-fuzz)
+cd fuzz && cargo +nightly fuzz run ring_publish_receive -- -max_total_time=60
 
 # Python bindings (native build, macOS or Linux)
 python -m venv .venv && .venv/bin/pip install maturin

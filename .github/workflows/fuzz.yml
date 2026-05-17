@@ -1,0 +1,53 @@
+name: Fuzz smoke
+
+on:
+  pull_request:
+    paths:
+      - 'src/ring.rs'
+      - 'fuzz/**'
+      - '.github/workflows/fuzz.yml'
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: 'How long to fuzz (seconds)'
+        required: false
+        default: '60'
+
+jobs:
+  fuzz:
+    name: Fuzz ring_publish_receive
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Cache Cargo registry + fuzz target build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/target
+          key: fuzz-${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'fuzz/Cargo.toml') }}
+          restore-keys: fuzz-${{ runner.os }}-cargo-
+
+      - name: Run fuzz target
+        working-directory: fuzz
+        run: |
+          DURATION="${{ github.event.inputs.duration_seconds || '60' }}"
+          cargo fuzz run ring_publish_receive -- -max_total_time="$DURATION"
+
+      - name: Upload crash artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

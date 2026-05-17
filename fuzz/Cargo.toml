@@ -1,0 +1,26 @@
+[package]
+name = "mmbus-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tempfile = "3"
+
+[dependencies.mmbus]
+path = ".."
+
+# Prevent this from being picked up by `cargo test` in the parent workspace —
+# it's only meant to be built via `cargo fuzz run` under nightly.
+[workspace]
+
+[[bin]]
+name = "ring_publish_receive"
+path = "fuzz_targets/ring_publish_receive.rs"
+test = false
+doc = false
+bench = false
