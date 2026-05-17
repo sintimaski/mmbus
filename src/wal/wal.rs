@@ -429,7 +429,7 @@ pub struct WalReplayer {
 }
 
 impl WalReplayer {
-    fn new(segments: Vec<PathBuf>, cursor_floor: u64) -> Self {
+    pub(crate) fn new(segments: Vec<PathBuf>, cursor_floor: u64) -> Self {
         Self { segments, seg_idx: 0, cursor_floor, current: None }
     }
 }

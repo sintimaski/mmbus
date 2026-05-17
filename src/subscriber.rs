@@ -1,6 +1,7 @@
 use crate::config::BusConfig;
 use crate::error::{Error, Result};
 use crate::ring::RingBuffer;
+use crate::wal::{WalReader, WalReplayer};
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -50,6 +51,12 @@ pub struct Subscriber {
     /// and `receive` returns `UnexpectedEof` so the iterator terminates
     /// instead of reading from a logically-reset ring.
     generation: u64,
+
+    /// WAL replayer feeding records from the on-disk log when the
+    /// subscriber connected with a cursor behind the ring's oldest
+    /// in-ring slot.  `receive()` pulls from this first; on exhaustion
+    /// the field is dropped and reads continue from the live ring.
+    wal_replay: Option<WalReplayer>,
 }
 
 impl Drop for Subscriber {
@@ -201,19 +208,54 @@ impl Subscriber {
         // points at the *old* tail and would block forever waiting for
         // messages that never arrive.
         let tail = ring.current_tail();
-        let cursor = match start {
-            StartPos::Now => tail,
-            StartPos::HistoryBack(n) => tail.saturating_sub(n),
+        let (cursor, wal_replay) = match start {
+            StartPos::Now => (tail, None),
+            StartPos::HistoryBack(n) => (tail.saturating_sub(n), None),
             StartPos::Explicit(c) => {
-                let oldest = tail.saturating_sub(ring.capacity as u64);
-                if c < oldest {
-                    ring.release_cursor(cursor_idx);
-                    return Err(Error::CursorTooOld { requested: c, oldest });
+                let ring_oldest = tail.saturating_sub(ring.capacity as u64);
+                if c >= ring_oldest {
+                    (c, None)
+                } else {
+                    // Behind the ring — try the WAL.  We don't claim a
+                    // cursor at `c` because that would block the
+                    // publisher's backpressure on a position the ring
+                    // can no longer reach; we leave cursor_idx pointing
+                    // at the live tail and read the missing prefix from
+                    // the WAL.  An on-disk WAL with no segments (or
+                    // missing entirely) is treated the same as no WAL
+                    // at all — surface CursorTooOld with the ring's
+                    // oldest visible cursor.
+                    let wal_reader = WalReader::open(&dir)
+                        .ok()
+                        .filter(|wr| wr.oldest_cursor().is_some());
+                    match wal_reader {
+                        Some(wr) => match wr.read_from(c) {
+                            Ok(replayer) => (c, Some(replayer)),
+                            Err(crate::wal::WalError::CursorTooOld { requested, oldest }) => {
+                                ring.release_cursor(cursor_idx);
+                                return Err(Error::CursorTooOld { requested, oldest });
+                            }
+                            Err(e) => {
+                                ring.release_cursor(cursor_idx);
+                                return Err(Error::Wal(e));
+                            }
+                        },
+                        None => {
+                            ring.release_cursor(cursor_idx);
+                            return Err(Error::CursorTooOld {
+                                requested: c,
+                                oldest: ring_oldest,
+                            });
+                        }
+                    }
                 }
-                c
             }
         };
-        ring.set_cursor(cursor_idx, cursor);
+        // During WAL replay the live cursor is parked at the current
+        // tail so the publisher's backpressure check ignores us; we
+        // re-sync to the real cursor when replay catches up.
+        let live_cursor = if wal_replay.is_some() { tail } else { cursor };
+        ring.set_cursor(cursor_idx, live_cursor);
         let generation = ring.generation();
 
         Ok(Self {
@@ -229,11 +271,15 @@ impl Subscriber {
             cursor,
             cursor_idx,
             generation,
+            wal_replay,
         })
     }
 
     /// Block until the next message arrives.
     pub fn receive(&mut self) -> Result<Vec<u8>> {
+        if let Some(payload) = self.next_wal_record()? {
+            return Ok(payload);
+        }
         let mut out = Vec::new();
         loop {
             if let Some(new_cursor) =
@@ -248,6 +294,9 @@ impl Subscriber {
 
     /// Block with a timeout. Returns `Ok(None)` if the timeout elapses.
     pub fn receive_timeout(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>> {
+        if let Some(payload) = self.next_wal_record()? {
+            return Ok(Some(payload));
+        }
         let deadline = Instant::now() + timeout;
         let mut out = Vec::new();
         loop {
@@ -277,12 +326,47 @@ impl Subscriber {
 
     /// Non-blocking poll. Returns `None` if no message is ready.
     pub fn try_receive(&mut self) -> Option<Vec<u8>> {
+        if let Ok(Some(payload)) = self.next_wal_record() {
+            return Some(payload);
+        }
         let mut out = Vec::new();
         if let Some(new_cursor) = self.ring.try_receive(self.cursor_idx, self.cursor, &mut out) {
             self.cursor = new_cursor;
             Some(out)
         } else {
             None
+        }
+    }
+
+    /// Pull the next record from the WAL replayer (if active) and
+    /// advance `self.cursor`.  When the replayer is exhausted, drop
+    /// it and re-sync the live ring cursor to our true position so
+    /// subsequent ring reads pick up where the WAL left off.
+    ///
+    /// Returns `Ok(None)` when there is no WAL replay in flight OR
+    /// the replayer has just been drained — in either case the caller
+    /// falls through to the live-ring read path.
+    fn next_wal_record(&mut self) -> Result<Option<Vec<u8>>> {
+        let Some(replayer) = self.wal_replay.as_mut() else {
+            return Ok(None);
+        };
+        match replayer.next() {
+            Some(Ok(record)) => {
+                self.cursor = record.cursor + 1;
+                Ok(Some(record.payload))
+            }
+            Some(Err(e)) => {
+                self.wal_replay = None;
+                Err(Error::Wal(e))
+            }
+            None => {
+                // Replayer drained — promote to live-ring reads.
+                // Re-sync our claimed cursor slot so the publisher
+                // sees our real position from here on.
+                self.wal_replay = None;
+                self.ring.set_cursor(self.cursor_idx, self.cursor);
+                Ok(None)
+            }
         }
     }
 
@@ -335,6 +419,12 @@ impl Subscriber {
     /// Non-blocking: drain at most one wakeup signal and attempt one ring
     /// read.  Designed for event-loop callbacks (`asyncio.add_reader`).
     pub fn poll_recv(&mut self) -> Result<Option<Vec<u8>>> {
+        // WAL replay records are available without any kernel wakeup —
+        // serve them first so a subscriber catching up from disk isn't
+        // gated on producer-side wakeups it never receives.
+        if let Some(payload) = self.next_wal_record()? {
+            return Ok(Some(payload));
+        }
         if !self.try_drain_wakeup()? {
             return Ok(None);
         }
