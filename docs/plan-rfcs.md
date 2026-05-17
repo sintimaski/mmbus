@@ -38,19 +38,20 @@ Win32 substitute; this plan slices that into review-sized commits.
 - ARM64 Windows wheels (defer until x64 ships).
 - Service Manager / Windows event log integration.
 
-## mmbus-bridge — staged breakdown (sketch only; defer until Windows ships)
+## mmbus-bridge — staged breakdown
 
-| Stage | Scope |
-|-------|-------|
-| **B0** | New `bridge/` crate (alongside `fuzz/`); binary `mmbus-bridge`; config-file parsing |
-| **B1** | Local subscribe + forward over TCP to one hardcoded peer endpoint |
-| **B2** | Receive frames from peer, dedupe by `origin_id`, republish locally |
-| **B3** | Mesh of N peers; per-peer ring buffer; drop-oldest on overflow |
-| **B4** | QUIC transport (quinn) behind a feature flag; preshared-key auth |
-| **B5** | Python helper `mmbus.bridge.start(config_path)`; systemd unit |
+| Stage | Scope | Status |
+|-------|-------|--------|
+| **B0** | New `bridge/` crate (alongside `fuzz/`); binary `mmbus-bridge`; TOML config; wire-frame codec (RFC §3 `Frame` struct) — 20 round-trip + edge-case tests | shipped |
+| **B1** | Local subscribe + forward over TCP to one hardcoded peer endpoint | next |
+| **B2** | Receive frames from peer, dedupe by `origin_id`, republish locally | |
+| **B3** | Mesh of N peers; per-peer ring buffer; drop-oldest on overflow | |
+| **B4** | QUIC transport (quinn) behind a feature flag; preshared-key auth | |
+| **B5** | Python helper `mmbus.bridge.start(config_path)`; systemd unit | |
 
-Wire-format is in RFC §3 (`Frame` struct); flesh into a tested binary
-codec in B0.
+The bridge crate is a standalone workspace (its `Cargo.toml` has an
+empty `[workspace]` block) so the parent `cargo test` does not pull
+in its network deps.  Build via `cd bridge && cargo test`.
 
 ## WAL Phase B — write a real RFC first
 

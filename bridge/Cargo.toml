@@ -1,0 +1,25 @@
+[package]
+name = "mmbus-bridge"
+version = "0.0.1"
+edition = "2021"
+description = "Cross-machine relay for mmbus topics over TCP/QUIC"
+license = "MIT"
+publish = false
+
+[dependencies]
+mmbus = { path = ".." }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+# Standalone workspace — the parent `cargo test` should NOT pick up the
+# bridge; we want it built explicitly via `cd bridge && cargo test` so
+# its iteration time stays separate from the core library's.
+[workspace]
+
+[[bin]]
+name = "mmbus-bridge"
+path = "src/main.rs"

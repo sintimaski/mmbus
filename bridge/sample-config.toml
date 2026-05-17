@@ -1,0 +1,35 @@
+# Sample mmbus-bridge config.  Copy + edit; pass the path as the only
+# positional argument:
+#
+#   mmbus-bridge ./bridge.toml
+
+# Local mmbus bus this bridge attaches to.
+bus = "demo"
+
+# Optional: override the mmbus base_dir.  Defaults to the mmbus crate
+# default (`/tmp/mmbus` on Unix, `%LOCALAPPDATA%\mmbus` on Windows).
+# base_dir = "/var/lib/mmbus"
+
+# Optional: stable 64-bit origin_id.  When omitted, the binary picks a
+# fresh random value at startup; that means loop-prevention dedup
+# windows reset after a restart, which is fine for most use cases.
+# origin_id = 1234567890123456789
+
+# Topics this bridge cares about.  `forward = true` (the default) sends
+# locally-published messages to all peers; `receive = true` (the
+# default) republishes peer-originated messages locally.
+[[topics]]
+name = "events"
+
+[[topics]]
+name = "alerts"
+forward = true
+receive = false   # ingest-only: alerts only flow OUT to peers
+
+# Peers in the mesh.  Each entry is a separate process on another
+# machine running its own `mmbus-bridge`.  No discovery in v1 — the
+# endpoint list is the topology.
+[[peers]]
+name = "machine-b"
+endpoint = "machine-b.internal:4443"
+preshared_key = "REPLACE-ME-WITH-A-LONG-RANDOM-STRING"
