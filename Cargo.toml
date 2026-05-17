@@ -17,8 +17,25 @@ python = ["pyo3"]
 [dependencies]
 memmap2 = "0.9"
 thiserror = "1"
-libc = "0.2"
 pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+
+# Unix uses libc directly (eventfd, flock, sendmsg, etc.).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Windows uses windows-sys for LockFileEx, CreateNamedPipe, CreateSemaphore,
+# DuplicateHandle, WaitForMultipleObjects.  Feature gates keep the
+# downloaded surface area small.
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_Security",
+]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

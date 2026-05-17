@@ -37,9 +37,30 @@ impl Default for BusConfig {
         Self {
             slot_size: 64 * 1024,
             capacity: 256,
-            base_dir: PathBuf::from("/tmp/mmbus"),
+            base_dir: default_base_dir(),
             max_subscribers: 16,
             backpressure: BackpressurePolicy::Error,
         }
     }
+}
+
+/// Default on-disk root for bus files.  Per-platform because there is no
+/// single cross-OS scratch location:
+///   * Unix: `/tmp/mmbus`.
+///   * Windows: `%LOCALAPPDATA%\mmbus`, falling back to `%TEMP%\mmbus`
+///     and finally `C:\mmbus` if neither env var is set.
+#[cfg(unix)]
+fn default_base_dir() -> PathBuf {
+    PathBuf::from("/tmp/mmbus")
+}
+
+#[cfg(windows)]
+fn default_base_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("LOCALAPPDATA") {
+        return PathBuf::from(dir).join("mmbus");
+    }
+    if let Ok(dir) = std::env::var("TEMP") {
+        return PathBuf::from(dir).join("mmbus");
+    }
+    PathBuf::from(r"C:\mmbus")
 }
