@@ -60,6 +60,9 @@ pub(crate) fn acquire_producer_lock(name: &str, dir: &Path) -> Result<ProducerLo
     };
 
     // Cross-process exclusive advisory lock (non-blocking).
+    // SAFETY: file is a freshly-opened std::fs::File whose fd is open for
+    // the duration of the call; libc::flock either returns 0 (held) or
+    // sets errno (we surface it as AlreadyPublishing).
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         IN_PROCESS_LOCKS.lock().unwrap_or_else(|e| e.into_inner()).remove(&path);
         return Err(Error::AlreadyPublishing(name.to_owned()));

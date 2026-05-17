@@ -25,12 +25,16 @@ pub(crate) mod linux {
     /// `N` publishes produce `N` distinct wakeups (without it the counter is
     /// coalesced and the receiver loses messages already in the ring).
     pub fn create_eventfd() -> io::Result<OwnedFd> {
+        // SAFETY: libc::eventfd is always safe to call with valid flag
+        // constants; returns a new fd or -1.
         let fd = unsafe {
             libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC | libc::EFD_SEMAPHORE)
         };
         if fd < 0 {
             Err(io::Error::last_os_error())
         } else {
+            // SAFETY: fd is freshly created by eventfd above and not
+            // duplicated; we have exclusive ownership.
             Ok(unsafe { OwnedFd::from_raw_fd(fd) })
         }
     }
@@ -39,6 +43,9 @@ pub(crate) mod linux {
     /// (peer has closed its copy — subscriber disconnected).
     pub fn eventfd_wake(fd: RawFd) -> bool {
         let val: u64 = 1;
+        // SAFETY: &val points to 8 bytes on the stack; we tell libc::write
+        // the exact size; fd is the caller's responsibility to keep open
+        // for the duration of the call.
         unsafe { libc::write(fd, &val as *const u64 as *const libc::c_void, 8) == 8 }
     }
 
@@ -46,6 +53,8 @@ pub(crate) mod linux {
     /// Fails with `WouldBlock` if counter is 0 (fd is `EFD_NONBLOCK`).
     pub fn eventfd_drain(fd: RawFd) -> io::Result<u64> {
         let mut val: u64 = 0;
+        // SAFETY: &mut val points to 8 bytes on the stack; libc::read writes
+        // exactly that many bytes for an eventfd (or returns -1).
         let ret = unsafe { libc::read(fd, &mut val as *mut u64 as *mut libc::c_void, 8) };
         if ret == 8 {
             Ok(val)
@@ -69,6 +78,9 @@ pub(crate) mod linux {
             libc::pollfd { fd: sock, events: libc::POLLHUP | libc::POLLERR, revents: 0 },
         ];
         loop {
+            // SAFETY: fds is a 2-element stack array; we pass its base
+            // pointer + length 2.  libc::poll writes to revents fields
+            // in-place.  efd / sock fds are the caller's responsibility.
             let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
             if n < 0 {
                 let e = io::Error::last_os_error();
@@ -98,6 +110,8 @@ pub(crate) mod linux {
         let iov =
             libc::iovec { iov_base: &dummy as *const u8 as *mut libc::c_void, iov_len: 1 };
         let fd_size = std::mem::size_of::<libc::c_int>() as u32;
+        // SAFETY: CMSG_SPACE is a const-fn-equivalent macro that just
+        // computes a size; it has no side effects.
         let cmsg_space = unsafe { libc::CMSG_SPACE(fd_size) } as usize;
         let mut buf = vec![0u8; cmsg_space];
         let msg = libc::msghdr {
@@ -109,6 +123,12 @@ pub(crate) mod linux {
             msg_controllen: cmsg_space,
             msg_flags: 0,
         };
+        // SAFETY: cmsg_buf has the size CMSG_SPACE(fd_size) computed by
+        // libc; CMSG_FIRSTHDR returns the first cmsghdr in that buffer,
+        // which fits because we allocated for one fd-passing cmsg.
+        // CMSG_DATA points into the same buffer after the cmsghdr
+        // prefix; we write one c_int there. iov references `dummy` on
+        // the stack which lives until `sendmsg` returns.
         unsafe {
             let cmsg = libc::CMSG_FIRSTHDR(&msg) as *mut libc::cmsghdr;
             (*cmsg).cmsg_level = libc::SOL_SOCKET;
@@ -129,6 +149,7 @@ pub(crate) mod linux {
         let mut iov =
             libc::iovec { iov_base: &mut dummy as *mut u8 as *mut libc::c_void, iov_len: 1 };
         let fd_size = std::mem::size_of::<libc::c_int>() as u32;
+        // SAFETY: pure size computation, no side effects.
         let cmsg_space = unsafe { libc::CMSG_SPACE(fd_size) } as usize;
         let mut buf = vec![0u8; cmsg_space];
         let mut msg = libc::msghdr {
@@ -140,6 +161,13 @@ pub(crate) mod linux {
             msg_controllen: cmsg_space,
             msg_flags: 0,
         };
+        // SAFETY: msg's control buffer is `cmsg_space` bytes (sized for
+        // exactly one fd-passing cmsg); iov references the stack-local
+        // `dummy` valid for the recvmsg duration.  After recvmsg returns,
+        // CMSG_FIRSTHDR points into our control buffer; CMSG_DATA points
+        // to the c_int payload within it.  Returned fd is freshly dup'd
+        // by the kernel into our process so OwnedFd::from_raw_fd takes
+        // exclusive ownership cleanly.
         unsafe {
             if libc::recvmsg(sock.as_raw_fd(), &mut msg, 0) < 0 {
                 return Err(io::Error::last_os_error());

@@ -85,6 +85,12 @@ pub struct RingBuffer {
     slots_off: usize,
 }
 
+// SAFETY (Send + Sync): `RingBuffer` wraps `UnsafeCell<MmapMut>`.  We never
+// hand out `&mut MmapMut`; every mutation goes through atomic ops on
+// pointer-derived `AtomicU64` references or through `write_unaligned` /
+// `copy_nonoverlapping` on disjoint slot regions (publisher writes its slot
+// before bumping `tail`; subscribers only read slots strictly less than
+// `tail`).  Cross-process sharing of the same mmap pages is the design.
 unsafe impl Send for RingBuffer {}
 unsafe impl Sync for RingBuffer {}
 
@@ -104,9 +110,18 @@ impl RingBuffer {
             .open(path)?;
         file.set_len(total as u64)?;
 
+        // SAFETY: file was `set_len(total)`-ed above; memmap2 maps exactly
+        // that many bytes.  We're the only mmap of this file (we just
+        // created it), so there's no concurrent reader yet.
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
         let p = mmap.as_mut_ptr();
 
+        // SAFETY: `p` points to the first byte of a `total`-byte mmap
+        // (>= 64 B header).  Every OFF_* is < 64; `write_unaligned`
+        // handles any alignment (in practice all offsets are naturally
+        // aligned).  OFF_GENERATION is 8-byte aligned (offset 24) so
+        // the AtomicU64 cast is sound.  No other thread holds a
+        // reference to the mmap yet (we just returned from `map_mut`).
         unsafe {
             p.add(OFF_MAGIC).cast::<u64>().write_unaligned(MAGIC);
             p.add(OFF_VERSION).cast::<u32>().write_unaligned(4);
@@ -120,6 +135,10 @@ impl RingBuffer {
 
         // The file is zero-initialized; cursor slots need CURSOR_UNCLAIMED (u64::MAX).
         for i in 0..max_subscribers as usize {
+            // SAFETY: i < max_subscribers, so OFF_CURSORS + i*8 < slots_offset
+            // <= total.  Each cursor slot is at an 8-byte offset from
+            // OFF_CURSORS (= 64), hence 8-byte aligned.  Single-threaded
+            // init; Relaxed is fine.
             unsafe {
                 let cp = p.add(OFF_CURSORS + i * 8) as *mut AtomicU64;
                 (*cp).store(CURSOR_UNCLAIMED, Ordering::Relaxed);
@@ -132,8 +151,17 @@ impl RingBuffer {
 
     pub fn open(path: &Path) -> std::io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
+        // SAFETY: the file was created with `mmap_size(...)` bytes by
+        // `create()` (we trust the magic check below to confirm it's
+        // ours). Other processes may concurrently mmap the same file —
+        // that's the design; all mutation goes through atomics + disjoint
+        // slot writes.
         let mmap = unsafe { MmapMut::map_mut(&file)? };
 
+        // SAFETY: the file is at least 64 B (we set_len'd to mmap_size,
+        // and the smallest mmap_size starts at slots_offset(0) = 64).
+        // All header offsets are < 32 so well within the mapped region.
+        // read_unaligned tolerates any alignment.
         let p = mmap.as_ptr();
         let magic = unsafe { p.add(OFF_MAGIC).cast::<u64>().read_unaligned() };
         if magic != MAGIC {
@@ -142,6 +170,7 @@ impl RingBuffer {
                 format!("mmbus: unrecognised magic {magic:#018x} (want {MAGIC:#018x}; is this an older format?)"),
             ));
         }
+        // SAFETY: same as above — offsets within the header region.
         let capacity = unsafe { p.add(OFF_CAPACITY).cast::<u32>().read_unaligned() };
         let slot_payload_size = unsafe { p.add(OFF_SLOT_SIZE).cast::<u32>().read_unaligned() };
         let max_subscribers = unsafe { p.add(OFF_MAX_SUBS).cast::<u32>().read_unaligned() };
@@ -187,6 +216,10 @@ impl RingBuffer {
     }
 
     fn generation_atomic(&self) -> &AtomicU64 {
+        // SAFETY: `base()` is the mmap start, OFF_GENERATION=24 is 8-byte
+        // aligned, and the header (64 B) is always mapped — see `create()`
+        // and `open()`.  Cast to `&AtomicU64` because every read/write of
+        // this field crate-wide goes through atomic ops.
         unsafe { &*(self.base().add(OFF_GENERATION) as *const AtomicU64) }
     }
 
@@ -195,15 +228,26 @@ impl RingBuffer {
     }
 
     fn base(&self) -> *mut u8 {
+        // SAFETY: UnsafeCell::get returns a raw `*mut MmapMut` valid for
+        // the lifetime of `self`.  We never construct a `&mut MmapMut`
+        // elsewhere, so this is the unique mutable access.  The MmapMut
+        // we deref into is owned by self, so the &mut is short-lived
+        // and discarded as soon as `as_mut_ptr()` returns the byte ptr.
         unsafe { (&mut *self.inner.get()).as_mut_ptr() }
     }
 
     fn tail_atomic(&self) -> &AtomicU64 {
+        // SAFETY: OFF_TAIL=32 is 8-byte aligned; the header is always
+        // mapped (see `generation_atomic` SAFETY for the full rationale).
         unsafe { &*(self.base().add(OFF_TAIL) as *const AtomicU64) }
     }
 
     fn cursor_atomic(&self, idx: usize) -> &AtomicU64 {
         debug_assert!(idx < self.max_subscribers as usize);
+        // SAFETY: idx < max_subscribers (debug-checked); cursor table
+        // ends at OFF_CURSORS + 8*max_subscribers <= slots_offset, so
+        // the access is within the mapped header region.  Cursor slots
+        // are 8-byte aligned (OFF_CURSORS=64 plus 8-byte stride).
         unsafe { &*(self.base().add(OFF_CURSORS + idx * 8) as *const AtomicU64) }
     }
 
@@ -290,9 +334,19 @@ impl RingBuffer {
     /// observing it via Acquire see the new len + payload.
     fn write_slot(&self, tail: u64, data: &[u8]) {
         let idx = (tail % self.capacity as u64) as usize;
+        // SAFETY: idx < capacity (modulo); slot_offset + idx*stride <
+        // slots_offset + capacity*stride <= mmap_size.  Slot base is
+        // 8-byte aligned via `slot_stride()` padding, so the seq cast
+        // is well-aligned.
         let slot = unsafe { self.base().add(self.slots_off + idx * self.stride()) };
+        // SAFETY (write order):
+        //   1. len at slot+8 (4 B; unaligned-safe via write_unaligned).
+        //   2. payload at slot+12 (up to slot_payload_size bytes — the
+        //      caller upholds `data.len() <= slot_payload_size`).
+        //   3. seq at slot+0 with Release: subscribers' Acquire-load of
+        //      seq sees the new len + payload.
+        // Publisher is single (SPMC); no concurrent writer to this slot.
         unsafe {
-            // len + payload first (relaxed), then seq with Release ordering.
             (slot.add(8) as *mut u32).write_unaligned(data.len() as u32);
             std::ptr::copy_nonoverlapping(data.as_ptr(), slot.add(12), data.len());
             (*(slot as *const AtomicU64)).store(tail, Ordering::Release);
@@ -328,7 +382,11 @@ impl RingBuffer {
         let mut effective = local_cursor;
         for _ in 0..MAX_RETRIES {
             let idx = (effective % self.capacity as u64) as usize;
+            // SAFETY: same bounds + alignment argument as `write_slot`:
+            // idx < capacity, slot within the mapped region, 8-byte aligned.
             let slot = unsafe { self.base().add(self.slots_off + idx * self.stride()) };
+            // SAFETY: seq field is at slot+0, 8-byte aligned; this `&AtomicU64`
+            // lives only for the iteration so it can't outlive the mmap.
             let seq_atomic = unsafe { &*(slot as *const AtomicU64) };
 
             let seq_before = seq_atomic.load(Ordering::Acquire);
@@ -343,7 +401,10 @@ impl RingBuffer {
                 // out by the tail check above; bail defensively.
                 return None;
             }
-            // seq matches `effective` — read the payload.
+            // SAFETY (read-after-seq-Acquire): paired with the publisher's
+            // Release-store of `seq`; we therefore observe the len + payload
+            // that was current at the seq_before time.  Mid-copy overwrite
+            // by the publisher is detected by the seq_after re-check below.
             let len =
                 unsafe { (slot.add(8) as *const u32).read_unaligned() as usize };
             if len > self.slot_payload_size as usize {
@@ -352,6 +413,9 @@ impl RingBuffer {
             }
             out.clear();
             out.resize(len, 0);
+            // SAFETY: len <= slot_payload_size (checked above); destination
+            // Vec is grown to exactly len bytes; source is within the slot
+            // payload region (slot+12 + len <= slot+12+slot_payload_size).
             unsafe {
                 std::ptr::copy_nonoverlapping(slot.add(12), out.as_mut_ptr(), len);
             }

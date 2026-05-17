@@ -288,6 +288,10 @@ impl Subscriber {
             // Use MSG_DONTWAIT so we don't have to toggle O_NONBLOCK on a
             // socket that the blocking `receive()` path also uses.
             let mut byte = 0u8;
+            // SAFETY: self.sock is an owned UnixStream (fd open); &mut byte
+            // points to one stack byte; libc::recv writes at most 1 byte
+            // (we tell it length 1).  MSG_DONTWAIT makes the call return
+            // immediately if the socket has no data.
             let ret = unsafe {
                 libc::recv(
                     self.sock.as_raw_fd(),

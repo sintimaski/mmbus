@@ -170,6 +170,9 @@ impl Publisher {
 /// instead of raising SIGPIPE. On Linux MSG_NOSIGNAL is used per-send.
 fn suppress_sigpipe(_stream: &UnixStream) {
     #[cfg(target_os = "macos")]
+    // SAFETY: setsockopt accepts a const-int option value via *const void;
+    // we pass a stack-local int that lives for the call.  The fd comes
+    // from a UnixStream we hold a reference to, so it's open.
     unsafe {
         let val: libc::c_int = 1;
         libc::setsockopt(
@@ -186,6 +189,8 @@ fn suppress_sigpipe(_stream: &UnixStream) {
 #[cfg(not(target_os = "linux"))]
 fn send_wakeup_socket(stream: &UnixStream) -> bool {
     let byte: u8 = 0x01;
+    // SAFETY: stream is a borrowed UnixStream (fd is open for the call);
+    // &byte points to one stack byte; we tell libc::send length 1.
     unsafe {
         libc::send(stream.as_raw_fd(), &byte as *const u8 as *const libc::c_void, 1, 0) == 1
     }

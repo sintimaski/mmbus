@@ -232,6 +232,11 @@ cargo test --release --test stress -- --ignored       # stress tests
 # Fuzz the ring-buffer API (needs nightly + cargo-fuzz)
 cd fuzz && cargo +nightly fuzz run ring_publish_receive -- -max_total_time=60
 
+# Miri is intentionally not part of the test loop: every unsafe block in
+# this crate either calls libc (eventfd, flock, sendmsg, recv) or maps a
+# file (memmap2), neither of which Miri can execute.  Coverage of the
+# unsafe surface comes from the fuzz harness + stress tests instead.
+
 # Python bindings (native build, macOS or Linux)
 python -m venv .venv && .venv/bin/pip install maturin
 .venv/bin/maturin develop --features python
