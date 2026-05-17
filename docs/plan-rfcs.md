@@ -43,8 +43,8 @@ Win32 substitute; this plan slices that into review-sized commits.
 | Stage | Scope | Status |
 |-------|-------|--------|
 | **B0** | New `bridge/` crate (alongside `fuzz/`); binary `mmbus-bridge`; TOML config; wire-frame codec (RFC §3 `Frame` struct) — 20 round-trip + edge-case tests | shipped |
-| **B1** | Local subscribe + forward over TCP to one hardcoded peer endpoint | next |
-| **B2** | Receive frames from peer, dedupe by `origin_id`, republish locally | |
+| **B1** | `Bridge::start(config)` spawns one subscriber thread per forward-enabled topic + one TCP forwarder thread per peer.  Forwarders connect with exponential backoff, send `PeerHello` on connect, pump frames from an mpsc channel.  Integration test in `tests/forward_smoke.rs` drives the full chain (mmbus publish → bridge → TcpListener decode) | shipped |
+| **B2** | Receive frames from peer, dedupe by `origin_id`, republish locally | next |
 | **B3** | Mesh of N peers; per-peer ring buffer; drop-oldest on overflow | |
 | **B4** | QUIC transport (quinn) behind a feature flag; preshared-key auth | |
 | **B5** | Python helper `mmbus.bridge.start(config_path)`; systemd unit | |

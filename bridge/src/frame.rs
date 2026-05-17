@@ -34,10 +34,10 @@ pub const HEADER_LEN: usize = 4 + 4 + 8 + 8;
 pub const MIN_FRAME_LEN: usize = HEADER_LEN + 4 + 4;
 
 /// Hard cap on encoded frame size.  Mainly protects the decoder from a
-/// hostile peer sending an absurd length prefix; legitimate mmbus topics
-/// + payloads are bounded by the configured ring slot size (typically
-/// 64 KiB) so 16 MiB is plenty of headroom while staying well below
-/// `usize::MAX` on 32-bit platforms.
+/// hostile peer sending an absurd length prefix; legitimate mmbus
+/// topics and payloads are bounded by the configured ring slot size
+/// (typically 64 KiB) so 16 MiB is plenty of headroom while staying
+/// well below `usize::MAX` on 32-bit platforms.
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 
 /// Discriminant for [`Frame::frame_type`].

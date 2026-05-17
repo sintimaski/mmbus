@@ -12,8 +12,10 @@
 //! Stage B4: QUIC (quinn) transport behind a feature flag.
 //! Stage B5: Python helper + systemd unit.
 
+pub mod bridge;
 pub mod config;
 pub mod frame;
 
+pub use bridge::{Bridge, BridgeError};
 pub use config::{BridgeConfig, ConfigError, PeerConfig, TopicConfig};
 pub use frame::{DecodeError, Frame, FrameType, FRAME_VERSION, HEADER_LEN};

@@ -110,6 +110,13 @@ impl BridgeConfig {
     }
 
     /// Parse + semantically validate a TOML config from a string.
+    ///
+    /// Named `from_str` to match the convention set by `toml::from_str`
+    /// / `serde_json::from_str`, even though that collides with the
+    /// `std::str::FromStr` trait method.  Implementing `FromStr` itself
+    /// would force callers to write `text.parse::<BridgeConfig>()`
+    /// which is harder to discover.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(text: &str) -> Result<Self, ConfigError> {
         let cfg: BridgeConfig = toml::from_str(text)?;
         cfg.validate()?;
