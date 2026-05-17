@@ -18,9 +18,16 @@ pub(crate) mod linux {
 
     // ── eventfd primitives ────────────────────────────────────────────────────
 
-    /// Create a non-blocking, close-on-exec eventfd with counter = 0.
+    /// Create a non-blocking, close-on-exec eventfd in semaphore mode.
+    ///
+    /// `EFD_SEMAPHORE` makes each `read()` return 1 and decrement the counter
+    /// by 1 — matching the macOS "one byte per message" socket semantics so
+    /// `N` publishes produce `N` distinct wakeups (without it the counter is
+    /// coalesced and the receiver loses messages already in the ring).
     pub fn create_eventfd() -> io::Result<OwnedFd> {
-        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        let fd = unsafe {
+            libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC | libc::EFD_SEMAPHORE)
+        };
         if fd < 0 {
             Err(io::Error::last_os_error())
         } else {

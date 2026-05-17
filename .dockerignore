@@ -1,0 +1,8 @@
+target/
+.venv/
+.git/
+.github/
+*.pyc
+__pycache__/
+*.so
+.DS_Store

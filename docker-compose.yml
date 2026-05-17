@@ -1,13 +1,14 @@
 services:
 
   # Run Rust tests + Python eventfd smoke test inside a single Linux container.
+  # Source is COPY'd at build time; rebuild with `docker compose build test`
+  # after code changes. We deliberately do NOT bind-mount the host source: the
+  # host `target/` is macOS-compiled and would conflict with the Linux rustc,
+  # and `.venv/` is host-platform binaries that won't load inside the container.
   test:
     build:
       context: .
       target: test
-    volumes:
-      # Live-mount source so you can iterate without rebuilding the image.
-      - .:/app
     environment:
       - RUST_BACKTRACE=1
 
