@@ -92,16 +92,35 @@ impl Frame {
         Self { frame_type: FrameType::Msg, origin_id, origin_seq, topic, payload }
     }
 
-    /// Construct a `PeerHello` frame whose payload is the origin_id
-    /// of the sender (forward-compatible with longer hello messages).
-    pub fn peer_hello(origin_id: u64) -> Self {
+    /// Construct a `PeerHello` frame whose payload carries the
+    /// sender's origin_id and preshared key.  Payload layout:
+    /// `u64 origin_id_le || u16 psk_len_le || [u8; psk_len] psk`.
+    /// Receivers MUST validate `psk` against their configured peer
+    /// PSKs before processing any subsequent frames on the
+    /// connection.
+    ///
+    /// The v1 wire protocol explicitly sends the PSK in cleartext
+    /// over TCP (see `docs/rfc-multi-machine.md` §4); the QUIC
+    /// transport adds TLS so the PSK is no longer visible on the
+    /// wire there.
+    pub fn peer_hello_with_psk(origin_id: u64, psk: &[u8]) -> Self {
+        let mut payload = Vec::with_capacity(8 + 2 + psk.len());
+        payload.extend_from_slice(&origin_id.to_le_bytes());
+        payload.extend_from_slice(&(psk.len() as u16).to_le_bytes());
+        payload.extend_from_slice(psk);
         Self {
             frame_type: FrameType::PeerHello,
             origin_id,
             origin_seq: 0,
             topic: Vec::new(),
-            payload: origin_id.to_le_bytes().to_vec(),
+            payload,
         }
+    }
+
+    /// Convenience constructor for tests + tools that don't care about
+    /// PSK auth.  Equivalent to `peer_hello_with_psk(origin_id, &[])`.
+    pub fn peer_hello(origin_id: u64) -> Self {
+        Self::peer_hello_with_psk(origin_id, &[])
     }
 
     /// Construct a `Ping` frame.  All variable fields empty.
@@ -133,6 +152,27 @@ impl Frame {
     }
 }
 
+/// Parsed PeerHello payload — `(origin_id, psk_bytes)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerHelloParts<'a> {
+    pub origin_id: u64,
+    pub psk: &'a [u8],
+}
+
+/// Parse a PeerHello frame's payload bytes.  Borrowed slice to avoid
+/// an extra allocation in the hot accept path.
+pub fn parse_peer_hello(payload: &[u8]) -> Result<PeerHelloParts<'_>, DecodeError> {
+    if payload.len() < 10 {
+        return Err(DecodeError::ShortPeerHello { have: payload.len() });
+    }
+    let origin_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+    let psk_len = u16::from_le_bytes(payload[8..10].try_into().unwrap()) as usize;
+    if payload.len() < 10 + psk_len {
+        return Err(DecodeError::ShortPeerHello { have: payload.len() });
+    }
+    Ok(PeerHelloParts { origin_id, psk: &payload[10..10 + psk_len] })
+}
+
 /// Errors the decoder can surface.  `Incomplete` is the soft error a
 /// streaming reader should treat as "buffer more data and retry";
 /// everything else is a protocol violation that should drop the
@@ -156,6 +196,11 @@ pub enum DecodeError {
     /// hostile peer.
     #[error("frame size {0} exceeds MAX_FRAME_LEN ({})", MAX_FRAME_LEN)]
     TooLarge(usize),
+
+    /// A PeerHello frame's payload was too short to contain the
+    /// required `(origin_id, psk_len, psk)` fields.
+    #[error("PeerHello payload too short: have {have} bytes")]
+    ShortPeerHello { have: usize },
 }
 
 /// Decode one frame from the start of `buf`.  On success returns the
@@ -240,6 +285,47 @@ mod tests {
     #[test]
     fn roundtrip_peer_hello() {
         roundtrip(&Frame::peer_hello(0xCAFE_F00D_DEAD_BEEF));
+    }
+
+    #[test]
+    fn peer_hello_with_psk_round_trips_through_parse() {
+        let f = Frame::peer_hello_with_psk(0x1234_5678_9ABC_DEF0, b"hunter2");
+        let mut buf = Vec::new();
+        f.encode(&mut buf);
+        let (got, _) = decode(&buf).unwrap();
+        let parsed = parse_peer_hello(&got.payload).unwrap();
+        assert_eq!(parsed.origin_id, 0x1234_5678_9ABC_DEF0);
+        assert_eq!(parsed.psk, b"hunter2");
+    }
+
+    #[test]
+    fn peer_hello_empty_psk_round_trips() {
+        let f = Frame::peer_hello(42);
+        let parsed = parse_peer_hello(&f.payload).unwrap();
+        assert_eq!(parsed.origin_id, 42);
+        assert_eq!(parsed.psk, b"");
+    }
+
+    #[test]
+    fn parse_rejects_short_peer_hello() {
+        // 8 bytes is enough for origin_id but missing the psk_len.
+        let short = [0u8; 8];
+        match parse_peer_hello(&short) {
+            Err(DecodeError::ShortPeerHello { have: 8 }) => (),
+            other => panic!("expected ShortPeerHello, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_psk_len_overflow() {
+        // 10 header bytes but psk_len = 100 → underflow.
+        let mut buf = Vec::with_capacity(10);
+        buf.extend_from_slice(&7u64.to_le_bytes());
+        buf.extend_from_slice(&100u16.to_le_bytes());
+        match parse_peer_hello(&buf) {
+            Err(DecodeError::ShortPeerHello { have: 10 }) => (),
+            other => panic!("expected ShortPeerHello, got {other:?}"),
+        }
     }
 
     #[test]

@@ -30,7 +30,7 @@
 //! `(topic, payload)` pairs to it via an mpsc channel.
 
 use crate::config::BridgeConfig;
-use crate::frame::{decode, DecodeError, Frame, FrameType};
+use crate::frame::{decode, parse_peer_hello, DecodeError, Frame, FrameType};
 use crate::queue;
 use mmbus::{Bus, BusConfig};
 use std::collections::HashSet;
@@ -93,7 +93,9 @@ impl Bridge {
         let bus = build_bus(cfg);
 
         // One outbound channel per peer.  Drop-oldest bounded queue —
-        // slow peers cannot stall the publisher.
+        // slow peers cannot stall the publisher.  Each forwarder
+        // sends a PeerHello stamped with that peer's PSK so the
+        // receiving bridge can authenticate the connection.
         let mut peer_tx = Vec::new();
         let mut fwd_threads = Vec::new();
         for peer in &cfg.peers {
@@ -104,7 +106,8 @@ impl Bridge {
             let shutdown_clone = shutdown.clone();
             let hello = {
                 let mut buf = Vec::new();
-                Frame::peer_hello(origin_id).encode(&mut buf);
+                Frame::peer_hello_with_psk(origin_id, peer.preshared_key.as_bytes())
+                    .encode(&mut buf);
                 buf
             };
             fwd_threads.push(thread::spawn(move || {
@@ -149,6 +152,15 @@ impl Bridge {
                     .filter(|t| t.receive)
                     .map(|t| t.name.clone())
                     .collect();
+                // Authentication set: any peer presenting one of these
+                // PSKs in their PeerHello is accepted.  Built from
+                // cfg.peers — symmetric meshes typically share the
+                // same PSK between A→B and B→A entries.
+                let accepted_psks: HashSet<Vec<u8>> = cfg
+                    .peers
+                    .iter()
+                    .map(|p| p.preshared_key.as_bytes().to_vec())
+                    .collect();
                 let (ptx, prx) = mpsc::channel::<(String, Vec<u8>)>();
                 let publish_shutdown = shutdown.clone();
                 // Publisher thread.  Owns a fresh mut Bus (cloning
@@ -176,11 +188,13 @@ impl Bridge {
                 let listener_shutdown = shutdown.clone();
                 let listener_ptx = ptx.clone();
                 let receive_topics_arc = Arc::new(receive_topics);
+                let accepted_psks_arc = Arc::new(accepted_psks);
                 let listen_handle = thread::spawn(move || {
                     listener_main(
                         listener,
                         origin_id,
                         receive_topics_arc,
+                        accepted_psks_arc,
                         listener_ptx,
                         listener_shutdown,
                     );
@@ -425,6 +439,7 @@ fn listener_main(
     listener: TcpListener,
     our_origin_id: u64,
     receive_topics: Arc<HashSet<String>>,
+    accepted_psks: Arc<HashSet<Vec<u8>>>,
     publish_tx: mpsc::Sender<(String, Vec<u8>)>,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -444,10 +459,11 @@ fn listener_main(
                     continue;
                 }
                 let topics = receive_topics.clone();
+                let psks = accepted_psks.clone();
                 let tx = publish_tx.clone();
                 let sd = shutdown.clone();
                 readers.push(thread::spawn(move || {
-                    reader_main(stream, our_origin_id, topics, tx, sd);
+                    reader_main(stream, our_origin_id, topics, psks, tx, sd);
                 }));
             }
             Err(e)
@@ -469,18 +485,27 @@ fn listener_main(
     }
 }
 
-/// Per-accepted-connection reader: decode the frame stream, drop our
-/// own (loop prevention), and forward Msg frames whose topic is in
-/// the receive set to the publisher.
+/// Per-accepted-connection reader: validate the PeerHello, then decode
+/// the frame stream, drop our own (loop prevention), and forward Msg
+/// frames whose topic is in the receive set to the publisher.
+///
+/// Wire-level state machine:
+///   1. Read until we have a full `PeerHello`.
+///   2. Validate its PSK against `accepted_psks`; close on mismatch
+///      or if the first frame isn't a PeerHello.
+///   3. Loop over subsequent frames as before.
 fn reader_main(
     mut stream: TcpStream,
     our_origin_id: u64,
     receive_topics: Arc<HashSet<String>>,
+    accepted_psks: Arc<HashSet<Vec<u8>>>,
     publish_tx: mpsc::Sender<(String, Vec<u8>)>,
     shutdown: Arc<AtomicBool>,
 ) {
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
     let mut tmp = [0u8; 4 * 1024];
+    let mut authenticated = false;
+
     while !shutdown.load(Ordering::Acquire) {
         // Refill from the socket; the 200 ms read timeout makes this
         // loop check the shutdown flag periodically even when the peer
@@ -507,6 +532,38 @@ fn reader_main(
         loop {
             match decode(&buf) {
                 Ok((frame, n)) => {
+                    if !authenticated {
+                        // First frame MUST be PeerHello with a matching PSK.
+                        if frame.frame_type != FrameType::PeerHello {
+                            eprintln!(
+                                "bridge: first frame must be PeerHello (got {:?}); closing",
+                                frame.frame_type
+                            );
+                            return;
+                        }
+                        let hello = match parse_peer_hello(&frame.payload) {
+                            Ok(h) => h,
+                            Err(e) => {
+                                eprintln!("bridge: malformed PeerHello: {e}; closing");
+                                return;
+                            }
+                        };
+                        if !accepted_psks.contains(hello.psk) {
+                            eprintln!(
+                                "bridge: PSK mismatch from origin_id={} ({} byte PSK); closing",
+                                hello.origin_id,
+                                hello.psk.len()
+                            );
+                            return;
+                        }
+                        eprintln!(
+                            "bridge: authenticated peer origin_id={}",
+                            hello.origin_id
+                        );
+                        authenticated = true;
+                        buf.drain(..n);
+                        continue;
+                    }
                     handle_frame(&frame, our_origin_id, &receive_topics, &publish_tx);
                     buf.drain(..n);
                 }
@@ -548,14 +605,17 @@ fn handle_frame(
             }
         }
         FrameType::PeerHello => {
-            eprintln!("bridge: received peer-hello origin_id={}", frame.origin_id);
+            // A second PeerHello mid-stream is unexpected (we only
+            // process the first one at auth time).  Ignore for
+            // forwards-compat in case a future protocol re-handshakes.
         }
         FrameType::Ping => {
             // B2 doesn't yet respond; pings are silently absorbed.
         }
         FrameType::TopicSubscribe => {
-            // B3 will use this to register peer interest in additional
-            // topics.  For now, ignore.
+            // Reserved: will let peers register interest in additional
+            // topics beyond the bridge's configured forward set.
+            // Ignored today.
         }
     }
 }

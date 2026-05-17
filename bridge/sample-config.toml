@@ -29,6 +29,16 @@ receive = false   # ingest-only: alerts only flow OUT to peers
 # Peers in the mesh.  Each entry is a separate process on another
 # machine running its own `mmbus-bridge`.  No discovery in v1 — the
 # endpoint list is the topology.
+#
+# `preshared_key` does double duty since B4a:
+#   * Outbound: included in this bridge's PeerHello to that endpoint
+#     (the remote bridge accepts the connection if it sees the PSK in
+#     ITS own peers list).
+#   * Inbound: when this bridge accepts a connection, the offered
+#     PeerHello PSK must match one of THIS list's preshared_keys.
+# Symmetric meshes typically share the same PSK between A→B and B→A
+# entries.  Today the PSK travels over plaintext TCP; QUIC (B4b) will
+# wrap it in TLS so it isn't visible on the wire.
 [[peers]]
 name = "machine-b"
 endpoint = "machine-b.internal:4443"

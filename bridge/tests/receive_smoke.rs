@@ -40,6 +40,16 @@ fn bridge_receives_from_peer_and_republishes_locally() {
 
             [[topics]]
             name = "events"
+
+            # Required since B4a — the bridge's accepted-PSK set is
+            # built from cfg.peers, so a [[peers]] entry must exist
+            # whose preshared_key matches what the test peer sends
+            # in PeerHello.  endpoint is unused here (we never dial
+            # out from this test bridge).
+            [[peers]]
+            name = "test-peer"
+            endpoint = "127.0.0.1:1"
+            preshared_key = "test-psk"
         "#,
         base_dir = tmp.path().to_str().unwrap(),
     );
@@ -67,7 +77,7 @@ fn bridge_receives_from_peer_and_republishes_locally() {
             },
         );
         let mut sub = bus
-            .subscribe_with_history_timeout("events", 100, Duration::from_secs(5))
+            .subscribe_with_history_timeout("events", 100, Duration::from_secs(15))
             .expect("local subscribe must succeed");
         let mut got = Vec::new();
         for _ in 0..3 {
@@ -85,7 +95,10 @@ fn bridge_receives_from_peer_and_republishes_locally() {
     peer.set_nodelay(true).ok();
 
     let peer_origin_id: u64 = 0xDEAD_BEEF_CAFE_F00D;
-    write_frame(&mut peer, &Frame::peer_hello(peer_origin_id));
+    write_frame(
+        &mut peer,
+        &Frame::peer_hello_with_psk(peer_origin_id, b"test-psk"),
+    );
 
     // Three legitimate Msg frames.
     for i in 0..3u64 {

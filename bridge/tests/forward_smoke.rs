@@ -9,7 +9,7 @@
 //! messages locally and assert the listener sees them in order.
 
 use mmbus::Bus;
-use mmbus_bridge::frame::{decode, Frame, FrameType, MIN_FRAME_LEN};
+use mmbus_bridge::frame::{decode, parse_peer_hello, Frame, FrameType, MIN_FRAME_LEN};
 use mmbus_bridge::{Bridge, BridgeConfig};
 use std::io::Read;
 use std::net::TcpListener;
@@ -129,7 +129,9 @@ fn bridge_forwards_local_publishes_to_one_peer_over_tcp() {
     assert_eq!(hello.frame_type, FrameType::PeerHello);
     assert_eq!(hello.origin_id, bridge.origin_id);
     assert_eq!(hello.topic, b"");
-    assert_eq!(hello.payload, bridge.origin_id.to_le_bytes().to_vec());
+    let parts = parse_peer_hello(&hello.payload).expect("parse hello");
+    assert_eq!(parts.origin_id, bridge.origin_id);
+    assert_eq!(parts.psk, b"k", "forwarder must send the configured PSK");
 
     for (i, frame) in frames[1..6].iter().enumerate() {
         assert_eq!(frame.frame_type, FrameType::Msg);
