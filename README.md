@@ -103,6 +103,26 @@ async def main():
 asyncio.run(main())
 ```
 
+For **trio** or other anyio backends, use `AnyioSubscription` (one worker
+thread per concurrent recv — strictly slower than `AsyncSubscription`, but
+portable):
+
+```python
+import anyio
+from mmbus import Bus
+
+async def main():
+    bus = Bus("demo")
+    sub = await bus.subscribe_anyio("events")
+    async with sub:
+        async for msg in sub:
+            print(msg)
+
+anyio.run(main, backend="trio")  # or "asyncio"
+```
+
+Needs `pip install anyio`; the import is lazy so it's a true opt-in.
+
 ## Performance
 
 Two layers worth measuring separately. Numbers from `cargo bench` on an

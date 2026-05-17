@@ -87,6 +87,24 @@ class Bus:
         )
         return AsyncSubscription(sync_sub)
 
+    async def subscribe_anyio(
+        self, topic: str, timeout_secs: float = 30.0
+    ) -> "AnyioSubscription":
+        """Coroutine that returns an :class:`AnyioSubscription` for use with
+        any anyio-supported backend (asyncio, trio, …).
+
+        Requires ``anyio``: ``pip install anyio``.  Uses ``anyio.to_thread``
+        for blocking calls — costs one thread-pool slot per concurrent recv.
+        On asyncio prefer :meth:`subscribe_async`, which uses
+        ``loop.add_reader`` directly and avoids the thread pool.
+        """
+        from anyio import to_thread
+
+        sync_sub = await to_thread.run_sync(
+            lambda: self._bus.subscribe(topic, timeout_secs=timeout_secs)
+        )
+        return AnyioSubscription(sync_sub)
+
     # ── Coordination ──────────────────────────────────────────────────────────
 
     def wait_for_subscribers(
@@ -217,9 +235,79 @@ class AsyncSubscription:
         pass
 
 
+class AnyioSubscription:
+    """Cross-backend async subscription (asyncio, trio, curio).
+
+    Wraps a synchronous :class:`Subscription` and offloads blocking calls to
+    ``anyio.to_thread`` — costs one worker-thread slot per concurrent recv.
+    If you're on asyncio and care about thread-pool pressure, prefer
+    :class:`AsyncSubscription` which uses ``loop.add_reader`` directly.
+
+    Construct via :meth:`Bus.subscribe_anyio`; raises :exc:`ImportError`
+    on instantiation if ``anyio`` is not installed.
+    """
+
+    def __init__(self, sub: Subscription):
+        try:
+            from anyio import to_thread as _to_thread
+        except ImportError as e:  # pragma: no cover
+            raise ImportError(
+                "AnyioSubscription requires anyio: pip install anyio"
+            ) from e
+        self._to_thread = _to_thread
+        self._sub = sub
+
+    # ── Single-message receive ────────────────────────────────────────────────
+
+    async def recv(self) -> bytes:
+        """Await the next message."""
+        return await self._to_thread.run_sync(self._sub.recv)
+
+    async def recv_timeout(self, timeout_secs: float = 1.0):
+        """Await the next message up to *timeout_secs*.  Returns ``None`` on timeout."""
+        return await self._to_thread.run_sync(self._sub.recv_timeout, timeout_secs)
+
+    def try_recv(self):
+        """Non-blocking poll of the ring (does not drain the wakeup fd)."""
+        return self._sub.try_recv()
+
+    # ── Properties forwarded from the inner Subscription ─────────────────────
+
+    @property
+    def lag(self) -> int:
+        return self._sub.lag
+
+    @property
+    def cursor(self) -> int:
+        return self._sub.cursor
+
+    def fileno(self) -> int:
+        return self._sub.fileno()
+
+    # ── Async iterator protocol ───────────────────────────────────────────────
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> bytes:
+        try:
+            return await self.recv()
+        except (OSError, EOFError):
+            raise StopAsyncIteration
+
+    # ── Async context-manager protocol ───────────────────────────────────────
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        pass
+
+
 __all__ = [
     "Bus",
     "AsyncSubscription",
+    "AnyioSubscription",
     "Subscription",
     "TopicStats",
     "AlreadyPublishingError",
