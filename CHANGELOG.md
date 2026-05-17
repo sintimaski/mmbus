@@ -29,6 +29,10 @@ All notable changes to mmbus are recorded here.  Format follows
   connected sockets.
 - `bus.clean_topic(topic)` — dev/test helper that wipes on-disk state;
   refuses if a publisher is active.
+- `Bus(name, backpressure="error" | "drop_oldest")` — `"error"`
+  (default) raises `BusFullError` when the ring is saturated;
+  `"drop_oldest"` silently overwrites the oldest unread slot and the
+  subscriber detects the skip via the per-slot seqlock.
 - Typed exceptions: `BusFullError`, `MessageTooLargeError`,
   `ConnectTimeoutError`, `TooManySubscribersError`,
   `AlreadyPublishingError`, `CursorTooOldError`.
@@ -103,13 +107,11 @@ All notable changes to mmbus are recorded here.  Format follows
   backed Phase B is designed but unimplemented.
 - **`AnyioSubscription` perf**: uses a worker thread per recv; for
   asyncio-only workloads `AsyncSubscription` is strictly cheaper.
-- **`BackpressurePolicy` from Python**: the Rust core supports both
-  `Error` and `DropOldest`, but `PyBus::new` only exposes the default
-  `Error` policy in 0.1.0.  A `backpressure="error" | "drop_oldest"`
-  kwarg is a small addition planned for the next release; `DropOldest`
-  is a deliberate footgun for naive Python users and we'd rather ship
-  it with the recv-side "you skipped N messages" signal at the same
-  time.
+- **`drop_oldest` recv-side skip signal**: subscribers on a
+  `backpressure="drop_oldest"` bus do not currently get a *count* of
+  how many messages they skipped; the cursor jump is silent.  The
+  next-write seq is detectable at the slot level (the ring code uses
+  it internally) but isn't surfaced to Python.  Planned follow-up.
 - **macOS `kqueue` wakeup**: the macOS path uses a Unix-socket byte
   per message.  `kqueue` is not a substitute (it's a multiplexer, not
   a cross-process primitive); a true equivalent of Linux's `eventfd`

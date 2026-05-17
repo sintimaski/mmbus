@@ -44,7 +44,18 @@ from mmbus._mmbus import (  # noqa: F401
 
 
 class Bus:
-    """High-level pub/sub bus.  Wraps ``_RustBus`` and adds async support."""
+    """High-level pub/sub bus.  Wraps ``_RustBus`` and adds async support.
+
+    Keyword args forwarded to ``_RustBus``:
+      - ``base_dir`` (str): root directory for bus files (default ``/tmp/mmbus``).
+      - ``capacity`` (int): ring slot count (default 256).
+      - ``slot_size`` (int): max payload bytes per slot (default 65536).
+      - ``max_subscribers`` (int): max concurrent subscribers (default 16).
+      - ``backpressure`` (str): ``"error"`` (default; raises
+        :exc:`BusFullError` when the ring is full) or ``"drop_oldest"``
+        (overwrites the oldest unread slot; subscribers detect the skip
+        via the per-slot seqlock).
+    """
 
     def __init__(self, name: str, **kwargs):
         self._bus = _RustBus(name, **kwargs)

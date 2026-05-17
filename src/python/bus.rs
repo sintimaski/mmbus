@@ -1,39 +1,63 @@
 //! `_RustBus` — the PyO3 wrapper around [`crate::Bus`].
 
 use crate::bus::Bus;
-use crate::config::BusConfig;
+use crate::config::{BackpressurePolicy, BusConfig};
 use crate::python::exceptions::mmbus_err;
 use crate::python::subscription::{PySubscription, PyTopicStats};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::time::Duration;
 
 /// Low-level Rust-backed Bus.  Prefer the Python ``Bus`` wrapper in
 /// ``mmbus/__init__.py`` which adds async support and context-manager protocol.
-#[pyclass(name = "_RustBus")]
+#[pyclass(name = "_RustBus", module = "mmbus._mmbus")]
 pub struct PyBus {
     inner: Bus,
 }
 
 #[pymethods]
 impl PyBus {
+    /// ``backpressure`` accepts ``"error"`` (default; raises
+    /// :exc:`BusFullError` when full) or ``"drop_oldest"`` (silently
+    /// overwrites the oldest unread slot; subscribers detect the skip
+    /// via the per-slot seqlock).  Any other value raises ``ValueError``.
     #[new]
-    #[pyo3(signature = (name, *, base_dir=None, capacity=None, slot_size=None, max_subscribers=None))]
+    #[pyo3(signature = (
+        name,
+        *,
+        base_dir=None,
+        capacity=None,
+        slot_size=None,
+        max_subscribers=None,
+        backpressure=None,
+    ))]
     pub fn new(
         name: &str,
         base_dir: Option<String>,
         capacity: Option<u32>,
         slot_size: Option<u32>,
         max_subscribers: Option<u32>,
-    ) -> Self {
+        backpressure: Option<&str>,
+    ) -> PyResult<Self> {
         let defaults = BusConfig::default();
+        let policy = match backpressure {
+            None => defaults.backpressure.clone(),
+            Some("error") => BackpressurePolicy::Error,
+            Some("drop_oldest") => BackpressurePolicy::DropOldest,
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "backpressure must be \"error\" or \"drop_oldest\", got {other:?}"
+                )));
+            }
+        };
         let config = BusConfig {
             base_dir: base_dir.map(Into::into).unwrap_or(defaults.base_dir),
             capacity: capacity.unwrap_or(defaults.capacity),
             slot_size: slot_size.unwrap_or(defaults.slot_size),
             max_subscribers: max_subscribers.unwrap_or(defaults.max_subscribers),
-            ..defaults
+            backpressure: policy,
         };
-        PyBus { inner: Bus::with_config(name, config) }
+        Ok(PyBus { inner: Bus::with_config(name, config) })
     }
 
     /// Publish bytes to ``topic``.

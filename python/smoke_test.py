@@ -69,6 +69,55 @@ def smoke_async() -> None:
     print("  async add_reader PASSED")
 
 
+def smoke_backpressure_kwarg() -> None:
+    """`backpressure=` kwarg validation + drop_oldest semantics."""
+    # Invalid string is rejected at construction with ValueError.
+    try:
+        mmbus.Bus("bp-validate", backpressure="banana")
+    except ValueError:
+        pass
+    else:
+        raise SystemExit("backpressure='banana' should have raised ValueError")
+
+    # drop_oldest lets the publisher outrun a slow reader without raising
+    # BusFullError; the reader receives some prefix and the publisher
+    # completes the full send.
+    base = "/tmp/mmbus_smoke_bp"
+    import shutil
+    shutil.rmtree(base, ignore_errors=True)
+    bus = mmbus.Bus(
+        "drop-smoke", base_dir=base,
+        capacity=4, slot_size=8, backpressure="drop_oldest",
+    )
+    bus.clean_topic("ch")
+    received: list[bytes] = []
+
+    def reader() -> None:
+        sub_bus = mmbus.Bus(
+            "drop-smoke", base_dir=base,
+            capacity=4, slot_size=8, backpressure="drop_oldest",
+        )
+        sub = sub_bus.subscribe("ch", timeout_secs=5.0)
+        for _ in range(20):
+            m = sub.recv_timeout(0.5)
+            if m is None:
+                break
+            received.append(m)
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+    bus.wait_for_subscribers("ch", n=1, timeout_secs=5.0)
+    # 500 publishes into a 4-slot ring must not raise BusFullError under
+    # drop_oldest; subscriber sees a prefix of the stream.
+    for i in range(500):
+        bus.publish("ch", f"{i:08}".encode())
+    t.join(timeout=5.0)
+    shutil.rmtree(base, ignore_errors=True)
+    assert len(received) < 500, "drop_oldest reader must have been skipped"
+    assert len(received) > 0, "drop_oldest reader must have received something"
+    print(f"  backpressure kwarg PASSED (drop_oldest: {len(received)}/500 frames seen)")
+
+
 def smoke_example_np_pipeline() -> None:
     """Run the numpy round-trip example as a subprocess so its assertions
     are exercised in CI.  Skipped if numpy is not installed."""
@@ -96,6 +145,7 @@ def smoke_example_np_pipeline() -> None:
 def main() -> None:
     smoke_sync()
     smoke_async()
+    smoke_backpressure_kwarg()
     smoke_example_np_pipeline()
     print("eventfd smoke test PASSED")
 

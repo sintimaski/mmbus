@@ -219,7 +219,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the full design.
 
 | Call                                       | Behaviour                                          |
 |--------------------------------------------|----------------------------------------------------|
-| `Bus(name)`                                | open a named bus namespace                         |
+| `Bus(name, backpressure="error" \| "drop_oldest")` | open a named bus namespace                  |
 | `bus.publish(topic, bytes)`                | publish a message                                  |
 | `bus.subscribe(topic) -> Subscription`     | sync subscription (iterator + context manager)     |
 | `bus.subscribe_with_history(topic, n)`     | sync subscription replaying the last *n* in-ring messages |
