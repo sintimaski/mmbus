@@ -1,99 +1,94 @@
 # Roadmap
 
-## Phase 1 — Rust Core
+## Phase 1 — Rust Core ✓
 
 Goal: a working lock-free ring buffer over mmap with Unix socket signaling.
-No Python yet. Validate correctness and performance with Rust benchmarks.
 
-- [ ] mmap file creation, header layout, magic/version validation
-- [ ] Lock-free ring buffer: atomic head/tail, slot format, wrap-around
-- [ ] Single-producer single-consumer (SPSC) first, then MPMC
-- [ ] Unix domain socket wakeup (producer sends 1 byte, consumer wakes)
-- [ ] `eventfd` on Linux as lower-overhead alternative to Unix socket
+- [x] mmap file creation, header layout, magic/version validation
+- [x] Lock-free ring buffer: atomic head/tail, slot format, wrap-around
+- [x] Single-producer single-consumer (SPSC) first, then SPMC
+- [x] Unix domain socket wakeup (1 byte per message, macOS)
+- [x] `eventfd` on Linux (`EFD_SEMAPHORE`) — Unix socket kept as
+      handshake / disconnect signal
+- [x] `flock` producer lock (per-process `HashSet` for macOS BSD semantics)
+- [x] Rust benchmarks: `cargo bench --bench ring && cargo bench --bench e2e`
+- [x] SPMC fan-out: per-subscriber cursor table in mmap header
 - [ ] Crash recovery: dirty-flag protocol, header revalidation on reconnect
-- [ ] `fcntl` producer lock (one writer per named bus)
-- [ ] Rust benchmarks: latency histogram, throughput, syscall count
-- [ ] Basic multi-reader fan-out (each reader tracks its own cursor)
 
-**Success criteria:** matches bslatkin/ringbuffer throughput (~2 GB/s) with
-correct behavior under concurrent readers and simulated producer crashes.
+Throughput on M-series macOS: ~36M ring ops/s (32 B), ~1.4M msg/s e2e.
 
 ---
 
-## Phase 2 — PyO3 Bindings
+## Phase 2 — PyO3 Bindings ✓
 
-Goal: expose Rust core to Python with correct GIL semantics and zero-copy.
+Goal: expose Rust core to Python with correct GIL semantics.
 
-- [ ] `Bus`, `Publisher`, `Subscriber` as PyO3 classes
-- [ ] `pub.publish(bytes)` — write bytes into ring buffer
-- [ ] `sub.receive() -> memoryview` — zero-copy read
-- [ ] `sub.receive(timeout=N)` — blocking with GIL release
-- [ ] `py.allow_threads()` around all blocking waits
-- [ ] Buffer protocol: expose slot memory as `memoryview` without copy
-- [ ] `maturin develop` workflow; basic Python test suite
-- [ ] Publish development wheel to TestPyPI
-
-**Success criteria:** Python round-trip latency under 500 ns for small
-messages; numpy array passed as memoryview with no copy verified via
-`id()` / buffer address checks.
+- [x] `Bus`, `Subscription`, `TopicStats` as PyO3 classes
+- [x] `bus.publish(bytes)` — write bytes into ring
+- [x] `sub.recv() -> bytes` — copy out of ring into Python `bytes`
+- [x] `sub.recv_timeout(secs)` — blocking with timeout, GIL released
+- [x] `py.allow_threads()` around all blocking waits
+- [x] `maturin develop` workflow; smoke test in `python/smoke_test.py`
+- [ ] Buffer protocol: expose slot memory as `memoryview` (deferred — only
+      meaningful for large arrays; pinned slots would block ring overwrites.
+      Revisit if ML / video use cases emerge.)
+- [ ] Publish wheel to TestPyPI / PyPI (wheels.yml ready; needs `v0.1.0` tag)
 
 ---
 
-## Phase 3 — Python API
+## Phase 3 — Python API ✓
 
-Goal: ergonomic, Pythonic API on top of the raw PyO3 bindings.
-
-- [ ] Topic routing: named channels within a Bus
-- [ ] Serialization layer: raw bytes (default), numpy, pickle, msgpack
-- [ ] Blocking iterator: `for msg in sub:`
-- [ ] Context manager: `with bus.subscriber("x") as sub:`
-- [ ] `Publisher.publish(data)` — auto-serializes based on type
-- [ ] `Subscriber.receive(timeout)` — typed return
-- [ ] `Bus.topics()` — list active topics
-- [ ] Error types: `BusFullError`, `BusClosedError`, `TimeoutError`
-- [ ] Type annotations throughout
-- [ ] Python 3.9+ support
+- [x] Topic routing: named channels within a `Bus`
+- [x] Blocking iterator: `for msg in sub:`
+- [x] Context manager: `with bus.subscribe("x") as sub:`
+- [x] Typed exceptions: `BusFullError`, `MessageTooLargeError`,
+      `ConnectTimeoutError`, `TooManySubscribersError`, `AlreadyPublishingError`
+- [x] Type annotations on public API
+- [x] Python 3.8+ support
+- [ ] Serialization helpers (numpy / msgpack / pickle) — out of scope for v0.1;
+      raw bytes is the documented contract
 
 ---
 
-## Phase 4 — Async Support
+## Phase 4 — Async Support ✓
 
-Goal: native asyncio integration without threads.
-
-- [ ] `async for msg in sub.aiter():` — non-blocking async iterator
-- [ ] `await sub.receive_async(timeout)` — awaitable receive
-- [ ] `asyncio` event loop integration via fd registration (`loop.add_reader`)
-- [ ] Compatible with `anyio` / `trio` via abstraction layer
-- [ ] FastAPI example: WebSocket broadcast to N clients via mmbus
+- [x] `async for msg in sub:` — non-blocking async iterator
+- [x] `await sub.recv_timeout(timeout)` — awaitable receive
+- [x] `asyncio` integration via `loop.add_reader` (eventfd Linux,
+      socket macOS); zero thread pool usage for `recv`
+- [x] Disconnect detection: second `add_reader` on handshake socket on Linux
+      so publisher `POLLHUP` cancels in-flight `await sub.recv()`
+- [ ] `anyio` / `trio` compatibility layer
+- [ ] FastAPI WebSocket-broadcast example
 
 ---
 
 ## Phase 5 — Hardening & Observability
 
-Goal: production-ready reliability and debuggability.
-
-- [ ] Backpressure: configurable drop vs. block on full buffer
-- [ ] Slow-consumer detection: warn when a subscriber cursor falls behind
-- [ ] `Bus.stats()` — throughput, lag, drop count per topic
+- [x] Backpressure: `BackpressurePolicy::Error` vs `DropOldest`
+- [x] `Bus.stats(topic)` — `tail`, `active_subscribers`, per-cursor `lags`,
+      `connected_sockets`
+- [x] `subscription.lag` / `.cursor` exposed for slow-consumer detection
+- [ ] Warn when a subscriber's `lag` exceeds threshold (today: caller
+      must poll `stats` and decide)
 - [ ] Prometheus metrics export (optional dependency)
 - [ ] Structured logging (tracing in Rust, `logging` in Python)
 - [ ] Fuzz testing of ring buffer under concurrent access
 - [ ] Stress test: 24h run under load, validate no message loss
-- [ ] macOS: switch wakeup to `kqueue` for efficiency
+- [ ] macOS: switch wakeup to `kqueue` for efficiency (eventfd-equivalent)
 
 ---
 
 ## Phase 6 — Distribution & Documentation
 
-Goal: frictionless `pip install`, discoverable library.
-
-- [ ] PyPI release under chosen name
-- [ ] GitHub Actions CI: build wheels for all targets (manylinux, macOS)
-- [ ] `maturin` release workflow
-- [ ] README with benchmark comparison (vs ZeroMQ, Redis, multiprocessing)
-- [ ] Quickstart guide for each target use case (ML pipeline, FastAPI, edge)
-- [ ] API reference docs (mkdocs or rustdoc-style)
-- [ ] Example projects: tensor pipeline, multi-worker broadcast, sensor reader
+- [x] README with quickstart + perf table + competitive comparison
+- [x] Cross-process examples (`examples/pub.py`, `examples/sub.py`)
+- [x] CI: `cargo test` + `clippy` on Linux + macOS (`.github/workflows/ci.yml`)
+- [x] Wheel build matrix: `linux/macos × x86_64/aarch64` (`wheels.yml`)
+- [x] Docker dev environment for Linux testing from macOS
+- [ ] Tag `v0.1.0` → triggers PyPI publish via wheels.yml
+- [ ] API reference docs (rustdoc + mkdocs)
+- [ ] Use-case mini-guides (FastAPI, ML pipeline, sensor reader)
 
 ---
 

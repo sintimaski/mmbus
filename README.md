@@ -105,20 +105,39 @@ asyncio.run(main())
 
 ## Performance
 
-Numbers from public IPC benchmarks (arXiv 2508.07934 + Linux IPC mechanism
-shootouts):
+Two layers worth measuring separately. Numbers from `cargo bench` on an
+Apple M-series laptop (`benches/ring.rs` + `benches/e2e.rs`).
 
-| Transport            | P50 latency | Throughput     | Syscalls / 1M msgs |
-|----------------------|-------------|----------------|-------------------|
-| **`mmap` ring buffer** | **~127 ns** | **7.9M msg/s** | **~4 total**      |
-| POSIX message queue  | ~2.7 µs     | 364K msg/s     | 2M                |
-| ZeroMQ IPC           | ~20–40 µs   | 481K msg/s     | high              |
-| Redis pub/sub        | ~17 µs      | 59K msg/s      | high              |
-| `multiprocessing.Queue` | ~6 µs    | 80–175K msg/s  | high (+ pickle)   |
+**Ring layer alone** — in-process write/read of a slot, no IPC wakeup:
 
-~16× lower latency than ZeroMQ. ~130× lower latency than Redis.  The data
-path generates ~4 syscalls *total* per million messages — none of them
-copying payload bytes.
+| Payload | Per-op cost | Throughput   |
+|---------|-------------|--------------|
+| 32 B    | ~27 ns      | ~36M ops/s   |
+| 256 B   | ~33 ns      | ~30M ops/s   |
+| 1024 B  | ~154 ns     | ~6.5M ops/s  |
+
+**End-to-end** — separate publisher and subscriber threads, including the
+1-byte wakeup syscall per message:
+
+| Payload | Per-msg cost | Throughput     |
+|---------|--------------|----------------|
+| 32 B    | ~720 ns      | ~1.4M msg/s    |
+| 256 B   | ~740 ns      | ~1.35M msg/s   |
+
+The wakeup syscall dominates e2e latency; for fan-out workloads where the
+publisher is faster than any single subscriber, the ring-layer numbers are
+what matters.  Reference points from public IPC benchmarks (arXiv 2508.07934
+and Linux IPC shootouts) for comparison:
+
+| Transport               | P50 latency | Throughput      |
+|-------------------------|-------------|-----------------|
+| **mmbus (e2e)**         | **~720 ns** | **~1.4M msg/s** |
+| POSIX message queue     | ~2.7 µs     | 364K msg/s      |
+| ZeroMQ IPC              | ~20–40 µs   | 481K msg/s      |
+| Redis pub/sub           | ~17 µs      | 59K msg/s       |
+| `multiprocessing.Queue` | ~6 µs       | 80–175K msg/s   |
+
+Reproduce: `cargo bench --bench ring && cargo bench --bench e2e`.
 
 ## How it works
 
