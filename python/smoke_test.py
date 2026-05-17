@@ -142,11 +142,49 @@ def smoke_example_np_pipeline() -> None:
     print("  np_pipeline example PASSED")
 
 
+def smoke_example_fastapi_broadcast() -> None:
+    """Drive examples/fastapi_broadcast:app via Starlette's TestClient
+    end-to-end: POST /publish on the HTTP side, recv on a WS connection
+    on the subscriber side, assert byte-for-byte equality.  Skipped if
+    fastapi or httpx (required by TestClient) is not installed."""
+    try:
+        import fastapi  # noqa: F401
+        from fastapi.testclient import TestClient
+    except (ImportError, RuntimeError):
+        # RuntimeError happens when fastapi is present but httpx is not —
+        # starlette.testclient raises at import.
+        print("  fastapi_broadcast SKIPPED (fastapi+httpx not installed)")
+        return
+
+    here = os.path.dirname(__file__)
+    repo_root = os.path.normpath(os.path.join(here, ".."))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
+    # The example creates Bus("fastapi-broadcast") at import time and
+    # publishes an empty warmup byte under its lifespan.  Clean any
+    # leftover topic state from a prior run so the smoke is reproducible.
+    mmbus.Bus("fastapi-broadcast").clean_topic("broadcast")
+
+    from examples.fastapi_broadcast import app  # noqa: WPS433
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            r = client.post("/publish", content=b"smoke-payload")
+            assert r.status_code == 200, r.text
+            msg = ws.receive_bytes()
+            assert msg == b"smoke-payload", f"unexpected WS payload: {msg!r}"
+            root = client.get("/").json()
+            assert root["active_subscribers"] >= 1, root
+    print("  fastapi_broadcast example PASSED")
+
+
 def main() -> None:
     smoke_sync()
     smoke_async()
     smoke_backpressure_kwarg()
     smoke_example_np_pipeline()
+    smoke_example_fastapi_broadcast()
     print("eventfd smoke test PASSED")
 
 
