@@ -1,11 +1,11 @@
 /// Lock-free SPMC ring buffer over a memory-mapped file.
 ///
-/// # Wire format (v3 — SPMC + generation counter)
+/// # Wire format (v4 — SPMC + generation + per-slot seqlock)
 ///
 /// ```text
 /// Bytes 0..64  — fixed header
 ///   0   u64    magic
-///   8   u32    version (= 3)
+///   8   u32    version (= 4)
 ///  12   u32    capacity (slot count)
 ///  16   u32    slot_payload_size (max bytes per message)
 ///  20   u32    max_subscribers
@@ -19,7 +19,15 @@
 ///                   any other value = subscriber's next-read position
 ///
 /// Bytes ALIGN64(64+8*max_subscribers) onwards — ring slots
-///   slot[i]  [u32 len][payload bytes (slot_payload_size)]
+///   slot[i]  [u64 seq][u32 len][payload (slot_payload_size bytes)]
+///
+///   `seq` carries the publisher's tail value at the moment this slot was
+///   written.  Subscribers Acquire-load it before AND after copying the
+///   payload (seqlock pattern): a mismatch means the publisher overwrote
+///   the slot during the read, so the subscriber re-resolves its position
+///   from the new seq and retries.  Under `BackpressurePolicy::DropOldest`
+///   this is how skipped-message detection happens — no force-advance of
+///   the cursor table is needed.
 /// ```
 ///
 /// # SPMC invariant
@@ -35,7 +43,7 @@ use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub const MAGIC: u64 = 0x6D6D_6275_7300_0003; // "mmbus" + format version 3
+pub const MAGIC: u64 = 0x6D6D_6275_7300_0004; // "mmbus" + format version 4
 pub const CURSOR_UNCLAIMED: u64 = u64::MAX;
 pub const MAX_SUBSCRIBERS_DEFAULT: u32 = 16;
 
@@ -54,8 +62,19 @@ pub fn slots_offset(max_subscribers: u32) -> usize {
     (raw + 63) & !63
 }
 
+/// On-disk slot stride: 8 B seq + 4 B len + `slot_payload_size` payload bytes,
+/// rounded up to an 8-byte multiple so every slot's `seq: AtomicU64` is naturally
+/// aligned.
+const SLOT_OVERHEAD: usize = 8 + 4;
+const SLOT_ALIGN: usize = 8;
+
+fn slot_stride(slot_payload_size: u32) -> usize {
+    let raw = SLOT_OVERHEAD + slot_payload_size as usize;
+    (raw + SLOT_ALIGN - 1) & !(SLOT_ALIGN - 1)
+}
+
 pub fn mmap_size(capacity: u32, slot_payload_size: u32, max_subscribers: u32) -> usize {
-    slots_offset(max_subscribers) + (4 + slot_payload_size as usize) * capacity as usize
+    slots_offset(max_subscribers) + slot_stride(slot_payload_size) * capacity as usize
 }
 
 pub struct RingBuffer {
@@ -90,7 +109,7 @@ impl RingBuffer {
 
         unsafe {
             p.add(OFF_MAGIC).cast::<u64>().write_unaligned(MAGIC);
-            p.add(OFF_VERSION).cast::<u32>().write_unaligned(3);
+            p.add(OFF_VERSION).cast::<u32>().write_unaligned(4);
             p.add(OFF_CAPACITY).cast::<u32>().write_unaligned(capacity);
             p.add(OFF_SLOT_SIZE).cast::<u32>().write_unaligned(slot_payload_size);
             p.add(OFF_MAX_SUBS).cast::<u32>().write_unaligned(max_subscribers);
@@ -172,7 +191,7 @@ impl RingBuffer {
     }
 
     fn stride(&self) -> usize {
-        4 + self.slot_payload_size as usize
+        slot_stride(self.slot_payload_size)
     }
 
     fn base(&self) -> *mut u8 {
@@ -211,6 +230,14 @@ impl RingBuffer {
     }
 
     /// Release a cursor slot (subscriber disconnecting or being dropped).
+    /// Overwrite a previously-claimed cursor slot.  Used by the subscriber
+    /// to re-synchronise its position with the current tail after the
+    /// publisher handshake completes (in case the publisher restarted and
+    /// reset the tail between `claim_cursor` and the socket connect).
+    pub fn set_cursor(&self, idx: usize, value: u64) {
+        self.cursor_atomic(idx).store(value, Ordering::Release);
+    }
+
     pub fn release_cursor(&self, idx: usize) {
         self.cursor_atomic(idx).store(CURSOR_UNCLAIMED, Ordering::Release);
     }
@@ -252,57 +279,28 @@ impl RingBuffer {
         true
     }
 
-    /// Like `try_publish`, but if the ring is full it advances the cursor of the
-    /// slowest subscriber by 1 (drops that subscriber's oldest unread message)
-    /// and retries. Always succeeds unless there are zero slots.
+    /// Like `try_publish` but always succeeds: when the ring is full the
+    /// publisher overwrites the slot containing the oldest unread message.
+    /// Subscribers detect the overwrite via the slot's seq field and skip
+    /// forward — no cursor-table force-advance is needed.
     pub fn publish_drop_oldest(&self, data: &[u8]) -> bool {
-        loop {
-            let tail = self.tail_atomic().load(Ordering::Relaxed);
-            let effective_min = self.min_active_cursor().unwrap_or(tail);
-
-            if tail.wrapping_sub(effective_min) < self.capacity as u64 {
-                self.write_slot(tail, data);
-                self.tail_atomic().store(tail + 1, Ordering::Release);
-                return true;
-            }
-
-            // Ring full: force-advance the slowest subscriber's cursor.
-            // Use CAS so we don't race with the subscriber itself advancing.
-            // If the CAS fails the subscriber made progress on its own — retry.
-            if let Some((idx, val)) = self.min_active_cursor_with_idx() {
-                let _ = self.cursor_atomic(idx).compare_exchange(
-                    val,
-                    val + 1,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                );
-            } else {
-                // No subscribers but ring somehow full — shouldn't happen.
-                return false;
-            }
-        }
+        let tail = self.tail_atomic().load(Ordering::Relaxed);
+        self.write_slot(tail, data);
+        self.tail_atomic().store(tail + 1, Ordering::Release);
+        true
     }
 
-    fn min_active_cursor_with_idx(&self) -> Option<(usize, u64)> {
-        let mut best: Option<(usize, u64)> = None;
-        for i in 0..self.max_subscribers as usize {
-            let c = self.cursor_atomic(i).load(Ordering::Acquire);
-            if c != CURSOR_UNCLAIMED {
-                let update = best.map_or(true, |(_, m)| c < m);
-                if update {
-                    best = Some((i, c));
-                }
-            }
-        }
-        best
-    }
-
+    /// Write `data` into the ring slot for `tail` and stamp it with
+    /// `seq = tail`.  The seq Release-store goes last so subscribers
+    /// observing it via Acquire see the new len + payload.
     fn write_slot(&self, tail: u64, data: &[u8]) {
         let idx = (tail % self.capacity as u64) as usize;
         let slot = unsafe { self.base().add(self.slots_off + idx * self.stride()) };
         unsafe {
-            (slot as *mut u32).write_unaligned(data.len() as u32);
-            std::ptr::copy_nonoverlapping(data.as_ptr(), slot.add(4), data.len());
+            // len + payload first (relaxed), then seq with Release ordering.
+            (slot.add(8) as *mut u32).write_unaligned(data.len() as u32);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), slot.add(12), data.len());
+            (*(slot as *const AtomicU64)).store(tail, Ordering::Release);
         }
     }
 
@@ -325,28 +323,60 @@ impl RingBuffer {
         out: &mut Vec<u8>,
     ) -> Option<u64> {
         let tail = self.tail_atomic().load(Ordering::Acquire);
-
-        // Detect force-advancement by DropOldest: ring may have moved ahead.
-        let ring_cursor = self.cursor_atomic(cursor_idx).load(Ordering::Acquire);
-        let effective = local_cursor.max(ring_cursor);
-
-        if effective >= tail {
+        if local_cursor >= tail {
             return None;
         }
 
-        let idx = (effective % self.capacity as u64) as usize;
-        let slot = unsafe { self.base().add(self.slots_off + idx * self.stride()) };
-        let len = unsafe { (slot as *const u32).read_unaligned() as usize };
+        // Seqlock read protocol — guards against torn reads under
+        // `DropOldest` where the publisher may overwrite a slot mid-copy.
+        const MAX_RETRIES: usize = 16;
+        let mut effective = local_cursor;
+        for _ in 0..MAX_RETRIES {
+            let idx = (effective % self.capacity as u64) as usize;
+            let slot = unsafe { self.base().add(self.slots_off + idx * self.stride()) };
+            let seq_atomic = unsafe { &*(slot as *const AtomicU64) };
 
-        out.clear();
-        out.resize(len, 0);
-        unsafe {
-            std::ptr::copy_nonoverlapping(slot.add(4), out.as_mut_ptr(), len);
+            let seq_before = seq_atomic.load(Ordering::Acquire);
+            if seq_before > effective {
+                // Publisher overwrote this slot with a newer message.
+                // Skip forward to whatever's there now.
+                effective = seq_before;
+                continue;
+            }
+            if seq_before < effective {
+                // Slot not yet written for our position.  Should be ruled
+                // out by the tail check above; bail defensively.
+                return None;
+            }
+            // seq matches `effective` — read the payload.
+            let len =
+                unsafe { (slot.add(8) as *const u32).read_unaligned() as usize };
+            if len > self.slot_payload_size as usize {
+                // Torn read of `len` field — slot is being overwritten.
+                continue;
+            }
+            out.clear();
+            out.resize(len, 0);
+            unsafe {
+                std::ptr::copy_nonoverlapping(slot.add(12), out.as_mut_ptr(), len);
+            }
+            let seq_after = seq_atomic.load(Ordering::Acquire);
+            if seq_after != seq_before {
+                // Slot was overwritten during the payload copy — retry,
+                // possibly at the new seq if it leapt ahead.
+                if seq_after > effective {
+                    effective = seq_after;
+                }
+                continue;
+            }
+
+            let new_cursor = effective + 1;
+            self.cursor_atomic(cursor_idx).store(new_cursor, Ordering::Release);
+            return Some(new_cursor);
         }
-
-        let new_cursor = effective + 1;
-        self.cursor_atomic(cursor_idx).store(new_cursor, Ordering::Release);
-        Some(new_cursor)
+        // Publisher is sustained-overwriting this slot faster than we can
+        // copy — give up; the caller's wakeup loop will retry.
+        None
     }
 
     pub fn current_tail(&self) -> u64 {

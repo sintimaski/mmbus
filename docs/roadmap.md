@@ -13,7 +13,10 @@ Goal: a working lock-free ring buffer over mmap with Unix socket signaling.
 - [x] `flock` producer lock (per-process `HashSet` for macOS BSD semantics)
 - [x] Rust benchmarks: `cargo bench --bench ring && cargo bench --bench e2e`
 - [x] SPMC fan-out: per-subscriber cursor table in mmap header
-- [ ] Crash recovery: dirty-flag protocol, header revalidation on reconnect
+- [x] Crash-safe publisher restart: header `generation` counter (v3 wire
+      format).  Subscribers detect the bump on next wakeup and return
+      `UnexpectedEof` instead of reading from the logically-reset ring.
+      Tests in `tests/crash_recovery.rs`.
 
 Throughput on M-series macOS: ~36M ring ops/s (32 B), ~1.4M msg/s e2e.
 
@@ -59,7 +62,7 @@ Goal: expose Rust core to Python with correct GIL semantics.
 - [x] Disconnect detection: second `add_reader` on handshake socket on Linux
       so publisher `POLLHUP` cancels in-flight `await sub.recv()`
 - [ ] `anyio` / `trio` compatibility layer
-- [ ] FastAPI WebSocket-broadcast example
+- [x] FastAPI WebSocket-broadcast example (`examples/fastapi_broadcast.py`)
 
 ---
 
@@ -73,9 +76,18 @@ Goal: expose Rust core to Python with correct GIL semantics.
       must poll `stats` and decide)
 - [ ] Prometheus metrics export (optional dependency)
 - [ ] Structured logging (tracing in Rust, `logging` in Python)
-- [ ] Fuzz testing of ring buffer under concurrent access
-- [ ] Stress test: 24h run under load, validate no message loss
-- [ ] macOS: switch wakeup to `kqueue` for efficiency (eventfd-equivalent)
+- [ ] Fuzz testing of ring buffer under concurrent access (cargo-fuzz +
+      nightly Rust; out of scope for v0.1)
+- [x] Stress tests: `cargo test --release --test stress -- --ignored`
+      (fan-out 100k×4, drop-oldest 50k×3, 50× rapid restart cycles)
+- [ ] ~~macOS: switch wakeup to `kqueue` for efficiency~~ — *not viable as
+      originally framed.* `kqueue` is the event multiplexer (asyncio uses
+      it already), not a cross-process wakeup primitive like `eventfd`.
+      macOS has no clean eventfd equivalent (`EVFILT_USER` is per-kqueue,
+      not transferable via SCM_RIGHTS; Mach ports are a major rewrite for
+      marginal gain). Current Unix-socket path is ~720 ns e2e — close
+      enough to the Linux eventfd path (~similar order) that the
+      complexity isn't justified.
 
 ---
 

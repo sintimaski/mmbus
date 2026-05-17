@@ -100,6 +100,14 @@ impl Subscriber {
             return Err(Error::Io(e));
         }
 
+        // Re-synchronise after the handshake completes.  If the publisher
+        // restarted between our initial `current_tail` read above and the
+        // socket connect, the tail was reset to 0 — but our cursor still
+        // points at the *old* tail and would block forever waiting for
+        // messages that never arrive.  Reading tail + generation now
+        // captures the post-handshake state.
+        let cursor = ring.current_tail();
+        ring.set_cursor(cursor_idx, cursor);
         let generation = ring.generation();
 
         Ok(Self {
