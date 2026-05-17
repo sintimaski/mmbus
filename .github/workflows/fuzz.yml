@@ -28,21 +28,25 @@ jobs:
         with:
           tool: cargo-fuzz
 
-      - name: Cache Cargo registry + fuzz target build
-        uses: actions/cache@v4
+      # Cache the fuzz workspace specifically (separate from the parent
+      # cargo workspace so the libfuzzer-instrumented target/ tree
+      # doesn't pollute or invalidate the non-fuzz CI cache).
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            fuzz/target
-          key: fuzz-${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'fuzz/Cargo.toml') }}
-          restore-keys: fuzz-${{ runner.os }}-cargo-
+          workspaces: "fuzz -> target"
+          prefix-key: "v0-rust-fuzz"
 
-      - name: Run fuzz target
+      - name: Run fuzz target (ring_publish_receive)
         working-directory: fuzz
         run: |
           DURATION="${{ github.event.inputs.duration_seconds || '60' }}"
           cargo fuzz run ring_publish_receive -- -max_total_time="$DURATION"
+
+      - name: Run fuzz target (ring_concurrent)
+        working-directory: fuzz
+        run: |
+          DURATION="${{ github.event.inputs.duration_seconds || '60' }}"
+          cargo fuzz run ring_concurrent -- -max_total_time="$DURATION"
 
       - name: Upload crash artifacts on failure
         if: failure()

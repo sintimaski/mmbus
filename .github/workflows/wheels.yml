@@ -30,6 +30,16 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Per-target cache so each (os, target) wheel has its own warm
+      # registry + target/.  Wheels are tag-driven so reuse is rare,
+      # but maturin builds the full crate from scratch every time
+      # otherwise — a ~3-minute cold start that's worth avoiding when
+      # a tag triggers four parallel runs.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          prefix-key: "v0-rust-wheels"
+
       - name: Install cross-compilation tools (Linux aarch64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: sudo apt-get install -y gcc-aarch64-linux-gnu
