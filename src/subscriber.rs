@@ -177,6 +177,68 @@ impl Subscriber {
         }
     }
 
+    /// The handshake socket fd. On Linux this differs from [`fileno`] (the
+    /// eventfd) and signals **disconnect** via `POLLHUP` — register it with
+    /// the event loop alongside [`fileno`] so publisher death is detected
+    /// even while idle. On macOS it equals [`fileno`].
+    pub fn socket_fileno(&self) -> RawFd {
+        self.sock.as_raw_fd()
+    }
+
+    /// Non-blocking: drain at most one wakeup signal and attempt one ring
+    /// read.  Designed for event-loop callbacks (`asyncio.add_reader`).
+    ///
+    /// * `Ok(Some(msg))` — a message was received.
+    /// * `Ok(None)`      — no wakeup was pending (spurious wake or already drained).
+    /// * `Err(_)`        — publisher disconnected or I/O error.
+    pub fn poll_recv(&mut self) -> Result<Option<Vec<u8>>> {
+        if !self.try_drain_wakeup()? {
+            return Ok(None);
+        }
+        Ok(self.try_receive())
+    }
+
+    /// Drain exactly one wakeup unit without blocking.  Returns `Ok(true)`
+    /// if a wakeup was consumed, `Ok(false)` if none was pending.
+    fn try_drain_wakeup(&mut self) -> io::Result<bool> {
+        #[cfg(target_os = "linux")]
+        {
+            // eventfd is EFD_NONBLOCK | EFD_SEMAPHORE — read decrements by 1.
+            match crate::waker::linux::eventfd_drain(self.efd.as_raw_fd()) {
+                Ok(_) => Ok(true),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(false),
+                Err(e) => Err(e),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Use MSG_DONTWAIT so we don't have to toggle O_NONBLOCK on a
+            // socket that the blocking `receive()` path also uses.
+            let mut byte = 0u8;
+            let ret = unsafe {
+                libc::recv(
+                    self.sock.as_raw_fd(),
+                    &mut byte as *mut u8 as *mut libc::c_void,
+                    1,
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if ret == 1 {
+                Ok(true)
+            } else if ret == 0 {
+                // EOF: peer closed.
+                Err(io::Error::new(io::ErrorKind::UnexpectedEof, "publisher closed"))
+            } else {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::WouldBlock {
+                    Ok(false)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
     // ── Internal wakeup helpers ───────────────────────────────────────────────
 
     /// Wait for one wakeup signal. `timeout_ms = -1` blocks indefinitely.

@@ -50,6 +50,24 @@ impl Subscription {
     pub fn fileno(&self) -> RawFd {
         self.sub.fileno()
     }
+
+    /// The handshake socket fd. On Linux this differs from [`fileno`] and
+    /// signals **publisher disconnect** via `POLLHUP`. Register both with
+    /// the event loop so disconnect is detected even while idle. On macOS
+    /// it equals [`fileno`].
+    pub fn socket_fileno(&self) -> RawFd {
+        self.sub.socket_fileno()
+    }
+
+    /// Non-blocking event-loop callback helper: drain at most one wakeup
+    /// signal and attempt one ring read.  Returns:
+    ///
+    /// * `Ok(Some(msg))` — a message was received.
+    /// * `Ok(None)`      — no wakeup pending (spurious wake or already drained).
+    /// * `Err(_)`        — publisher disconnected.
+    pub fn poll_recv(&mut self) -> Result<Option<Vec<u8>>> {
+        self.sub.poll_recv()
+    }
 }
 
 impl Iterator for Subscription {

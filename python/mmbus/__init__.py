@@ -114,8 +114,16 @@ class Bus:
 
 
 class AsyncSubscription:
-    """asyncio-compatible subscription.  Wraps a synchronous :class:`Subscription`
-    and offloads blocking calls to the running loop's default executor."""
+    """asyncio-compatible subscription using ``loop.add_reader`` — no thread
+    pool, no blocking on the event-loop thread.
+
+    The subscriber's wakeup fd (eventfd on Linux, socket on macOS) is
+    registered with the running event loop.  When it becomes readable, a
+    callback drains one wakeup signal and reads one message from the ring,
+    then resolves the awaiting future.  On Linux a second reader is
+    registered on the handshake socket so publisher disconnect (POLLHUP)
+    is detected even while idle.
+    """
 
     def __init__(self, sub: Subscription):
         self._sub = sub
@@ -123,19 +131,51 @@ class AsyncSubscription:
     # ── Single-message receive ────────────────────────────────────────────────
 
     async def recv(self) -> bytes:
-        """Await the next message.  Never returns ``None``."""
+        """Await the next message.  Raises :exc:`EOFError` if the publisher
+        disconnects while waiting."""
         loop = _asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._sub.recv)
+        fut = loop.create_future()
+        wfd = self._sub.fileno()
+        sfd = self._sub.socket_fileno()
+        # On macOS these are the same fd; on Linux wfd is the eventfd and
+        # sfd is the handshake socket (POLLHUP signals publisher death).
+        same_fd = wfd == sfd
+
+        def on_data() -> None:
+            try:
+                msg = self._sub.poll_recv()
+            except OSError as e:
+                if not fut.done():
+                    fut.set_exception(e)
+                return
+            if msg is not None and not fut.done():
+                fut.set_result(msg)
+            # else: spurious wakeup — reader stays armed.
+
+        def on_disconnect() -> None:
+            if not fut.done():
+                fut.set_exception(EOFError("publisher disconnected"))
+
+        loop.add_reader(wfd, on_data)
+        if not same_fd:
+            loop.add_reader(sfd, on_disconnect)
+        try:
+            return await fut
+        finally:
+            loop.remove_reader(wfd)
+            if not same_fd:
+                loop.remove_reader(sfd)
 
     async def recv_timeout(self, timeout_secs: float = 1.0):
         """Await the next message up to *timeout_secs*.  Returns ``None`` on timeout."""
-        loop = _asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None, self._sub.recv_timeout, timeout_secs
-        )
+        try:
+            return await _asyncio.wait_for(self.recv(), timeout=timeout_secs)
+        except _asyncio.TimeoutError:
+            return None
 
     def try_recv(self):
-        """Non-blocking poll.  Returns ``None`` if no message is ready."""
+        """Non-blocking poll of the ring (does not drain the wakeup fd).
+        Returns ``None`` if no message is ready."""
         return self._sub.try_recv()
 
     # ── Properties forwarded from the inner Subscription ─────────────────────
@@ -148,6 +188,9 @@ class AsyncSubscription:
     def cursor(self) -> int:
         return self._sub.cursor
 
+    def fileno(self) -> int:
+        return self._sub.fileno()
+
     # ── Async iterator protocol ───────────────────────────────────────────────
 
     def __aiter__(self):
@@ -156,7 +199,7 @@ class AsyncSubscription:
     async def __anext__(self) -> bytes:
         try:
             return await self.recv()
-        except OSError:
+        except (OSError, EOFError):
             raise StopAsyncIteration
 
     # ── Async context-manager protocol ───────────────────────────────────────

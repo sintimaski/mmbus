@@ -72,6 +72,25 @@ impl PySubscription {
         self.inner.fileno()
     }
 
+    /// Handshake-socket fd for disconnect detection (Linux only differs from
+    /// :meth:`fileno`).  Register this alongside ``fileno`` with the event
+    /// loop so publisher death is detected while idle.
+    fn socket_fileno(&self) -> i32 {
+        self.inner.socket_fileno()
+    }
+
+    /// Non-blocking: drain one wakeup signal and try one ring read.
+    /// Returns ``None`` if no wakeup was pending or the ring was empty;
+    /// raises on publisher disconnect.  Use from ``asyncio.add_reader``
+    /// callbacks for true zero-thread async.
+    fn poll_recv<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        match self.inner.poll_recv() {
+            Ok(Some(data)) => Ok(Some(PyBytes::new_bound(py, &data))),
+            Ok(None) => Ok(None),
+            Err(e) => Err(mmbus_err(e)),
+        }
+    }
+
     // ── Iterator protocol ────────────────────────────────────────────────────
 
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
