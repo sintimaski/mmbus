@@ -12,9 +12,6 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # Windows port is in progress (see docs/plan-rfcs.md, stages W0..W5).
-    # Don't fail the whole CI run if Windows is red while we wire it up.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     strategy:
       fail-fast: false
       matrix:
