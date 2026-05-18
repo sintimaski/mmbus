@@ -202,14 +202,20 @@ impl Publisher {
 
         self.accept_clients()?;
 
-        // For Error backpressure: pre-check ring capacity before the
-        // WAL append so a full ring doesn't write a phantom WAL record.
-        // DropOldest never rejects so we always WAL-append + ring-publish.
-        if matches!(self.backpressure, BackpressurePolicy::Error) && self.ring.is_full() {
-            return Err(Error::Full);
-        }
-
         if let Some(wal) = self.wal.as_ref() {
+            // Pre-check ring capacity under Error backpressure so a
+            // full ring doesn't leave a phantom WAL record that no
+            // live subscriber will ever observe.  DropOldest never
+            // rejects, so we always WAL-append + ring-publish.  This
+            // check is intentionally INSIDE the WAL-enabled branch:
+            // with WAL disabled, `ring.try_publish` does the same
+            // is-full check and the publish path is byte-identical
+            // to v0.1.0.
+            if matches!(self.backpressure, BackpressurePolicy::Error)
+                && self.ring.is_full()
+            {
+                return Err(Error::Full);
+            }
             let cursor = self.ring.current_tail();
             let ts = self
                 .wall_base_nanos
