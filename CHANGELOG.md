@@ -9,13 +9,25 @@ All notable changes to mmbus are recorded here.  Format follows
 ### Added
 
 - **`Subscription.recv_batch(n, timeout_secs)`** — Python-side batch
-  recv that drains up to `n` messages under a single GIL release.
-  Blocks for the first message up to `timeout_secs`, then drains
-  non-blockingly until the ring is empty or `n` is reached.
-  Returns a `list[bytes]` (empty on timeout).  Designed to close
-  most of the small-payload throughput gap vs `pyzmq` on
-  burst-heavy workloads where per-call PyO3 + GIL dispatch
-  dominates.
+  recv that drains up to `n` messages amortising the per-call PyO3
+  + GIL dispatch.  Blocks for the FIRST message up to
+  `timeout_secs` (GIL released), then drains non-blockingly with
+  the GIL HELD — `try_recv` is a memory-mapped read, so per-message
+  `allow_threads` would just add round-trip cost.  Returns a
+  `list[bytes]` (empty on timeout).  Local bench on macOS arm64 +
+  CPython 3.9 (32 B payload, pre-filled 5k-message ring):
+
+  | Call shape         | ns/msg | vs `recv()` |
+  |--------------------|-------:|------------:|
+  | `recv()` loop      |     90 |           — |
+  | `recv_batch(16)`   |     43 | 2.1× faster |
+  | `recv_batch(64)`   |     36 | 2.5× faster |
+  | `recv_batch(1024)` |     34 | 2.6× faster |
+
+  Win shows up when the consumer is draining a backlog (the
+  intended workload).  In a publisher-bound live stream the
+  publisher's per-message cost dominates and `recv_batch` adds
+  marginal per-call overhead; use `recv()` there.
 - **Rust buffer-reuse API:** `Subscriber::receive_into(&mut Vec<u8>)`,
   `try_receive_into`, `receive_timeout_into` + matching
   `Subscription::recv_into` / `try_recv_into` /

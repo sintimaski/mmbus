@@ -81,12 +81,17 @@ impl PySubscription {
         }
     }
 
-    /// Drain up to ``n`` messages into a list under a single GIL
-    /// release.  Blocks up to ``timeout_secs`` for the FIRST message;
-    /// once at least one has arrived, returns immediately with
-    /// whatever is currently available (up to ``n``).  Designed for
-    /// burst-heavy workloads where the per-call PyO3 + GIL overhead
-    /// of single-message ``recv()`` dominates.
+    /// Drain up to ``n`` messages into a list, amortising the
+    /// PyO3 + GIL overhead of single-message ``recv()``.
+    ///
+    /// Blocks up to ``timeout_secs`` for the FIRST message (GIL
+    /// released).  Once at least one has arrived, drains the rest
+    /// non-blockingly with the GIL HELD — ``try_recv`` is a
+    /// memory-mapped read with no syscall, so releasing the GIL
+    /// per message would just add round-trip cost.  The
+    /// PySubscription's reusable ``recv_buf`` is reused for every
+    /// message in the batch (one ring→buf memcpy per message; one
+    /// PyBytes alloc + buf→PyBytes memcpy per message).
     ///
     /// Returns an empty list on timeout.
     #[pyo3(signature = (n, timeout_secs=1.0))]
@@ -96,44 +101,30 @@ impl PySubscription {
         n: usize,
         timeout_secs: f64,
     ) -> PyResult<Bound<'py, PyList>> {
+        let list = PyList::empty_bound(py);
         if n == 0 {
-            return Ok(PyList::empty_bound(py));
+            return Ok(list);
         }
         let timeout = Duration::from_secs_f64(timeout_secs);
 
-        // Phase 1 (GIL released): block for the first message up to
-        // `timeout`, then drain non-blockingly until either the ring
-        // is empty or we've collected `n` payloads.  We accumulate
-        // into `Vec<Vec<u8>>` so we can build the PyList in one shot
-        // after re-acquiring the GIL.  Yes, this allocates per
-        // message — but `recv_batch` is for amortising the PyO3
-        // dispatch over many messages, not for chasing the absolute
-        // minimum allocation count (that's `recv_into`'s job).
-        let payloads: Vec<Vec<u8>> = py
-            .allow_threads(|| -> Result<Vec<Vec<u8>>, Error> {
-                let mut out = Vec::with_capacity(n);
-                let mut first_buf = Vec::new();
-                if !self.inner.recv_timeout_into(timeout, &mut first_buf)? {
-                    return Ok(out); // timeout before any message
-                }
-                out.push(first_buf);
-                while out.len() < n {
-                    let mut buf = Vec::new();
-                    if !self.inner.try_recv_into(&mut buf) {
-                        break;
-                    }
-                    out.push(buf);
-                }
-                Ok(out)
-            })
+        // Phase 1 (GIL released): block for the first message.
+        let got_first = py
+            .allow_threads(|| self.inner.recv_timeout_into(timeout, &mut self.recv_buf))
             .map_err(mmbus_err)?;
+        if !got_first {
+            return Ok(list); // timeout before any message
+        }
+        list.append(payload_to_pybytes(py, &self.recv_buf))?;
 
-        // Phase 2 (GIL held): build the PyList.  `PyBytes::new_bound`
-        // is the only unavoidable per-payload cost left — it allocs
-        // a Python bytes object + memcpy's the payload in.
-        let list = PyList::empty_bound(py);
-        for p in &payloads {
-            list.append(payload_to_pybytes(py, p))?;
+        // Phase 2 (GIL held): drain non-blockingly until ring is
+        // empty or n is reached.  No allow_threads per iteration —
+        // try_recv_into is a cheap mmap read and the whole point
+        // of recv_batch is to NOT pay per-message GIL tax.
+        while list.len() < n {
+            if !self.inner.try_recv_into(&mut self.recv_buf) {
+                break;
+            }
+            list.append(payload_to_pybytes(py, &self.recv_buf))?;
         }
         Ok(list)
     }

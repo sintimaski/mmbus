@@ -212,35 +212,80 @@ def smoke_example_fastapi_broadcast() -> None:
 
 def smoke_recv_batch() -> None:
     """Subscription.recv_batch(n, timeout) amortises GIL+PyO3 dispatch
-    across N messages.  Verifies the API shape (returns a list of
-    bytes) and the basic semantics (blocks for first, drains
-    non-blockingly thereafter, empty list on timeout).
+    across N messages.  Verifies:
+      1. empty list on timeout when nothing's published,
+      2. single recv_batch drains a pre-populated burst,
+      3. batch caps at `n` even when more are available.
+
+    `recv_batch` blocks for the FIRST message and then drains
+    non-blockingly via try_recv_into.  In a racing publisher
+    scenario the drain loop can break the moment the ring is
+    momentarily empty between two adjacent publishes — so each
+    burst is published in full *before* the subscriber is allowed
+    to start draining.  This mirrors the realistic burst pattern
+    the batch API is for.
     """
-    received: list[bytes] = []
+    subscriber_ready = threading.Event()
+    burst1_ready = threading.Event()
+    burst2_ready = threading.Event()
+    received_burst: list[bytes] = []
+    received_capped: list[bytes] = []
 
     def subscriber() -> None:
         bus = mmbus.Bus("docker-test-batch")
         sub = bus.subscribe("ch", timeout_secs=10.0)
-        # Empty list on timeout with nothing published yet.
+        # (1) empty list on timeout — no publishes yet.
         empty = sub.recv_batch(n=5, timeout_secs=0.05)
         assert empty == [], f"expected empty list on timeout, got {empty!r}"
-        # Drain a burst of 10 in one call.
-        batch = sub.recv_batch(n=20, timeout_secs=2.0)
-        received.extend(batch)
+
+        subscriber_ready.set()  # publisher may now push burst 1
+        if not burst1_ready.wait(timeout=5.0):
+            raise SystemExit("subscriber: burst1 was never published")
+        # (2) burst 1 is fully in the ring — one recv_batch drains it.
+        received_burst.extend(sub.recv_batch(n=20, timeout_secs=2.0))
+
+        if not burst2_ready.wait(timeout=5.0):
+            raise SystemExit("subscriber: burst2 was never published")
+        # (3) burst 2 is fully in the ring — drain in two n=5 calls.
+        received_capped.extend(sub.recv_batch(n=5, timeout_secs=2.0))
+        received_capped.extend(sub.recv_batch(n=5, timeout_secs=2.0))
 
     t = threading.Thread(target=subscriber, daemon=True)
     t.start()
     pub = mmbus.Bus("docker-test-batch")
     pub.wait_for_subscribers("ch", n=1, timeout_secs=10.0)
-    # Give the subscriber's timeout-test call a moment to land first.
-    import time
-    time.sleep(0.1)
+    if not subscriber_ready.wait(timeout=5.0):
+        raise SystemExit("recv_batch subscriber never finished empty-list check")
+
     for i in range(10):
         pub.publish("ch", f"msg-{i:02}".encode())
+    burst1_ready.set()
+
+    # Wait long enough for the subscriber to drain burst 1 before
+    # we push burst 2 — without this the two bursts can interleave
+    # in the ring and the n=5 cap assertion becomes nondeterministic.
+    while len(received_burst) < 10:
+        if not t.is_alive():
+            break
+        threading.Event().wait(0.01)
+
+    for i in range(10, 20):
+        pub.publish("ch", f"msg-{i:02}".encode())
+    burst2_ready.set()
+
     t.join(timeout=5.0)
-    assert len(received) == 10, f"recv_batch: expected 10, got {len(received)}"
-    assert received[0] == b"msg-00" and received[-1] == b"msg-09"
-    print(f"  recv_batch PASSED ({len(received)} msgs in one call)")
+
+    assert len(received_burst) == 10, (
+        f"recv_batch burst: expected 10, got {len(received_burst)}"
+    )
+    assert received_burst[0] == b"msg-00" and received_burst[-1] == b"msg-09"
+    assert len(received_capped) == 10, (
+        f"recv_batch capped: expected 10 total across two n=5 calls, "
+        f"got {len(received_capped)}"
+    )
+    assert received_capped[0] == b"msg-10" and received_capped[-1] == b"msg-19"
+    print(f"  recv_batch PASSED ({len(received_burst)} burst + "
+          f"{len(received_capped)} capped)")
 
 
 def main() -> None:
