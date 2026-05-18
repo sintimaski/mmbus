@@ -288,11 +288,111 @@ def smoke_recv_batch() -> None:
           f"{len(received_capped)} capped)")
 
 
+def smoke_publish_many() -> None:
+    """Bus.publish_many fires ONE wakeup per subscriber for the batch.
+    Verifies (a) every record arrives in order, (b) returned count
+    matches the input length when ring has room.
+    """
+    received: list[bytes] = []
+    burst_ready = threading.Event()
+
+    def subscriber() -> None:
+        bus = mmbus.Bus("docker-test-pubmany")
+        sub = bus.subscribe("ch", timeout_secs=10.0)
+        burst_ready.wait(timeout=5.0)
+        # One recv_batch drains the entire publish_many burst on a
+        # single wakeup.
+        received.extend(sub.recv_batch(n=64, timeout_secs=2.0))
+
+    t = threading.Thread(target=subscriber, daemon=True)
+    t.start()
+    pub = mmbus.Bus("docker-test-pubmany")
+    pub.wait_for_subscribers("ch", n=1, timeout_secs=10.0)
+    payloads = [f"item-{i:02}".encode() for i in range(20)]
+    n = pub.publish_many("ch", payloads)
+    burst_ready.set()
+    t.join(timeout=5.0)
+    assert n == 20, f"publish_many: expected 20 written, got {n}"
+    assert len(received) == 20, f"recv_batch saw {len(received)}/20"
+    assert received[0] == b"item-00" and received[-1] == b"item-19"
+    print(f"  publish_many PASSED ({n} written, drained in one recv_batch)")
+
+
+def smoke_recv_into_buffer() -> None:
+    """Subscription.recv_into_buffer drains fixed-size payloads
+    directly into a bytearray (no PyBytes alloc per message).  If
+    numpy is installed, also verify the same path works with a 2D
+    ndarray.
+    """
+    PAYLOAD_SIZE = 8
+    N = 16
+    burst_ready = threading.Event()
+    result_bytearray = {"count": 0, "buf": None}
+
+    def subscriber_bytearray() -> None:
+        bus = mmbus.Bus("docker-test-rcvbuf-ba")
+        sub = bus.subscribe("ch", timeout_secs=10.0)
+        burst_ready.wait(timeout=5.0)
+        buf = bytearray(N * PAYLOAD_SIZE)
+        n = sub.recv_into_buffer(buf, payload_size=PAYLOAD_SIZE, timeout_secs=2.0)
+        result_bytearray["count"] = n
+        result_bytearray["buf"] = bytes(buf[: n * PAYLOAD_SIZE])
+
+    t = threading.Thread(target=subscriber_bytearray, daemon=True)
+    t.start()
+    pub = mmbus.Bus("docker-test-rcvbuf-ba")
+    pub.wait_for_subscribers("ch", n=1, timeout_secs=10.0)
+    payloads = [i.to_bytes(PAYLOAD_SIZE, "little") for i in range(N)]
+    pub.publish_many("ch", payloads)
+    burst_ready.set()
+    t.join(timeout=5.0)
+    assert result_bytearray["count"] == N, (
+        f"recv_into_buffer/bytearray: got {result_bytearray['count']}/{N}"
+    )
+    expected = b"".join(payloads)
+    assert result_bytearray["buf"] == expected
+    print(f"  recv_into_buffer/bytearray PASSED ({N}×{PAYLOAD_SIZE}B)")
+
+    # numpy variant
+    try:
+        import numpy as np
+    except ImportError:
+        print("  recv_into_buffer/numpy SKIPPED (numpy not installed)")
+        return
+
+    result_numpy = {"count": 0, "buf": None}
+    burst_ready2 = threading.Event()
+
+    def subscriber_numpy() -> None:
+        bus = mmbus.Bus("docker-test-rcvbuf-np")
+        sub = bus.subscribe("ch", timeout_secs=10.0)
+        burst_ready2.wait(timeout=5.0)
+        buf = np.empty((N, PAYLOAD_SIZE), dtype=np.uint8)
+        n = sub.recv_into_buffer(buf, payload_size=PAYLOAD_SIZE, timeout_secs=2.0)
+        result_numpy["count"] = n
+        result_numpy["buf"] = bytes(buf[:n].tobytes())
+
+    t = threading.Thread(target=subscriber_numpy, daemon=True)
+    t.start()
+    pub_np = mmbus.Bus("docker-test-rcvbuf-np")
+    pub_np.wait_for_subscribers("ch", n=1, timeout_secs=10.0)
+    pub_np.publish_many("ch", payloads)
+    burst_ready2.set()
+    t.join(timeout=5.0)
+    assert result_numpy["count"] == N, (
+        f"recv_into_buffer/numpy: got {result_numpy['count']}/{N}"
+    )
+    assert result_numpy["buf"] == expected
+    print(f"  recv_into_buffer/numpy PASSED ({N}×{PAYLOAD_SIZE}B uint8 ndarray)")
+
+
 def main() -> None:
     smoke_sync()
     smoke_async()
     smoke_backpressure_kwarg()
     smoke_recv_batch()
+    smoke_publish_many()
+    smoke_recv_into_buffer()
     smoke_bridge_module()
     smoke_example_np_pipeline()
     smoke_example_fastapi_broadcast()

@@ -231,7 +231,93 @@ impl Publisher {
             return Err(Error::Full);
         }
 
-        // Broadcast one wakeup per connected subscriber; drop disconnected ones.
+        self.broadcast_wakeup();
+
+        Ok(())
+    }
+
+    /// Publish a batch of records and wake every subscriber ONCE at
+    /// the end (one wakeup syscall per subscriber regardless of N).
+    ///
+    /// Returns the number of records successfully written.  Under
+    /// `BackpressurePolicy::Error` a full ring stops the loop early
+    /// — the caller compares the returned count to `items.len()` to
+    /// know if any tail wasn't published.  Under
+    /// `BackpressurePolicy::DropOldest` every item lands in the ring
+    /// (possibly overwriting older messages), so the return value
+    /// equals the input length.
+    ///
+    /// Why batched wakeups are safe:
+    /// `Subscriber::receive_into` does a `try_receive` BEFORE calling
+    /// `wait_wakeup`, so any subscriber sitting awake-and-draining
+    /// reads all N records without needing per-message wakes.  A
+    /// sleeping subscriber needs exactly ONE wake to start draining
+    /// the burst.  The wake count never has to match the message
+    /// count.
+    pub fn publish_many<I, B>(&mut self, items: I) -> Result<usize>
+    where
+        I: IntoIterator<Item = B>,
+        B: AsRef<[u8]>,
+    {
+        self.accept_clients()?;
+
+        let slot_max = self.ring.slot_payload_size as usize;
+        let wal_enabled = self.wal.is_some();
+        let drop_oldest = matches!(self.backpressure, BackpressurePolicy::DropOldest);
+        let mut count = 0usize;
+
+        for item in items {
+            let data = item.as_ref();
+            if data.len() > slot_max {
+                if count > 0 {
+                    self.broadcast_wakeup();
+                }
+                return Err(Error::TooLarge { size: data.len(), max: slot_max });
+            }
+
+            if let Some(wal) = self.wal.as_ref() {
+                if !drop_oldest && self.ring.is_full() {
+                    break; // partial publish; caller sees `count < items.len()`
+                }
+                let cursor = self.ring.current_tail();
+                let ts = self
+                    .wall_base_nanos
+                    .saturating_add(self.mono_base.elapsed().as_nanos() as u64);
+                if let Err(e) = wal.append(cursor, ts, data) {
+                    if count > 0 {
+                        self.broadcast_wakeup();
+                    }
+                    return Err(e.into());
+                }
+            }
+
+            let ok = if drop_oldest {
+                self.ring.publish_drop_oldest(data)
+            } else {
+                self.ring.try_publish(data)
+            };
+            if !ok {
+                // Only Error policy hits here (DropOldest always succeeds);
+                // the WAL pre-check above usually catches this, but a racing
+                // subscriber cursor change can flip is_full between check
+                // and try_publish.  Either way: partial publish.
+                break;
+            }
+            count += 1;
+            // Hint the loop has nothing to do with WAL when off — keeps
+            // the no-WAL hot path tight.
+            let _ = wal_enabled;
+        }
+
+        if count > 0 {
+            self.broadcast_wakeup();
+        }
+        Ok(count)
+    }
+
+    /// Fire one wakeup per connected subscriber; drop any whose peer
+    /// has closed.  Used by both `publish` and `publish_many`.
+    fn broadcast_wakeup(&mut self) {
         let mut i = 0;
         while i < self.clients.len() {
             if self.clients[i].wake() {
@@ -240,8 +326,6 @@ impl Publisher {
                 self.clients.swap_remove(i);
             }
         }
-
-        Ok(())
     }
 
     /// Block until at least `min_count` subscribers have connected, or timeout.

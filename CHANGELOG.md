@@ -8,26 +8,48 @@ All notable changes to mmbus are recorded here.  Format follows
 
 ### Added
 
-- **`Subscription.recv_batch(n, timeout_secs)`** — Python-side batch
-  recv that drains up to `n` messages amortising the per-call PyO3
-  + GIL dispatch.  Blocks for the FIRST message up to
+- **`Subscription.recv_batch(n, timeout_secs)`** — Python-side
+  batch recv that drains up to `n` messages amortising per-call
+  PyO3 + GIL dispatch.  Blocks for the FIRST message up to
   `timeout_secs` (GIL released), then drains non-blockingly with
-  the GIL HELD — `try_recv` is a memory-mapped read, so per-message
-  `allow_threads` would just add round-trip cost.  Returns a
-  `list[bytes]` (empty on timeout).  Local bench on macOS arm64 +
-  CPython 3.9 (32 B payload, pre-filled 5k-message ring):
+  the GIL HELD.  Returns `list[bytes]` (empty on timeout).
+- **`Bus.publish_many(topic, payloads)`** — batched publish that
+  fires ONE wakeup syscall per subscriber regardless of N.  Pairs
+  with `recv_batch` for end-to-end backlog throughput.  Returns
+  count actually written (less than `len(payloads)` under
+  `Error` backpressure when the ring fills mid-batch).
+- **`Subscription.recv_into_buffer(buf, payload_size, timeout_secs)`**
+  — zero-alloc fixed-size recv.  `buf` is any writable,
+  C-contiguous bytes-like (`bytearray`, `memoryview`, or numpy
+  uint8 array); drains up to `len(buf) // payload_size` messages
+  directly into rows.  Every drained payload must be exactly
+  `payload_size` bytes; mismatch raises `ValueError`.  Designed
+  for ML / sensor pipelines that hand a preallocated numpy
+  buffer to a downstream model.  Backed by a new lock-free
+  `RingBuffer::try_receive_into_slice` so ring slot bytes
+  memcpy straight into the user buffer — no `Vec<u8>` or
+  `PyBytes` intermediate.
 
-  | Call shape         | ns/msg | vs `recv()` |
-  |--------------------|-------:|------------:|
-  | `recv()` loop      |     90 |           — |
-  | `recv_batch(16)`   |     43 | 2.1× faster |
-  | `recv_batch(64)`   |     36 | 2.5× faster |
-  | `recv_batch(1024)` |     34 | 2.6× faster |
+### End-to-end bench (5k 32-byte msgs, macOS arm64 + CPython 3.9)
 
-  Win shows up when the consumer is draining a backlog (the
-  intended workload).  In a publisher-bound live stream the
-  publisher's per-message cost dominates and `recv_batch` adds
-  marginal per-call overhead; use `recv()` there.
+| Pairing                                       | ns/msg | vs baseline |
+|-----------------------------------------------|-------:|------------:|
+| `publish()` × `recv()` (baseline)             |  1,741 |           — |
+| `publish_many(64)` × `recv()`                 |    536 | 3.2× faster |
+| `publish_many(256)` × `recv()`                |    420 | 4.1× faster |
+| `publish_many(1024)` × `recv_batch(1024)`     |    335 | 5.2× faster |
+| `publish_many(1024)` × `recv_into_buffer(1024)`|   325 | 5.4× faster |
+
+The single largest lever is `publish_many` — collapsing N per-
+publish wakeup syscalls (eventfd_write / Unix-socket send /
+ReleaseSemaphore) into one drops publish-side cost from ~1500
+to ~200 ns/msg.  Stacking `recv_into_buffer` shaves another ~3%
+by eliminating the per-message `PyBytes` allocation.
+
+Use `recv()` for low-rate live streams (publisher-bound; batch
+APIs don't help there).  Use the `publish_many` + `recv_batch`
+or `recv_into_buffer` pairing for high-throughput burst
+workloads.
 - **Rust buffer-reuse API:** `Subscriber::receive_into(&mut Vec<u8>)`,
   `try_receive_into`, `receive_timeout_into` + matching
   `Subscription::recv_into` / `try_recv_into` /

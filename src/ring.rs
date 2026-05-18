@@ -472,6 +472,85 @@ impl RingBuffer {
         None
     }
 
+    /// Slice-target variant of [`Self::try_receive`].  Writes the
+    /// payload directly into `out` (no intermediate `Vec`) and
+    /// returns `(new_cursor, bytes_written)` on success.  `out`
+    /// MUST be at least `slot_payload_size` bytes; if the actual
+    /// payload is shorter, only `bytes_written` bytes of `out` are
+    /// touched.  Caller decides how to handle short reads (e.g.
+    /// zero-pad the remainder of the row for numpy use).
+    ///
+    /// Returns `None` if no message is available OR the seqlock
+    /// retried past the bound (same semantics as `try_receive`).
+    ///
+    /// Returns `Some((new_cursor, usize::MAX))` to signal "payload
+    /// too large for `out`" — callers needing strict size matching
+    /// (Python `recv_into_buffer`) detect this and surface a
+    /// `ValueError` instead of corrupting the buffer.
+    pub fn try_receive_into_slice(
+        &self,
+        cursor_idx: usize,
+        local_cursor: u64,
+        out: &mut [u8],
+    ) -> Option<(u64, usize)> {
+        let tail = self.tail_atomic().load(Ordering::Acquire);
+        if local_cursor >= tail {
+            return None;
+        }
+        const MAX_RETRIES: usize = 16;
+        let mut effective = local_cursor;
+        for _ in 0..MAX_RETRIES {
+            let idx = (effective % self.capacity as u64) as usize;
+            let slot = unsafe { self.base().add(self.slots_off + idx * self.stride()) };
+            let seq_atomic = unsafe { &*(slot as *const AtomicU64) };
+            let seq_before = seq_atomic.load(Ordering::Acquire);
+            if seq_before & SEQ_WRITING_BIT != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            if seq_before > effective {
+                effective = seq_before;
+                continue;
+            }
+            if seq_before < effective {
+                return None;
+            }
+            let len =
+                unsafe { (slot.add(8) as *const u32).read_unaligned() as usize };
+            if len > self.slot_payload_size as usize {
+                continue; // torn len read; retry
+            }
+            if len > out.len() {
+                // Caller's buffer is smaller than the actual payload —
+                // signal via sentinel.  We still advance the cursor so
+                // the subscriber doesn't loop forever on the same
+                // oversize record; caller decides whether to skip or
+                // surface an error.
+                let new_cursor = effective + 1;
+                self.cursor_atomic(cursor_idx).store(new_cursor, Ordering::Release);
+                return Some((new_cursor, usize::MAX));
+            }
+            // SAFETY: len <= out.len() (checked above) and len <=
+            // slot_payload_size (checked above); source is within the
+            // slot's payload region; destination is the caller's buffer.
+            unsafe {
+                std::ptr::copy_nonoverlapping(slot.add(12), out.as_mut_ptr(), len);
+            }
+            let seq_after = seq_atomic.load(Ordering::Acquire);
+            if seq_after != seq_before {
+                let seq_after_clean = seq_after & !SEQ_WRITING_BIT;
+                if seq_after_clean > effective {
+                    effective = seq_after_clean;
+                }
+                continue;
+            }
+            let new_cursor = effective + 1;
+            self.cursor_atomic(cursor_idx).store(new_cursor, Ordering::Release);
+            return Some((new_cursor, len));
+        }
+        None
+    }
+
     pub fn current_tail(&self) -> u64 {
         self.tail_atomic().load(Ordering::Acquire)
     }

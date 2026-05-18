@@ -51,6 +51,21 @@ impl Bus {
         self.publishers.get_mut(topic).unwrap().publish(data)
     }
 
+    /// Publish a batch of records to `topic` in one call.  Fires a
+    /// single wakeup per subscriber regardless of batch size — pairs
+    /// with `Subscription::recv_batch` for end-to-end backlog
+    /// throughput.  Returns the number of records actually written
+    /// (less than `items.len()` under `BackpressurePolicy::Error`
+    /// when the ring fills mid-batch).
+    pub fn publish_many<I, B>(&mut self, topic: &str, items: I) -> Result<usize>
+    where
+        I: IntoIterator<Item = B>,
+        B: AsRef<[u8]>,
+    {
+        self.ensure_publisher(topic)?;
+        self.publishers.get_mut(topic).unwrap().publish_many(items)
+    }
+
     /// Subscribe to `topic`, waiting up to 30 seconds for the publisher.
     pub fn subscribe(&self, topic: &str) -> Result<Subscription> {
         self.subscribe_timeout(topic, Duration::from_secs(30))

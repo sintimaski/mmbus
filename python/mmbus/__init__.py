@@ -70,6 +70,21 @@ class Bus:
         """
         self._bus.publish(topic, data)
 
+    def publish_many(self, topic: str, payloads) -> int:
+        """Publish a list/iterable of ``bytes`` to *topic* in a single call.
+
+        Fires one wakeup syscall per connected subscriber regardless
+        of batch size — pairs with :meth:`Subscription.recv_batch` for
+        end-to-end burst throughput.
+
+        Returns the number of records actually written.  Under the
+        default ``Error`` backpressure policy this can be less than
+        ``len(payloads)`` if the ring filled mid-batch; the caller
+        retries the tail.  Under ``drop_oldest`` it always equals
+        ``len(payloads)``.
+        """
+        return self._bus.publish_many(topic, list(payloads))
+
     # ── Synchronous subscribe ─────────────────────────────────────────────────
 
     def subscribe(self, topic: str, timeout_secs: float = 30.0) -> Subscription:

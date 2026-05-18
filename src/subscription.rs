@@ -56,6 +56,14 @@ impl Subscription {
         self.sub.try_receive_into(out)
     }
 
+    /// Slice-target try_recv: write directly into `out`, return the
+    /// number of bytes written.  See
+    /// [`crate::subscriber::Subscriber::try_receive_into_slice`] for
+    /// semantics + the `usize::MAX` oversize sentinel.
+    pub fn try_recv_into_slice(&mut self, out: &mut [u8]) -> Option<usize> {
+        self.sub.try_receive_into_slice(out)
+    }
+
     /// How many messages this subscriber is behind the producer.
     pub fn lag(&self) -> u64 {
         self.sub.lag()

@@ -79,6 +79,32 @@ impl PyBus {
             .map_err(mmbus_err)
     }
 
+    /// Publish a list of ``bytes`` to ``topic`` in a single call.
+    /// Fires ONE wakeup syscall per connected subscriber regardless
+    /// of batch size — pairs with :meth:`Subscription.recv_batch` for
+    /// end-to-end burst throughput.
+    ///
+    /// Returns the number of records actually written.  Under the
+    /// default ``Error`` backpressure policy this is less than
+    /// ``len(payloads)`` if the ring filled mid-batch (caller can
+    /// retry the tail).  Under ``drop_oldest`` it always equals
+    /// ``len(payloads)``.
+    ///
+    /// Raises :exc:`MessageTooLargeError` if any single payload
+    /// exceeds ``slot_size``; raises :exc:`WalError` on a WAL
+    /// failure mid-batch.  Both surface AFTER the wakeup is fired
+    /// for whatever was already written, so committed records stay
+    /// observable.
+    fn publish_many(
+        &mut self,
+        py: Python<'_>,
+        topic: &str,
+        payloads: Vec<Vec<u8>>,
+    ) -> PyResult<usize> {
+        py.allow_threads(|| self.inner.publish_many(topic, payloads))
+            .map_err(mmbus_err)
+    }
+
     /// Subscribe to ``topic`` with a custom connection timeout (seconds).
     /// Releases the GIL while waiting for the publisher.
     ///

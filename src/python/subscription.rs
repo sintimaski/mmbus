@@ -4,6 +4,8 @@ use crate::error::Error;
 use crate::python::exceptions::mmbus_err;
 use crate::stats::TopicStats;
 use crate::subscription::Subscription;
+use pyo3::buffer::PyBuffer;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList};
 use std::time::Duration;
@@ -127,6 +129,111 @@ impl PySubscription {
             list.append(payload_to_pybytes(py, &self.recv_buf))?;
         }
         Ok(list)
+    }
+
+    /// Drain up to ``len(buf) // payload_size`` messages directly
+    /// into ``buf``, returning the number of messages written.
+    ///
+    /// ``buf`` is any writable, C-contiguous bytes-like object —
+    /// ``bytearray``, ``memoryview``, or a numpy ``ndarray`` of
+    /// ``uint8`` (numpy exposes the buffer protocol automatically).
+    /// Every drained payload must be EXACTLY ``payload_size`` bytes;
+    /// a mismatch raises :exc:`ValueError`.  Designed for fixed-size
+    /// message workloads (sensor readings, feature vectors,
+    /// ML pipelines) where the caller already has a pre-allocated
+    /// numpy buffer they'd otherwise memcpy ``recv()`` bytes into.
+    ///
+    /// Blocks up to ``timeout_secs`` for the FIRST message; drains
+    /// the rest non-blockingly with the GIL held (same model as
+    /// :meth:`recv_batch`).  Returns 0 on timeout.
+    ///
+    /// Zero allocations per message: ring-slot bytes are memcpy'd
+    /// straight into ``buf``, no intermediate ``Vec`` or ``bytes``
+    /// object.
+    #[pyo3(signature = (buf, payload_size, timeout_secs=1.0))]
+    fn recv_into_buffer(
+        &mut self,
+        py: Python<'_>,
+        buf: &Bound<'_, PyAny>,
+        payload_size: usize,
+        timeout_secs: f64,
+    ) -> PyResult<usize> {
+        if payload_size == 0 {
+            return Err(PyValueError::new_err("payload_size must be > 0"));
+        }
+        let pybuf = PyBuffer::<u8>::get_bound(buf)?;
+        if pybuf.readonly() {
+            return Err(PyTypeError::new_err(
+                "recv_into_buffer requires a writable buffer (got read-only)",
+            ));
+        }
+        if !pybuf.is_c_contiguous() {
+            return Err(PyTypeError::new_err(
+                "recv_into_buffer requires a C-contiguous buffer",
+            ));
+        }
+        let buf_len = pybuf.len_bytes();
+        let capacity = buf_len / payload_size;
+        if capacity == 0 {
+            return Ok(0);
+        }
+
+        // SAFETY: we hold the GIL via `py`; PyBuffer::get_bound
+        // verified the pointer is valid for `buf_len` bytes; we do
+        // not call into Python (which could trigger GC + buffer
+        // invalidation) between this borrow and the end of the
+        // function.
+        let buf_ptr = pybuf.buf_ptr() as *mut u8;
+        let buf_slice = unsafe { std::slice::from_raw_parts_mut(buf_ptr, buf_len) };
+
+        let timeout = Duration::from_secs_f64(timeout_secs);
+
+        // Phase 1 (GIL released): block for the first message.
+        // recv_timeout_into fills self.recv_buf; we then check the
+        // length contract + memcpy into row 0 of the user buffer.
+        let got_first = py
+            .allow_threads(|| self.inner.recv_timeout_into(timeout, &mut self.recv_buf))
+            .map_err(mmbus_err)?;
+        if !got_first {
+            return Ok(0);
+        }
+        if self.recv_buf.len() != payload_size {
+            return Err(PyValueError::new_err(format!(
+                "payload at index 0 is {} bytes; payload_size is {}",
+                self.recv_buf.len(),
+                payload_size
+            )));
+        }
+        buf_slice[..payload_size].copy_from_slice(&self.recv_buf);
+        let mut count: usize = 1;
+
+        // Phase 2 (GIL held): drain straight into the user buffer
+        // via try_receive_into_slice — no Vec intermediate, no
+        // PyBytes alloc.  Returns Some(usize::MAX) on oversize
+        // payloads; we surface that as ValueError after advancing
+        // the cursor so the subscriber doesn't loop on the bad slot.
+        while count < capacity {
+            let dst_offset = count * payload_size;
+            let dst = &mut buf_slice[dst_offset..dst_offset + payload_size];
+            match self.inner.try_recv_into_slice(dst) {
+                Some(bytes_written) if bytes_written == payload_size => {
+                    count += 1;
+                }
+                Some(bytes_written) if bytes_written == usize::MAX => {
+                    return Err(PyValueError::new_err(format!(
+                        "payload at index {count} exceeds payload_size ({payload_size})"
+                    )));
+                }
+                Some(short) => {
+                    return Err(PyValueError::new_err(format!(
+                        "payload at index {count} is {short} bytes; payload_size is {payload_size}"
+                    )));
+                }
+                None => break, // ring exhausted
+            }
+        }
+
+        Ok(count)
     }
 
     /// How many messages this subscriber is behind the producer.

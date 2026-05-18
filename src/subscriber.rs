@@ -376,6 +376,30 @@ impl Subscriber {
         }
     }
 
+    /// Slice-target try_receive: write the next record directly into
+    /// `out` (no intermediate `Vec`) and return the number of bytes
+    /// written.  `None` means no message available; `Some(0)` is
+    /// impossible (zero-length payloads still consume the slot's
+    /// framing, but the API reports the actual payload bytes — empty
+    /// payloads return `Some(0)`).  Returns `Some(usize::MAX)` if the
+    /// payload is larger than `out`; the cursor advances so the
+    /// caller's loop doesn't stick on the oversize record.
+    ///
+    /// Used by the Python `recv_into_buffer` path so numpy / bytearray
+    /// users skip the `Vec<u8>` + `PyBytes` allocations entirely.
+    /// Does NOT consult the WAL replayer — slice reads are for
+    /// live-ring fast paths only; WAL replay continues to use
+    /// `receive_into` / `try_receive_into`.
+    pub fn try_receive_into_slice(&mut self, out: &mut [u8]) -> Option<usize> {
+        match self.ring.try_receive_into_slice(self.cursor_idx, self.cursor, out) {
+            Some((new_cursor, bytes_written)) => {
+                self.cursor = new_cursor;
+                Some(bytes_written)
+            }
+            None => None,
+        }
+    }
+
     /// Pull the next record from the WAL replayer (if active) and
     /// advance `self.cursor`.  When the replayer is exhausted, drop
     /// it and re-sync the live ring cursor to our true position so
