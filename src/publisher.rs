@@ -80,8 +80,17 @@ pub struct Publisher {
     /// `publish` call.  The thread holds `accept_stop` and exits when
     /// the Publisher drops (Drop wakes it by connecting a throwaway
     /// client to `accept_pipe_name`).
+    /// Windows-only: wrapped in `Mutex` so `Publisher: Sync`
+    /// (mpsc::Receiver is `!Sync`).  We're the sole consumer, so the
+    /// Mutex is uncontended in practice — the cost is one
+    /// `Mutex::lock` per `accept_clients` call, which itself runs
+    /// at the publish cadence (typically µs scale, dominated by the
+    /// ring write).  The publisher still owns the Receiver
+    /// exclusively at runtime; the Sync impl is needed so PyO3's
+    /// `allow_threads` (which takes `&self` and requires `T: Sync`)
+    /// can accept a `&PyBus` containing this Publisher.
     #[cfg(windows)]
-    accept_rx: mpsc::Receiver<io::Result<Client>>,
+    accept_rx: std::sync::Mutex<mpsc::Receiver<io::Result<Client>>>,
     #[cfg(windows)]
     accept_stop: Arc<AtomicBool>,
     #[cfg(windows)]
@@ -164,7 +173,7 @@ impl Publisher {
             #[cfg(unix)]
             listener,
             #[cfg(windows)]
-            accept_rx,
+            accept_rx: std::sync::Mutex::new(accept_rx),
             #[cfg(windows)]
             accept_stop,
             #[cfg(windows)]
@@ -399,7 +408,9 @@ impl Publisher {
 
         #[cfg(windows)]
         loop {
-            match self.accept_rx.try_recv() {
+            // Mutex is uncontended — Publisher is single-owner.
+            let rx = self.accept_rx.lock().unwrap_or_else(|e| e.into_inner());
+            match rx.try_recv() {
                 Ok(Ok(client)) => self.clients.push(client),
                 Ok(Err(e)) => return Err(e.into()),
                 Err(mpsc::TryRecvError::Empty) => break,

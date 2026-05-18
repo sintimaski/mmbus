@@ -25,6 +25,17 @@ jobs:
         with:
           components: clippy
 
+      # Pin Python BEFORE cargo test — the `cargo test --all-features`
+      # invocation enables the `python` feature, which compiles
+      # `pyo3-ffi` against the system Python.  GitHub runners now
+      # default to Python 3.14, which exceeds PyO3 0.22's max
+      # supported version (3.13).  Until the PyO3 0.22 → 0.28
+      # migration (tracked for v0.2.x), pin to 3.12 so the build
+      # script is happy.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       # Swatinem/rust-cache@v2 picks the right paths (target, registry,
       # git index, .cargo/bin), keys on Cargo.lock + toolchain, prunes
       # build artifacts that don't benefit from caching, and is the
@@ -41,9 +52,6 @@ jobs:
       # harness on every OS.  Windows-incompatible smokes
       # (asyncio.add_reader, fastapi without httpx, np_pipeline without
       # numpy) skip themselves with a logged reason.
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
 
       - name: Build + install Python extension
         # `pip install .` triggers the maturin build backend declared in

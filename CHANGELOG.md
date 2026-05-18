@@ -10,6 +10,45 @@ WAL v2 (lock-free mmap-backed) implementation work — RFC + plan
 landed, code gated behind `--features wal_v2` and tracked by
 tasks W2-1..W2-8.  See `docs/rfc-wal-v2-lockfree.md`.
 
+## [0.1.2] - 2026-05-18
+
+Release-engineering follow-up to v0.1.1: every workflow on the
+v0.1.1 push failed.  No code-visible API changes — pure CI /
+build / packaging fixes.
+
+### Fixed
+
+- **CI compile failure on Windows** — `Publisher` was `!Sync`
+  on Windows because its `accept_rx: mpsc::Receiver<...>` field
+  is `!Sync`, blocking `py.allow_threads` in the PyO3 binding
+  (which requires `&PyBus: Send`, transitively requiring
+  `Publisher: Sync`).  Wrapped `accept_rx` in `std::sync::Mutex`
+  on Windows only.  Single-owner contract preserved; lock cost
+  is one uncontended Mutex per `accept_clients` call.
+- **CI compile failure on macOS / Linux against Python 3.14** —
+  GitHub runners now default to Python 3.14, which exceeds
+  PyO3 0.22's max supported version (3.13).  `ci.yml` now pins
+  Python 3.12 via `actions/setup-python` BEFORE the `cargo
+  test --all-features` step (which compiles `pyo3-ffi`).
+- **`wheels.yml` couldn't find a Python interpreter on aarch64
+  Linux** — the cross-build needs a target-arch Python.
+  Rewrote the workflow to use `PyO3/maturin-action@v1`, which
+  handles manylinux container selection + QEMU + interpreter
+  discovery for all five build targets.
+- **`audit` workflow failure on RUSTSEC-2025-0020** — PyO3
+  0.22.6's `PyString::from_object` advisory.  We don't use
+  that function anywhere; whitelisted in `deny.toml` with a
+  documented justification + the resolution path (PyO3 0.22 →
+  0.28 migration tracked for v0.2.x).
+
+### Documented
+
+- `docs/release-checklist.md` gains a "One-time repo setup"
+  section: GitHub Pages must be enabled in Settings → Pages
+  (otherwise `docs.yml` fails); PyPI Trusted Publishing (or
+  `PYPI_API_TOKEN`) must be configured; the `pypi` GitHub
+  environment must exist.  These bit us on the v0.1.1 push.
+
 ## [0.1.1] - 2026-05-18
 
 Python throughput + development-process polish on top of the
@@ -306,6 +345,7 @@ high-throughput burst workloads.
 
 This is the first public release.  Wire format starts at v4.
 
-[Unreleased]: https://github.com/sintimaski/mmbus/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/sintimaski/mmbus/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/sintimaski/mmbus/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/sintimaski/mmbus/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/sintimaski/mmbus/releases/tag/v0.1.0

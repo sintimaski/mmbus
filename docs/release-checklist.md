@@ -4,6 +4,17 @@ Run through every box before tagging a release.  Mirrors the
 "Release Readiness" section of the universal harness in
 `~/.claude/CLAUDE.md`.
 
+## One-time repo setup
+
+- [ ] GitHub Pages enabled: Settings → Pages → Source = "GitHub
+      Actions".  Without this, `docs.yml` fails with `Get Pages
+      site failed`.
+- [ ] PyPI Trusted Publishing configured (or `PYPI_API_TOKEN`
+      secret set).  Without this, `wheels.yml`'s publish job
+      cannot upload.
+- [ ] `pypi` environment exists in repo settings (referenced by
+      `wheels.yml`'s `environment: pypi`).
+
 ## Automated gates (all must pass)
 
 - [ ] `cargo test` (default features) — every crate green

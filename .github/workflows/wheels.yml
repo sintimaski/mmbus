@@ -14,55 +14,39 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64
+            manylinux: auto
           - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
+            target: aarch64
+            manylinux: auto
           - os: macos-latest
-            target: x86_64-apple-darwin
+            target: x86_64
           - os: macos-latest
-            target: aarch64-apple-darwin
+            target: aarch64
           - os: windows-latest
-            target: x86_64-pc-windows-msvc
+            target: x64
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      # PyO3/maturin-action@v1 handles:
+      #  - manylinux container selection for Linux targets (provides
+      #    a target-arch Python interpreter, fixing the "Couldn't find
+      #    any python interpreters" error on aarch64 cross-builds).
+      #  - QEMU setup for aarch64 Linux.
+      #  - Native build for macOS / Windows.
+      # PyO3 0.22's Python version cap (3.13) is satisfied because the
+      # manylinux container ships Python 3.12.
+      - uses: PyO3/maturin-action@v1
         with:
-          targets: ${{ matrix.target }}
-
-      # Per-target cache so each (os, target) wheel has its own warm
-      # registry + target/.  Wheels are tag-driven so reuse is rare,
-      # but maturin builds the full crate from scratch every time
-      # otherwise — a ~3-minute cold start that's worth avoiding when
-      # a tag triggers four parallel runs.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-          prefix-key: "v0-rust-wheels"
-
-      - name: Install cross-compilation tools (Linux aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: sudo apt-get install -y gcc-aarch64-linux-gnu
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install maturin
-        run: pip install maturin
-
-      - name: Build wheel
-        run: |
-          maturin build --release \
-            --target ${{ matrix.target }} \
-            --features python \
-            --out dist
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          args: --release --out dist --features python
+          sccache: "true"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.target }}
+          name: wheels-${{ matrix.os }}-${{ matrix.target }}
           path: dist/*.whl
 
   publish:

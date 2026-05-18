@@ -7,7 +7,15 @@
 
 [advisories]
 yanked = "warn"
-ignore = []
+ignore = [
+    # RUSTSEC-2025-0020 — PyO3 0.22.6 `PyString::from_object` can read
+    # past the end of a `&str` containing interior NULs.  We don't call
+    # `PyString::from_object` anywhere in the codebase (we use
+    # `PyBytes::new_bound_with` + Python-side string args validated by
+    # `&str` extraction).  Tracked for resolution in the PyO3 0.22 →
+    # 0.28 migration (v0.2.x).
+    "RUSTSEC-2025-0020",
+]
 
 [licenses]
 allow = [
