@@ -1,0 +1,20 @@
+# Per-target build config for mmbus.
+#
+# macOS: `cargo test --all-features` enables the `python` cargo feature,
+# which pulls in `pyo3` with `extension-module`.  That tells pyo3 NOT to
+# link `libpython` directly — it expects the symbols to be provided at
+# runtime by the Python interpreter loading the .so.  This is fine when
+# building a .so for Python, but the test binary's link step still needs
+# to resolve those symbols.
+#
+# `-undefined dynamic_lookup` tells the macOS linker to defer
+# undefined symbol resolution until runtime, matching the Linux ld
+# behavior that already worked.  Without this, `cargo test` fails with
+# "ld: symbol(s) not found for architecture arm64 — __Py_TrueStruct".
+#
+# Linux + Windows don't need this — Linux's ld is lenient by default
+# for symbols expected from the host process, and the Windows test job
+# doesn't enable the `python` feature.
+
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
