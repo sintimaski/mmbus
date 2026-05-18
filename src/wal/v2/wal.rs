@@ -6,7 +6,7 @@
 //! [`MmapSegmentWriter`] (lock-free append),
 //! [`MmapSegmentReader`] (seqlock-aware read), and
 //! [`ActiveCoord`] (subscriber rotation discovery), wired with
-//! [`rotation::rotate`].
+//! [`crate::wal::v2::rotation::rotate`].
 //!
 //! Hot-path append:
 //!

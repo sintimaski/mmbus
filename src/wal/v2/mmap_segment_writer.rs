@@ -298,8 +298,9 @@ impl MmapSegmentWriter {
     /// Per-platform durable flush.  After this returns Ok, every
     /// committed record is on stable storage (within the OS's
     /// guarantees — `F_FULLFSYNC` on macOS, `fdatasync` on Linux,
-    /// `FlushFileBuffers` on Windows).  Used by [`FsyncPolicy::Each`]
-    /// inline and by the Batched flusher thread on each tick.
+    /// `FlushFileBuffers` on Windows).  Used by
+    /// [`FsyncPolicy::Each`](crate::wal::FsyncPolicy::Each) inline
+    /// and by the Batched flusher thread on each tick.
     pub fn flush_sync(&self) -> io::Result<()> {
         durability::flush_sync(&self.mmap, &self.file)
     }

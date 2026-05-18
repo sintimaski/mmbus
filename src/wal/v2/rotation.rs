@@ -1,8 +1,8 @@
 //! Segment rotation primitives (W2-3).
 //!
 //! Single-writer rotation: when [`MmapSegmentWriter::append`] returns
-//! [`AppendOutcome::SegmentFull`], the aggregator (W2-4) calls
-//! [`rotate`] which:
+//! [`AppendOutcome::SegmentFull`](crate::wal::v2::mmap_segment_writer::AppendOutcome::SegmentFull),
+//! the aggregator (W2-4) calls [`rotate`] which:
 //!
 //! 1. Writes a `SKIP_TO_END` sentinel at the dying segment's tail so
 //!    any in-flight reader transitions to `ReadOutcome::EndOfSegment`
@@ -78,7 +78,8 @@ pub fn rotate(
     Ok(new_writer)
 }
 
-/// Open `segment_path(dir, first_cursor)` as a [`MmapSegmentReader`].
+/// Open `segment_path(dir, first_cursor)` as a
+/// [`MmapSegmentReader`](crate::wal::v2::mmap_segment_reader::MmapSegmentReader).
 /// Convenience used by the W2-4 aggregator and tests.
 pub fn open_segment_reader(
     dir: &Path,
