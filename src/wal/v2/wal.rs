@@ -32,6 +32,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwapOption;
+
 use crate::wal::config::{FsyncPolicy, WalConfig};
 use crate::wal::record::{Record, MAX_PAYLOAD_LEN, RECORD_FRAMING};
 use crate::wal::stats::WalStats;
@@ -76,6 +78,11 @@ pub enum WalError {
 pub struct Wal {
     dir: PathBuf,
     cfg: WalConfig,
+    /// Wait-free swap slot for the active segment writer.  Hot
+    /// append path does `writer.load()` (no mutex) → cheap clone of
+    /// the Arc.  Rotation does `writer.store(Some(new_arc))` under
+    /// the `inner` mutex so concurrent rotations can't race.
+    writer: Arc<ArcSwapOption<MmapSegmentWriter>>,
     inner: Arc<Mutex<Inner>>,
     /// 16-byte mmap'd coord file that names the active segment.
     /// Subscribers open their own `ActiveCoord` and load-acquire the
@@ -88,6 +95,16 @@ pub struct Wal {
     /// survives the deferred-writer case (Wal::open with no segments
     /// holds this at the right value before the first append).
     pending_cursor: Arc<AtomicU64>,
+    /// Live byte count of the active segment.  Atomic outside the
+    /// inner mutex so the hot append path can update it (and check
+    /// the retention threshold) without re-acquiring the lock.
+    /// Mirrors `writer.current_tail()` post-append.
+    active_bytes: Arc<AtomicU64>,
+    /// Sum of RETIRED segment bytes.  Atomic for the same reason as
+    /// `active_bytes` — the retention pre-check needs `retained +
+    /// active <= cap` without a lock.  Mutated only by rotation +
+    /// retention (both serialized under `inner` mutex).
+    retained_bytes: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     flusher_thread: Option<JoinHandle<()>>,
     poisoned: Arc<AtomicBool>,
@@ -101,22 +118,6 @@ struct Inner {
     /// first_cursor.  Updated only on rotation + retention — never
     /// on the hot append path.
     segment_sizes: BTreeMap<u64, u64>,
-    /// Live tail (= byte count) of the active segment.  Mirrored
-    /// from `writer.current_tail()` after every append so retention
-    /// can be evaluated without an atomic load per check.
-    active_bytes: u64,
-    /// Sum of `segment_sizes` (retained-segment bytes), maintained
-    /// incrementally on rotation/retention so the per-publish
-    /// retention check is a single add + compare.
-    retained_bytes: u64,
-    /// Writer for the active segment.  Wrapped in `Arc` so the
-    /// flusher thread + the publish path can both clone the handle
-    /// inside the lock and then call append / flush_sync OUTSIDE
-    /// the lock — otherwise a 3-5 ms `flush_sync` blocks every
-    /// concurrent publish.  `MmapSegmentWriter::append` takes
-    /// `&self` and is internally lock-free (CAS on tail + memcpy
-    /// + bracketed seqlock), so the Arc-shared access is safe.
-    writer: Option<Arc<MmapSegmentWriter>>,
 }
 
 impl Wal {
@@ -222,19 +223,20 @@ impl Wal {
 
         let durable_cursor = Arc::new(AtomicU64::new(pending_cursor));
         let pending_cursor_atomic = Arc::new(AtomicU64::new(pending_cursor));
+        let active_bytes_atomic = Arc::new(AtomicU64::new(active_bytes));
+        let retained_bytes_atomic = Arc::new(AtomicU64::new(retained_bytes));
+        let writer_slot: Arc<ArcSwapOption<MmapSegmentWriter>> =
+            Arc::new(ArcSwapOption::from(writer));
         let inner = Arc::new(Mutex::new(Inner {
             segments,
             segment_sizes,
-            active_bytes,
-            retained_bytes,
-            writer,
         }));
         let shutdown = Arc::new(AtomicBool::new(false));
         let poisoned = Arc::new(AtomicBool::new(false));
 
         let flusher_thread = if cfg.enabled && matches!(cfg.fsync_policy, FsyncPolicy::Batched) {
             Some(spawn_flusher_thread(
-                inner.clone(),
+                writer_slot.clone(),
                 durable_cursor.clone(),
                 pending_cursor_atomic.clone(),
                 shutdown.clone(),
@@ -248,10 +250,13 @@ impl Wal {
         Ok(Self {
             dir: wal_dir,
             cfg,
+            writer: writer_slot,
             inner,
             active,
             durable_cursor,
             pending_cursor: pending_cursor_atomic,
+            active_bytes: active_bytes_atomic,
+            retained_bytes: retained_bytes_atomic,
             shutdown,
             flusher_thread,
             poisoned,
@@ -276,41 +281,54 @@ impl Wal {
             return Err(WalError::Poisoned);
         }
 
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-
-        if inner.writer.is_none() {
-            let path = segment_path(&self.dir, cursor);
-            let w = MmapSegmentWriter::create(&path, self.cfg.segment_size_max, cursor)?;
-            inner.segments.insert(cursor, path);
-            inner.active_bytes = w.current_tail();
-            inner.writer = Some(Arc::new(w));
-            self.active.store_active(cursor)?;
-        }
-
-        // Cheap pre-check: would this record fit?  We don't have to
-        // be exact — the writer's CAS handles the genuine overflow
-        // case — but cheap rejection saves a doomed append + rollback.
+        // Hot path: load the writer Arc via wait-free swap (no
+        // mutex).  Fall through to the slow path only when the
+        // writer doesn't exist yet (first append) or the next
+        // record won't fit (rotation needed).
         let record_bytes = align_record_len(RECORD_FRAMING + payload.len()) as u64;
-        if inner.active_bytes + record_bytes > self.cfg.segment_size_max as u64 {
-            self.rotate_locked(&mut inner, cursor)?;
-        }
+        let segment_size_max = self.cfg.segment_size_max as u64;
 
-        // Clone the writer Arc + drop the lock BEFORE calling append
-        // so the publisher doesn't serialize with the Batched flusher
-        // (which calls a 3-5 ms flush_sync; holding the lock through
-        // that turns +22% into +417%).  MmapSegmentWriter::append
-        // takes &self and is internally lock-free.
-        let writer = inner.writer.as_ref().unwrap().clone();
-        drop(inner);
+        let writer_guard = self.writer.load();
+        let writer = match writer_guard.as_ref() {
+            Some(w) if self.active_bytes.load(Ordering::Acquire) + record_bytes
+                <= segment_size_max =>
+            {
+                w.clone()
+            }
+            _ => {
+                // Slow path: need to (lazily) create OR rotate.
+                drop(writer_guard);
+                let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if self.writer.load().is_none() {
+                    let path = segment_path(&self.dir, cursor);
+                    let w = MmapSegmentWriter::create(&path, self.cfg.segment_size_max, cursor)?;
+                    inner.segments.insert(cursor, path);
+                    self.active_bytes.store(w.current_tail(), Ordering::Release);
+                    let arc = Arc::new(w);
+                    self.writer.store(Some(arc.clone()));
+                    self.active.store_active(cursor)?;
+                    arc
+                } else if self.active_bytes.load(Ordering::Acquire) + record_bytes
+                    > segment_size_max
+                {
+                    self.rotate_locked(&mut inner, cursor)?;
+                    self.writer.load_full().expect("writer set by rotate_locked")
+                } else {
+                    // Another thread filled the slot under us; re-load.
+                    self.writer.load_full().expect("writer present")
+                }
+            }
+        };
 
         let first_outcome = writer.append(cursor, ts_unix_nanos, payload)?;
         let next_cursor = match first_outcome {
             AppendOutcome::Ok { next_cursor, .. } => next_cursor,
             AppendOutcome::SegmentFull => {
-                // Re-acquire the lock for rotation, then retry.
+                // CAS race: our cached active_bytes drifted. Rotate
+                // + retry on the new writer.
                 let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
                 self.rotate_locked(&mut inner, cursor)?;
-                let writer2 = inner.writer.as_ref().unwrap().clone();
+                let writer2 = self.writer.load_full().expect("writer set by rotate_locked");
                 drop(inner);
                 match writer2.append(cursor, ts_unix_nanos, payload)? {
                     AppendOutcome::Ok { next_cursor, .. } => next_cursor,
@@ -322,19 +340,18 @@ impl Wal {
                 }
             }
         };
-        self.pending_cursor.store(next_cursor, Ordering::Release);
 
-        // Update active_bytes (cheap atomic load on the writer's
-        // tail) + run retention check.  These don't need the
-        // writer-mutex but they do need active_bytes consistency.
-        {
+        // Lock-free post-append bookkeeping.
+        self.pending_cursor.store(next_cursor, Ordering::Release);
+        let new_active_bytes = writer.current_tail();
+        self.active_bytes.store(new_active_bytes, Ordering::Release);
+
+        // Retention: cheap atomic-based pre-check; only take the
+        // slow lock if we actually need to prune.
+        let retained = self.retained_bytes.load(Ordering::Acquire);
+        if retained + new_active_bytes > self.cfg.retention_bytes {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(w) = inner.writer.as_ref() {
-                inner.active_bytes = w.current_tail();
-            }
-            if inner.retained_bytes + inner.active_bytes > self.cfg.retention_bytes {
-                self.enforce_retention_locked(&mut inner)?;
-            }
+            self.enforce_retention_locked(&mut inner)?;
         }
 
         if matches!(self.cfg.fsync_policy, FsyncPolicy::Each) {
@@ -352,14 +369,7 @@ impl Wal {
     /// Force-flush.  Calls the per-platform `flush_sync` and
     /// advances `durable_cursor` to `pending_cursor`.
     pub fn fsync(&self) -> Result<(), WalError> {
-        // Clone the writer Arc inside the lock + drop the lock
-        // before the 3-5 ms flush_sync so concurrent appends
-        // aren't blocked.
-        let writer_arc = {
-            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            inner.writer.as_ref().cloned()
-        };
-        if let Some(w) = writer_arc {
+        if let Some(w) = self.writer.load_full() {
             w.flush_sync()?;
         }
         self.durable_cursor
@@ -372,7 +382,7 @@ impl Wal {
     /// appends to the dead one's tail.
     pub fn bump_generation(&self) -> Result<(), WalError> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.writer.is_some() {
+        if self.writer.load().is_some() {
             let next_cursor = self.pending_cursor.load(Ordering::Acquire);
             self.rotate_locked(&mut inner, next_cursor)?;
         }
@@ -426,8 +436,9 @@ impl Wal {
             pending_cursor: self.pending_cursor.load(Ordering::Acquire),
             durable_cursor: self.durable_cursor.load(Ordering::Acquire),
             oldest_cursor,
-            active_segment_bytes: inner.active_bytes,
-            total_wal_bytes: inner.retained_bytes + inner.active_bytes,
+            active_segment_bytes: self.active_bytes.load(Ordering::Acquire),
+            total_wal_bytes: self.retained_bytes.load(Ordering::Acquire)
+                + self.active_bytes.load(Ordering::Acquire),
             segments,
         }
     }
@@ -435,7 +446,7 @@ impl Wal {
     // ── Internals ──────────────────────────────────────────────────────────
 
     fn rotate_locked(&self, inner: &mut Inner, new_first_cursor: u64) -> Result<(), WalError> {
-        if let Some(old_arc) = inner.writer.take() {
+        if let Some(old_arc) = self.writer.swap(None) {
             let first = old_arc.first_cursor();
             let final_bytes = old_arc.current_tail();
             // Use `rotate` helper to mark + create + publish.
@@ -448,11 +459,11 @@ impl Wal {
             )?;
             // Old segment retires; record its (final) size.
             inner.segment_sizes.insert(first, final_bytes);
-            inner.retained_bytes += final_bytes;
+            self.retained_bytes.fetch_add(final_bytes, Ordering::Release);
             // New segment becomes active.
             inner.segments.insert(new_first_cursor, segment_path(&self.dir, new_first_cursor));
-            inner.active_bytes = new_w.current_tail();
-            inner.writer = Some(Arc::new(new_w));
+            self.active_bytes.store(new_w.current_tail(), Ordering::Release);
+            self.writer.store(Some(Arc::new(new_w)));
             drop(old_arc);
         } else {
             // No writer yet — first append after a deferred-create.
@@ -460,8 +471,8 @@ impl Wal {
             let path = segment_path(&self.dir, new_first_cursor);
             let w = MmapSegmentWriter::create(&path, self.cfg.segment_size_max, new_first_cursor)?;
             inner.segments.insert(new_first_cursor, path);
-            inner.active_bytes = w.current_tail();
-            inner.writer = Some(Arc::new(w));
+            self.active_bytes.store(w.current_tail(), Ordering::Release);
+            self.writer.store(Some(Arc::new(w)));
             self.active.store_active(new_first_cursor)?;
         }
         Ok(())
@@ -469,11 +480,17 @@ impl Wal {
 
     fn enforce_retention_locked(&self, inner: &mut Inner) -> Result<(), WalError> {
         loop {
-            if inner.retained_bytes + inner.active_bytes <= self.cfg.retention_bytes {
+            let retained = self.retained_bytes.load(Ordering::Acquire);
+            let active = self.active_bytes.load(Ordering::Acquire);
+            if retained + active <= self.cfg.retention_bytes {
                 return Ok(());
             }
-            let active_first =
-                inner.writer.as_ref().map(|w| w.first_cursor()).unwrap_or(u64::MAX);
+            let active_first = self
+                .writer
+                .load()
+                .as_ref()
+                .map(|w| w.first_cursor())
+                .unwrap_or(u64::MAX);
             let oldest_first =
                 inner.segments.keys().copied().find(|&k| k != active_first);
             match oldest_first {
@@ -482,7 +499,8 @@ impl Wal {
                         let _ = fs::remove_file(&path);
                     }
                     if let Some(size) = inner.segment_sizes.remove(&k) {
-                        inner.retained_bytes = inner.retained_bytes.saturating_sub(size);
+                        self.retained_bytes
+                            .fetch_sub(size, Ordering::Release);
                     }
                 }
                 None => return Ok(()),
@@ -556,7 +574,7 @@ impl Iterator for WalReplayer {
 // ── Flusher thread ────────────────────────────────────────────────────────────
 
 fn spawn_flusher_thread(
-    inner: Arc<Mutex<Inner>>,
+    writer: Arc<ArcSwapOption<MmapSegmentWriter>>,
     durable_cursor: Arc<AtomicU64>,
     pending_cursor: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
@@ -577,20 +595,10 @@ fn spawn_flusher_thread(
             // that lands after our msync isn't falsely marked durable.
             let snapshot = pending_cursor.load(Ordering::Acquire);
 
-            // Clone the writer Arc inside the lock + drop the lock
-            // BEFORE the 3-5 ms flush_sync.  Holding the lock through
-            // the syscall was the dominant +417% overhead source —
-            // every publisher's lock() blocked on the flusher's
-            // syscall window (~60-100% of the 5 ms tick).  With the
-            // Arc clone, append and flush run truly concurrently.
-            let writer_arc = {
-                let guard = match inner.lock() {
-                    Ok(g) => g,
-                    Err(p) => p.into_inner(),
-                };
-                guard.writer.as_ref().cloned()
-            };
-            let flush_result: io::Result<()> = if let Some(w) = writer_arc {
+            // Wait-free writer load — never blocks the publisher.
+            // The 3-5 ms flush_sync() runs entirely without holding
+            // any lock; concurrent appends see no contention.
+            let flush_result: io::Result<()> = if let Some(w) = writer.load_full() {
                 w.flush_sync()
             } else {
                 Ok(())

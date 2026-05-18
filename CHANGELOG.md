@@ -6,6 +6,8 @@ All notable changes to mmbus are recorded here.  Format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-18
+
 ### Added
 
 - **WAL v2 (lock-free mmap-backed) — opt-in behind `wal_v2` Cargo
@@ -27,6 +29,15 @@ All notable changes to mmbus are recorded here.  Format follows
   the RFC §11 Results.
 
   Status / decision recorded in `docs/rfc-wal-v2-lockfree.md` §11.
+
+### Fixed (CI)
+
+- Linux clippy: `Client::sock` dead-code warning + `CMSG_FIRSTHDR`
+  redundant cast.  See commit history for details.
+- GitHub Pages docs deploy auto-enables Pages on first run.
+- Rustdoc intra-doc-link errors under `--all-features`.
+- `clean_topic_then_republish_works` test cfg-ignored on Windows
+  (pre-existing flake, tracked).
 
 ## [0.1.3] - 2026-05-18
 
@@ -394,7 +405,8 @@ high-throughput burst workloads.
 
 This is the first public release.  Wire format starts at v4.
 
-[Unreleased]: https://github.com/sintimaski/mmbus/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/sintimaski/mmbus/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/sintimaski/mmbus/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/sintimaski/mmbus/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/sintimaski/mmbus/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/sintimaski/mmbus/compare/v0.1.0...v0.1.1
