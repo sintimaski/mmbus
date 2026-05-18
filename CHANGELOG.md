@@ -6,71 +6,11 @@ All notable changes to mmbus are recorded here.  Format follows
 
 ## [Unreleased]
 
-### Added
+WAL v2 (lock-free mmap-backed) implementation work — RFC + plan
+landed, code gated behind `--features wal_v2` and tracked by
+tasks W2-1..W2-8.  See `docs/rfc-wal-v2-lockfree.md`.
 
-- **`Subscription.recv_batch(n, timeout_secs)`** — Python-side
-  batch recv that drains up to `n` messages amortising per-call
-  PyO3 + GIL dispatch.  Blocks for the FIRST message up to
-  `timeout_secs` (GIL released), then drains non-blockingly with
-  the GIL HELD.  Returns `list[bytes]` (empty on timeout).
-- **`Bus.publish_many(topic, payloads)`** — batched publish that
-  fires ONE wakeup syscall per subscriber regardless of N.  Pairs
-  with `recv_batch` for end-to-end backlog throughput.  Returns
-  count actually written (less than `len(payloads)` under
-  `Error` backpressure when the ring fills mid-batch).
-- **`Subscription.recv_into_buffer(buf, payload_size, timeout_secs)`**
-  — zero-alloc fixed-size recv.  `buf` is any writable,
-  C-contiguous bytes-like (`bytearray`, `memoryview`, or numpy
-  uint8 array); drains up to `len(buf) // payload_size` messages
-  directly into rows.  Every drained payload must be exactly
-  `payload_size` bytes; mismatch raises `ValueError`.  Designed
-  for ML / sensor pipelines that hand a preallocated numpy
-  buffer to a downstream model.  Backed by a new lock-free
-  `RingBuffer::try_receive_into_slice` so ring slot bytes
-  memcpy straight into the user buffer — no `Vec<u8>` or
-  `PyBytes` intermediate.
-
-### End-to-end bench (5k 32-byte msgs, macOS arm64 + CPython 3.9)
-
-| Pairing                                       | ns/msg | vs baseline |
-|-----------------------------------------------|-------:|------------:|
-| `publish()` × `recv()` (baseline)             |  1,741 |           — |
-| `publish_many(64)` × `recv()`                 |    536 | 3.2× faster |
-| `publish_many(256)` × `recv()`                |    420 | 4.1× faster |
-| `publish_many(1024)` × `recv_batch(1024)`     |    335 | 5.2× faster |
-| `publish_many(1024)` × `recv_into_buffer(1024)`|   325 | 5.4× faster |
-
-The single largest lever is `publish_many` — collapsing N per-
-publish wakeup syscalls (eventfd_write / Unix-socket send /
-ReleaseSemaphore) into one drops publish-side cost from ~1500
-to ~200 ns/msg.  Stacking `recv_into_buffer` shaves another ~3%
-by eliminating the per-message `PyBytes` allocation.
-
-Use `recv()` for low-rate live streams (publisher-bound; batch
-APIs don't help there).  Use the `publish_many` + `recv_batch`
-or `recv_into_buffer` pairing for high-throughput burst
-workloads.
-- **Rust buffer-reuse API:** `Subscriber::receive_into(&mut Vec<u8>)`,
-  `try_receive_into`, `receive_timeout_into` + matching
-  `Subscription::recv_into` / `try_recv_into` /
-  `recv_timeout_into`.  Saves one allocation per receive in tight
-  loops; backs the Python recv hot path.
-- `PySubscription` holds a reusable `recv_buf: Vec<u8>` across
-  calls — `recv()`, `recv_timeout()`, `try_recv()`, and `__next__`
-  all reuse it.  Combined with `PyBytes::new_bound_with`,
-  eliminates the per-call `Vec` intermediate that used to sit
-  between the ring read and the Python bytes object.
-- `mmbus.WalError` Python exception class — surfaces non-cursor
-  WAL failures (`WalError::Poisoned`, `WalError::PayloadTooLarge`,
-  underlying I/O).
-
-### Notes
-
-WAL v2 (lock-free mmap-backed) RFC + plan landed; implementation
-gated behind `--features wal_v2` and tracked by tasks W2-1..W2-8.
-See `docs/rfc-wal-v2-lockfree.md`.
-
-## [0.1.0] - first public release
+## [0.1.0] - 2026-05-18 — first public release
 
 ### Added
 
@@ -152,6 +92,57 @@ See `docs/rfc-wal-v2-lockfree.md`.
 `WalConfig::disabled()`.  Closing the gap needs the lock-free
 mmap-backed redesign tracked in `docs/rfc-wal-v2-lockfree.md`
 (v0.2.0).
+
+#### Python batch APIs
+
+- **`Subscription.recv_batch(n, timeout_secs) -> list[bytes]`** —
+  drains up to `n` messages amortising per-call PyO3 + GIL
+  dispatch.  Blocks for the FIRST message up to `timeout_secs`
+  (GIL released), then drains non-blockingly with the GIL HELD.
+  Returns empty list on timeout.
+- **`Bus.publish_many(topic, payloads) -> int`** — batched
+  publish that fires ONE wakeup syscall per subscriber regardless
+  of N.  Pairs with `recv_batch` for end-to-end backlog
+  throughput.  Returns count actually written (less than
+  `len(payloads)` under `Error` backpressure when the ring fills
+  mid-batch; equals `len(payloads)` under `drop_oldest`).
+- **`Subscription.recv_into_buffer(buf, payload_size, timeout_secs)
+  -> int`** — zero-alloc fixed-size recv.  `buf` is any writable,
+  C-contiguous bytes-like (`bytearray`, `memoryview`, or numpy
+  uint8 array); drains up to `len(buf) // payload_size` messages
+  directly into rows.  Every drained payload must be exactly
+  `payload_size` bytes; mismatch raises `ValueError`.  Backed by
+  a new lock-free `RingBuffer::try_receive_into_slice` so ring
+  slot bytes memcpy straight into the user buffer — no `Vec<u8>`
+  or `PyBytes` intermediate.
+- **Rust buffer-reuse API** (foundation for the above): new
+  `Subscriber::receive_into`, `try_receive_into`,
+  `receive_timeout_into` + matching `Subscription::*_into` +
+  `Subscriber::try_receive_into_slice`.  `PySubscription` holds
+  a reusable `recv_buf` and `PyBytes::new_bound_with` writes
+  directly into the PyBytes allocation — no Vec intermediate on
+  the single-recv path either.
+- **`mmbus.WalError`** Python exception class — surfaces
+  non-cursor WAL failures (`Poisoned`, `PayloadTooLarge`,
+  underlying I/O).
+
+#### Python perf — end-to-end pub/sub (5k 32 B msgs, macOS arm64, CPython 3.9)
+
+| Pairing                                          | ns/msg | vs baseline |
+|--------------------------------------------------|-------:|------------:|
+| `publish()` × `recv()` (baseline)                |  1,741 |           — |
+| `publish_many(64)` × `recv()`                    |    536 | 3.2× faster |
+| `publish_many(256)` × `recv()`                   |    420 | 4.1× faster |
+| `publish_many(1024)` × `recv_batch(1024)`        |    335 | 5.2× faster |
+| `publish_many(1024)` × `recv_into_buffer(1024)`  |    325 | 5.4× faster |
+
+Largest lever is `publish_many` — collapsing N per-publish
+wakeup syscalls (eventfd_write / Unix-socket send /
+ReleaseSemaphore) into one drops publish-side from ~1500 to
+~200 ns/msg.  Use `recv()` for low-rate live streams (batch
+APIs don't help when the publisher is the bottleneck); use
+`publish_many` + `recv_batch` / `recv_into_buffer` for
+high-throughput burst workloads.
 
 #### Async / framework integration
 
