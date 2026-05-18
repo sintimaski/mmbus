@@ -251,9 +251,12 @@ impl MmapSegmentWriter {
         let mut current = tail.load(Ordering::Acquire);
         let offset = loop {
             if current + 4 > segment_size {
-                // No room for the 4-byte marker — but that's fine:
-                // a reader whose pos lands at segment_size returns
-                // EndOfSegment without needing a marker.
+                // No room for the 4-byte marker — return false; the
+                // caller (rotation) updates active.dat next, and
+                // readers must detect rotation via that path (live-
+                // tailing helpers should treat "AwaitMore at pos=tail
+                // AND active.dat advanced past this segment's
+                // first_cursor" as EndOfSegment).
                 return Ok(false);
             }
             match tail.compare_exchange_weak(

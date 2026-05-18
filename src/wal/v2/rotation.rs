@@ -367,12 +367,21 @@ mod tests {
                         if Instant::now() >= deadline {
                             panic!("reader timeout at {} records", got.len());
                         }
-                        // Maybe the writer rotated past us — check.
+                        // If active.dat has advanced past our segment AND
+                        // we're parked at the live tail, the writer has
+                        // rotated and won't extend this segment.  This
+                        // can happen when the rotation's SKIP_TO_END
+                        // marker didn't fit (last few bytes of segment
+                        // unused), so we never see EndOfSegment via the
+                        // record_len path.  Switch segments.
                         let latest = active_reader.load_first_cursor();
                         if latest != current_first {
-                            // Defer the swap until we've drained the current
-                            // segment to EndOfSegment so we don't miss records.
-                            std::hint::spin_loop();
+                            current_first = latest;
+                            reader = MmapSegmentReader::open(&segment_path(
+                                &dir_for_reader,
+                                current_first,
+                            ))
+                            .unwrap();
                         } else {
                             std::hint::spin_loop();
                         }
