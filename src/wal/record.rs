@@ -53,25 +53,38 @@ impl Record {
     /// over the cursor + ts + payload_len + payload bytes (everything
     /// after `record_len`, excluding the crc itself).
     pub fn encode_into(&self, out: &mut Vec<u8>) {
-        debug_assert!(
-            self.payload.len() <= MAX_PAYLOAD_LEN,
-            "payload {} > MAX_PAYLOAD_LEN {}",
-            self.payload.len(),
-            MAX_PAYLOAD_LEN
-        );
-        let start = out.len();
-        let record_len = (RECORD_FRAMING + self.payload.len()) as u32;
-        out.extend_from_slice(&record_len.to_le_bytes());
-        let crc_input_start = out.len();
-        out.extend_from_slice(&self.cursor.to_le_bytes());
-        out.extend_from_slice(&self.ts_unix_nanos.to_le_bytes());
-        out.extend_from_slice(&(self.payload.len() as u32).to_le_bytes());
-        out.extend_from_slice(&self.payload);
-        let crc_input_end = out.len();
-        let crc = crc32c::crc32c(&out[crc_input_start..crc_input_end]);
-        out.extend_from_slice(&crc.to_le_bytes());
-        debug_assert_eq!(out.len() - start, record_len as usize);
+        encode_record_into(out, self.cursor, self.ts_unix_nanos, &self.payload);
     }
+}
+
+/// Allocation-free encoder used on the publisher hot path.  Equivalent
+/// to building a [`Record`] and calling [`Record::encode_into`], but
+/// avoids the per-publish `Vec` allocation for `payload`.
+pub fn encode_record_into(
+    out: &mut Vec<u8>,
+    cursor: u64,
+    ts_unix_nanos: u64,
+    payload: &[u8],
+) {
+    debug_assert!(
+        payload.len() <= MAX_PAYLOAD_LEN,
+        "payload {} > MAX_PAYLOAD_LEN {}",
+        payload.len(),
+        MAX_PAYLOAD_LEN
+    );
+    let record_len = (RECORD_FRAMING + payload.len()) as u32;
+    out.reserve(record_len as usize);
+    let start = out.len();
+    out.extend_from_slice(&record_len.to_le_bytes());
+    let crc_input_start = out.len();
+    out.extend_from_slice(&cursor.to_le_bytes());
+    out.extend_from_slice(&ts_unix_nanos.to_le_bytes());
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(payload);
+    let crc_input_end = out.len();
+    let crc = crc32c::crc32c(&out[crc_input_start..crc_input_end]);
+    out.extend_from_slice(&crc.to_le_bytes());
+    debug_assert_eq!(out.len() - start, record_len as usize);
 }
 
 /// Build the 32-byte segment header for a fresh segment whose first

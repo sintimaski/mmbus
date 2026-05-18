@@ -83,10 +83,21 @@ struct Inner {
     /// `first_cursor → segment_path`, sorted ascending.  Includes
     /// the active segment as the last entry.
     segments: BTreeMap<u64, PathBuf>,
-    /// Bytes-per-segment cache, parallel to `segments`.  Updated on
-    /// rotation + retention to avoid `stat`-ing every time we compute
-    /// total_wal_bytes for stats / retention checks.
+    /// Bytes for every RETIRED (non-active) segment, keyed by
+    /// first_cursor.  Updated only on rotation + retention — never
+    /// on the hot append path, where active-segment growth is
+    /// tracked in `active_bytes` instead to avoid a per-publish
+    /// BTreeMap walk.
     segment_sizes: BTreeMap<u64, u64>,
+    /// Live byte count of the active segment.  Mirrors
+    /// `writer.bytes_written()` after every append so retention can
+    /// be evaluated without re-reading the writer or summing the
+    /// BTreeMap each call.
+    active_bytes: u64,
+    /// Sum of `segment_sizes` (retained-segment bytes), maintained
+    /// incrementally on rotation/retention so the per-publish
+    /// retention check is a single add + compare, not an O(n) walk.
+    retained_bytes: u64,
     /// Writer for the active segment.  Always present once the WAL
     /// has been opened; rotation transiently sets it to None while
     /// the old writer is closed and the new one created.
@@ -127,8 +138,10 @@ impl Wal {
             segment_sizes.insert(first_cursor, len);
         }
 
-        let (writer, pending_cursor) = if let Some((&last_first_cursor, last_path)) =
-            segments.iter().next_back()
+        let (writer, pending_cursor, active_bytes) = if let Some((
+            &last_first_cursor,
+            last_path,
+        )) = segments.iter().next_back()
         {
             // Existing active segment — compute the next cursor from
             // its contents, then rotate to a fresh segment named after
@@ -148,24 +161,42 @@ impl Wal {
             if next_cursor == last_first_cursor {
                 // Empty segment — leave it; defer writer creation
                 // until the first append, like the fresh-WAL path.
-                (None, last_first_cursor)
+                (None, last_first_cursor, 0)
             } else {
                 let new_path = wal_dir.join(format!("{next_cursor:020}.seg"));
                 let writer = SegmentWriter::create(&new_path, next_cursor)?;
                 segments.insert(next_cursor, new_path.clone());
-                segment_sizes.insert(next_cursor, writer.bytes_written());
-                (Some(writer), next_cursor)
+                let bytes = writer.bytes_written();
+                segment_sizes.insert(next_cursor, bytes);
+                (Some(writer), next_cursor, bytes)
             }
         } else {
             // Fresh WAL — defer the writer creation to the first
             // append so an opened-but-never-used Wal doesn't leave
             // an empty segment file behind.
-            (None, 0)
+            (None, 0, 0)
         };
 
         let durable_cursor = Arc::new(AtomicU64::new(pending_cursor));
         let pending_cursor_atomic = Arc::new(AtomicU64::new(pending_cursor));
-        let inner = Arc::new(Mutex::new(Inner { segments, segment_sizes, writer }));
+        // `segment_sizes` holds RETIRED segments only; the active segment's
+        // bytes live in `active_bytes` and are pulled out of the map on
+        // entry so the retention check is a single add + compare.
+        let retained_bytes: u64 = if let Some(active_first) =
+            segments.iter().next_back().map(|(k, _)| *k).filter(|_| active_bytes > 0)
+        {
+            segment_sizes.remove(&active_first);
+            segment_sizes.values().sum()
+        } else {
+            segment_sizes.values().sum()
+        };
+        let inner = Arc::new(Mutex::new(Inner {
+            segments,
+            segment_sizes,
+            active_bytes,
+            retained_bytes,
+            writer,
+        }));
         let shutdown = Arc::new(AtomicBool::new(false));
         let poisoned = Arc::new(AtomicBool::new(false));
 
@@ -222,19 +253,17 @@ impl Wal {
             let path = self.dir.join(format!("{cursor:020}.seg"));
             let w = SegmentWriter::create(&path, cursor)?;
             inner.segments.insert(cursor, path.clone());
-            inner.segment_sizes.insert(cursor, w.bytes_written());
+            inner.active_bytes = w.bytes_written();
             inner.writer = Some(w);
         }
 
         // Rotate if the active segment would exceed segment_size_max.
         // We rotate BEFORE appending so the new record always lands in
-        // the new segment.
-        let needs_rotate = {
-            let w = inner.writer.as_ref().unwrap();
-            (w.bytes_written() + crate::wal::record::RECORD_FRAMING as u64 + payload.len() as u64)
-                > self.cfg.segment_size_max as u64
-        };
-        if needs_rotate {
+        // the new segment.  Uses the cached `active_bytes` so we don't
+        // touch the writer field at all for the common no-rotate case.
+        let record_bytes =
+            crate::wal::record::RECORD_FRAMING as u64 + payload.len() as u64;
+        if inner.active_bytes + record_bytes > self.cfg.segment_size_max as u64 {
             self.rotate_locked(&mut inner, cursor)?;
         }
 
@@ -242,11 +271,10 @@ impl Wal {
         {
             let w = inner.writer.as_mut().unwrap();
             w.append(cursor, ts_unix_nanos, payload)?;
-            let first = w.first_cursor();
             let bytes = w.bytes_written();
-            let new_pending = w.pending_cursor();
-            inner.segment_sizes.insert(first, bytes);
-            self.pending_cursor.store(new_pending, Ordering::Release);
+            let pending = w.pending_cursor();
+            inner.active_bytes = bytes;
+            self.pending_cursor.store(pending, Ordering::Release);
         }
 
         // Under Each, fsync inline and advance durable_cursor.
@@ -256,9 +284,11 @@ impl Wal {
             self.durable_cursor.store(d, Ordering::Release);
         }
 
-        // Retention: delete oldest segments while total > cap.  Never
-        // delete the active segment.
-        self.enforce_retention_locked(&mut inner)?;
+        // Retention: cheap pre-check against tracked retained_bytes +
+        // active_bytes; only walks segments when actually over cap.
+        if inner.retained_bytes + inner.active_bytes > self.cfg.retention_bytes {
+            self.enforce_retention_locked(&mut inner)?;
+        }
 
         Ok(())
     }
@@ -345,16 +375,13 @@ impl Wal {
     pub fn stats(&self) -> WalStats {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let oldest_cursor = inner.segments.keys().next().copied().unwrap_or(0);
-        let active_segment_bytes =
-            inner.writer.as_ref().map(|w| w.bytes_written()).unwrap_or(0);
-        let total_wal_bytes: u64 = inner.segment_sizes.values().sum();
         let segments = inner.segments.len();
         WalStats {
             pending_cursor: self.pending_cursor.load(Ordering::Acquire),
             durable_cursor: self.durable_cursor.load(Ordering::Acquire),
             oldest_cursor,
-            active_segment_bytes,
-            total_wal_bytes,
+            active_segment_bytes: inner.active_bytes,
+            total_wal_bytes: inner.retained_bytes + inner.active_bytes,
             segments,
         }
     }
@@ -371,19 +398,19 @@ impl Wal {
             let final_bytes = w.bytes_written();
             w.close()?;
             inner.segment_sizes.insert(first, final_bytes);
+            inner.retained_bytes += final_bytes;
         }
         let path = self.dir.join(format!("{new_first_cursor:020}.seg"));
         let writer = SegmentWriter::create(&path, new_first_cursor)?;
         inner.segments.insert(new_first_cursor, path.clone());
-        inner.segment_sizes.insert(new_first_cursor, writer.bytes_written());
+        inner.active_bytes = writer.bytes_written();
         inner.writer = Some(writer);
         Ok(())
     }
 
     fn enforce_retention_locked(&self, inner: &mut Inner) -> Result<(), WalError> {
         loop {
-            let total: u64 = inner.segment_sizes.values().sum();
-            if total <= self.cfg.retention_bytes {
+            if inner.retained_bytes + inner.active_bytes <= self.cfg.retention_bytes {
                 return Ok(());
             }
             // Find the oldest segment that is NOT the active one.
@@ -399,7 +426,9 @@ impl Wal {
                     if let Some(path) = inner.segments.remove(&k) {
                         let _ = fs::remove_file(&path);
                     }
-                    inner.segment_sizes.remove(&k);
+                    if let Some(size) = inner.segment_sizes.remove(&k) {
+                        inner.retained_bytes = inner.retained_bytes.saturating_sub(size);
+                    }
                 }
                 None => return Ok(()), // only the active segment left
             }

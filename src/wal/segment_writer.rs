@@ -11,7 +11,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crate::wal::record::{
-    encode_segment_header, Record, MAX_PAYLOAD_LEN, SEGMENT_HEADER_LEN,
+    encode_record_into, encode_segment_header, MAX_PAYLOAD_LEN, SEGMENT_HEADER_LEN,
 };
 
 /// Owns the on-disk file handle for one WAL segment.
@@ -97,17 +97,7 @@ impl SegmentWriter {
             });
         }
         self.scratch.clear();
-        Record {
-            cursor,
-            ts_unix_nanos,
-            // Re-encode without copying the payload — encode_into
-            // reads from a slice, but we need a Record by value.
-            // The temporary Vec here is dropped immediately after
-            // encode; in practice the optimiser inlines the slice
-            // copy.  Profile if it ever matters.
-            payload: payload.to_vec(),
-        }
-        .encode_into(&mut self.scratch);
+        encode_record_into(&mut self.scratch, cursor, ts_unix_nanos, payload);
         self.file.write_all(&self.scratch)?;
         self.bytes_written += self.scratch.len() as u64;
         self.pending_cursor = cursor + 1;

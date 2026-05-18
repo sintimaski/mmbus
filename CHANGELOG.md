@@ -47,23 +47,40 @@ All notable changes to mmbus are recorded here.  Format follows
 
 ### Bench results (32 B payload, capacity 4096, macOS 25.4 APFS)
 
-| Policy        | ns/publish (W1-f) | ns/publish (W2 opt) | Overhead vs baseline |
-|---------------|------------------:|--------------------:|---------------------:|
-| no WAL        |               185 |                 185 |                    — |
-| `wal=None`    |               275 |                 272 |                 +47% |
-| `wal=Batched` |               767 |                 656 |                +254% |
-| `wal=Each`    |         3,700,000 |           3,800,000 | catastrophic (fsync) |
+| Policy        | W1-f ns | W2 ns | Overhead vs baseline |
+|---------------|--------:|------:|---------------------:|
+| no WAL        |     185 |   176 |                    — |
+| `wal=None`    |     275 |   248 |                 +41% |
+| `wal=Batched` |     767 |   606 |                +244% |
+| `wal=Each`    |  3.7 ms | 3.6 ms | catastrophic (fsync) |
 
-W2 optimisation pass: (a) flusher thread's multi-ms `sync_data` now
-runs OUTSIDE the WAL mutex — only the BufWriter flush + fd clone are
-under the lock; (b) per-publish `SystemTime::now()` replaced with a
-cached wall-clock offset + cheap `Instant::now()`.  Net: Batched
-overhead drops 315% → 254% (-14%); other policies are unchanged
-within noise.
+W2 optimisation pass:
 
-Still well above the planned <10% gate, so the default stays at
-`WalConfig::disabled()`.  Closing the gap further likely needs a
-lock-free SPSC handoff between publisher and flusher (a v0.2.x item).
+- **Flusher sync_data outside WAL mutex** — only the BufWriter
+  flush + fd `try_clone` happen under the lock; the multi-ms
+  `sync_data` on the cloned fd runs without blocking publishers.
+- **Cached wall-clock anchor** — `SystemTime::now()` per publish
+  replaced with `wall_base + Instant::now().elapsed()`.
+- **Killed the per-publish `Vec` alloc** — `Record::encode_into`
+  was building a temporary `Vec` for `payload` on every record;
+  new free function `encode_record_into(&mut Vec, cursor, ts,
+  &[u8])` takes a slice.
+- **Active-segment bookkeeping outside BTreeMap** — every append
+  used to do a `BTreeMap::insert` on the active segment's size +
+  an O(n) `values().sum()` for the retention check.  Now tracked
+  as two `u64` fields (`active_bytes`, `retained_bytes`);
+  retention only walks segments when `retained + active > cap`.
+- **No-WAL hot path byte-identical to v0.1.0** — the `is_full`
+  pre-check (added in W1-d to prevent phantom WAL records) now
+  only runs inside the WAL-enabled branch.
+
+Cumulative deltas vs W1-f: no-WAL -5%; `wal=None` -10%;
+`wal=Batched` -21%.
+
+`Batched` still well above the planned <10% gate, so the default
+stays at `WalConfig::disabled()`.  Closing the remaining +244%
+likely needs a lock-free SPSC handoff between publisher and
+flusher (a v0.2.x item).
 
 ## [0.1.0] - first public release
 
