@@ -9,6 +9,7 @@
 //! through W2-6.
 
 pub mod active;
+pub mod durability;
 pub mod mmap_segment_reader;
 pub mod mmap_segment_writer;
 pub mod reader;

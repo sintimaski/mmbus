@@ -31,8 +31,9 @@
 use crate::wal::record::{
     MAX_PAYLOAD_LEN, MAX_RECORD_LEN, RECORD_FRAMING, SEGMENT_HEADER_LEN, SEGMENT_MAGIC,
 };
+use crate::wal::v2::durability;
 use memmap2::MmapMut;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -87,9 +88,13 @@ pub enum AppendOutcome {
 }
 
 /// Writer for one v2 segment file.  Owns an `MmapMut` backed by a
-/// pre-allocated file.
+/// pre-allocated file.  The owning `File` handle is kept around so
+/// the per-platform [`durability`] primitives can call
+/// `fdatasync` / `F_FULLFSYNC` / `FlushFileBuffers` on it after an
+/// `msync`.
 pub struct MmapSegmentWriter {
     path: PathBuf,
+    file: File,
     mmap: MmapMut,
     segment_size: usize,
     first_cursor: u64,
@@ -132,7 +137,7 @@ impl MmapSegmentWriter {
         mmap[16..24].copy_from_slice(&first_cursor.to_le_bytes());
         // Initialise tail at byte offset SEGMENT_HEADER_LEN (= 32),
         // i.e. just past the header — the first record's offset.
-        let writer = Self { path: path.to_owned(), mmap, segment_size, first_cursor };
+        let writer = Self { path: path.to_owned(), file, mmap, segment_size, first_cursor };
         writer.tail_atomic().store(SEGMENT_HEADER_LEN as u64, Ordering::Release);
         Ok(writer)
     }
@@ -282,12 +287,21 @@ impl MmapSegmentWriter {
     }
 
     /// Flush dirty mmap pages to the OS page cache via msync.  Does
-    /// NOT fsync the file — that's a separate per-platform path
-    /// (W2-7).  Useful for tests that want to make writes visible
-    /// to a concurrent reader on a different fd (the same-mmap reads
-    /// see them via the atomic stores already).
+    /// NOT fsync the file — that's [`Self::flush_sync`].  Useful
+    /// for tests that want to make writes visible to a concurrent
+    /// reader on a different fd (the same-mmap reads see them via
+    /// the atomic stores already).
     pub fn flush_async(&self) -> io::Result<()> {
-        self.mmap.flush_async()
+        durability::flush_async(&self.mmap)
+    }
+
+    /// Per-platform durable flush.  After this returns Ok, every
+    /// committed record is on stable storage (within the OS's
+    /// guarantees — `F_FULLFSYNC` on macOS, `fdatasync` on Linux,
+    /// `FlushFileBuffers` on Windows).  Used by [`FsyncPolicy::Each`]
+    /// inline and by the Batched flusher thread on each tick.
+    pub fn flush_sync(&self) -> io::Result<()> {
+        durability::flush_sync(&self.mmap, &self.file)
     }
 
     fn tail_atomic(&self) -> &AtomicU64 {

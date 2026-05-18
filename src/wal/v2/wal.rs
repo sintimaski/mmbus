@@ -324,12 +324,11 @@ impl Wal {
         self.pending_cursor.store(next_cursor, Ordering::Release);
 
         if matches!(self.cfg.fsync_policy, FsyncPolicy::Each) {
-            // W2-7 will wire real msync(MS_SYNC) + per-platform
-            // file-level sync here; for now flush_async + advance
-            // durable_cursor so subscribers gating on it behave as
-            // expected in tests.
+            // Per-platform durable flush — msync(MS_SYNC) +
+            // F_FULLFSYNC / fdatasync / FlushFileBuffers depending
+            // on the OS.  See wal::v2::durability.
             if let Some(w) = inner.writer.as_ref() {
-                w.flush_async()?;
+                w.flush_sync()?;
             }
             self.durable_cursor.store(next_cursor, Ordering::Release);
         }
@@ -341,12 +340,12 @@ impl Wal {
         Ok(())
     }
 
-    /// Force-flush — until W2-7, calls `flush_async` and advances
-    /// `durable_cursor` to `pending_cursor`.
+    /// Force-flush.  Calls the per-platform `flush_sync` and
+    /// advances `durable_cursor` to `pending_cursor`.
     pub fn fsync(&self) -> Result<(), WalError> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(w) = inner.writer.as_ref() {
-            w.flush_async()?;
+            w.flush_sync()?;
         }
         self.durable_cursor
             .store(self.pending_cursor.load(Ordering::Acquire), Ordering::Release);
@@ -569,7 +568,10 @@ fn spawn_flusher_thread(
                     Err(p) => p.into_inner(),
                 };
                 if let Some(w) = guard.writer.as_ref() {
-                    w.flush_async()
+                    // Per-platform sync flush so durable_cursor's
+                    // advance genuinely reflects on-disk durability,
+                    // not just an msync-scheduled writeback.
+                    w.flush_sync()
                 } else {
                     Ok(())
                 }
