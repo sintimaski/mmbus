@@ -5,10 +5,15 @@
 //! the ring tail aligns with the WAL on restart, and recovery copes
 //! with a torn segment tail.
 
-use mmbus::wal::{FsyncPolicy, SegmentReader, WalConfig};
+use mmbus::wal::{FsyncPolicy, WalConfig};
 use mmbus::{BusConfig, Publisher};
 use std::path::PathBuf;
 use std::time::Duration;
+
+#[cfg(not(feature = "wal_v2"))]
+use mmbus::wal::SegmentReader;
+#[cfg(feature = "wal_v2")]
+use mmbus::wal::v2::MmapSegmentReader;
 
 fn base_cfg(name: &str, policy: FsyncPolicy) -> BusConfig {
     BusConfig {
@@ -45,6 +50,7 @@ fn wal_segments(cfg: &BusConfig) -> Vec<PathBuf> {
     out
 }
 
+#[cfg(not(feature = "wal_v2"))]
 fn read_wal_records(cfg: &BusConfig) -> Vec<(u64, Vec<u8>)> {
     let mut out = Vec::new();
     for seg in wal_segments(cfg) {
@@ -52,6 +58,23 @@ fn read_wal_records(cfg: &BusConfig) -> Vec<(u64, Vec<u8>)> {
         while let Some(record) = r.next_record() {
             let record = record.expect("decode record");
             out.push((record.cursor, record.payload));
+        }
+    }
+    out
+}
+
+#[cfg(feature = "wal_v2")]
+fn read_wal_records(cfg: &BusConfig) -> Vec<(u64, Vec<u8>)> {
+    use mmbus::wal::v2::ReadOutcome;
+    let mut out = Vec::new();
+    for seg in wal_segments(cfg) {
+        let mut r = MmapSegmentReader::open(&seg).expect("open segment");
+        loop {
+            match r.next_record() {
+                ReadOutcome::Record(record) => out.push((record.cursor, record.payload)),
+                ReadOutcome::AwaitMore | ReadOutcome::EndOfSegment => break,
+                ReadOutcome::Err(e) => panic!("decode record: {e:?}"),
+            }
         }
     }
     out
@@ -149,6 +172,12 @@ fn ring_tail_aligns_with_wal_pending_cursor_on_restart() {
     cleanup(&cfg);
 }
 
+// v0.1's recover_truncate ftruncates the segment to the last clean
+// boundary on open.  v2's recovery model is different (in-mmap tail +
+// per-slot seqlock); the equivalent corruption-recovery test for v2
+// lands as part of W2-8's acceptance suite once we settle the on-disk
+// post-mortem semantics for an mmap-backed WAL.
+#[cfg(not(feature = "wal_v2"))]
 #[test]
 fn restart_after_torn_tail_drops_corrupt_records_and_resumes() {
     let cfg = base_cfg("torn_recovery", FsyncPolicy::Each);

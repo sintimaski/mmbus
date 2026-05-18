@@ -22,9 +22,22 @@ pub mod v2;
 pub mod wal;
 
 pub use config::{FsyncPolicy, WalConfig};
-pub use reader::WalReader;
 pub use record::{Record, SegmentHeader, SegmentHeaderError, MAX_PAYLOAD_LEN, SEGMENT_HEADER_LEN};
 pub use segment_reader::{recover_truncate, ReaderError, RecoveryReport, SegmentReader};
 pub use segment_writer::{SegmentWriter, WriterError};
 pub use stats::WalStats;
+
+// The publisher / subscriber import `crate::wal::{Wal, WalError,
+// WalReader, WalReplayer}` — re-export the right backend based on
+// the `wal_v2` feature so the integration is transparent.  v0.1's
+// types stay reachable at `crate::wal::wal::*` and `crate::wal::reader::*`
+// for code that wants them explicitly (e.g. v0.1's own unit tests).
+#[cfg(not(feature = "wal_v2"))]
+pub use reader::WalReader;
+#[cfg(not(feature = "wal_v2"))]
 pub use wal::{Wal, WalError, WalReplayer};
+
+#[cfg(feature = "wal_v2")]
+pub use v2::reader::WalReader;
+#[cfg(feature = "wal_v2")]
+pub use v2::{Wal, WalError, WalReplayer};

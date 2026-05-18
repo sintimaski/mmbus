@@ -160,15 +160,27 @@ impl Wal {
             // committed cursor, then rotate to a fresh segment so
             // we don't try to re-open the existing one for append
             // (MmapSegmentWriter::create uses create_new).
+            //
+            // Recovery tolerance: if the segment file is corrupt
+            // (truncated, bad header, mid-record CRC mismatch from
+            // a crash mid-write), treat everything from the bad
+            // boundary onwards as not-committed.  Mirrors v0.1's
+            // recover_truncate semantics without an in-place
+            // ftruncate (we just don't bump last_cursor past the
+            // last clean record).
             let mut last_cursor: Option<u64> = None;
-            let mut reader = MmapSegmentReader::open(last_path)?;
-            loop {
-                match reader.next_record() {
-                    ReadOutcome::Record(r) => last_cursor = Some(r.cursor),
-                    ReadOutcome::AwaitMore | ReadOutcome::EndOfSegment => break,
-                    ReadOutcome::Err(e) => return Err(WalError::from(e)),
+            if let Ok(mut reader) = MmapSegmentReader::open(last_path) {
+                // AwaitMore / EndOfSegment / Err all stop recovery at
+                // the last good cursor.  An Err here would have been
+                // a partial write before the system died; treat it
+                // as if the in-flight record never happened.
+                while let ReadOutcome::Record(r) = reader.next_record() {
+                    last_cursor = Some(r.cursor);
                 }
             }
+            // else: segment header unparseable (file truncated below
+            // 32 bytes or magic destroyed).  Treat as empty —
+            // last_cursor stays None.
             let next_cursor = last_cursor.map(|c| c + 1).unwrap_or(last_first_cursor);
             if next_cursor == last_first_cursor {
                 // Empty segment — leave it; defer writer creation

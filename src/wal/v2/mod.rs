@@ -11,6 +11,7 @@
 pub mod active;
 pub mod mmap_segment_reader;
 pub mod mmap_segment_writer;
+pub mod reader;
 pub mod rotation;
 pub mod wal;
 
@@ -22,5 +23,6 @@ pub use mmap_segment_writer::{
     align_record_len, AppendOutcome, MmapSegmentWriter, WriterError,
     SEGMENT_VERSION_V2, WRITING_BIT_U32,
 };
+pub use reader::WalReader;
 pub use rotation::{open_segment_reader, rotate, segment_path, RotateError};
 pub use wal::{Wal, WalError, WalReplayer};
