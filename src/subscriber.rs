@@ -277,16 +277,27 @@ impl Subscriber {
 
     /// Block until the next message arrives.
     pub fn receive(&mut self) -> Result<Vec<u8>> {
-        if let Some(payload) = self.next_wal_record()? {
-            return Ok(payload);
-        }
         let mut out = Vec::new();
+        self.receive_into(&mut out)?;
+        Ok(out)
+    }
+
+    /// Block until the next message arrives, reusing the caller's
+    /// buffer.  The buffer is `clear()`'d on entry; on success it
+    /// holds the new payload.  Saves one allocation per receive vs
+    /// [`Self::receive`] — used by the Python binding (which keeps a
+    /// reusable scratch buffer on the wrapper) and by any Rust caller
+    /// reading in a tight loop.
+    pub fn receive_into(&mut self, out: &mut Vec<u8>) -> Result<()> {
+        out.clear();
+        if let Some(payload) = self.next_wal_record()? {
+            out.extend_from_slice(&payload);
+            return Ok(());
+        }
         loop {
-            if let Some(new_cursor) =
-                self.ring.try_receive(self.cursor_idx, self.cursor, &mut out)
-            {
+            if let Some(new_cursor) = self.ring.try_receive(self.cursor_idx, self.cursor, out) {
                 self.cursor = new_cursor;
-                return Ok(out);
+                return Ok(());
             }
             self.wait_wakeup(-1)?;
         }
@@ -294,21 +305,35 @@ impl Subscriber {
 
     /// Block with a timeout. Returns `Ok(None)` if the timeout elapses.
     pub fn receive_timeout(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>> {
+        let mut out = Vec::new();
+        match self.receive_timeout_into(timeout, &mut out)? {
+            true => Ok(Some(out)),
+            false => Ok(None),
+        }
+    }
+
+    /// Buffer-reusing variant of [`Self::receive_timeout`].  Returns
+    /// `Ok(true)` if a message was received and written to `out`,
+    /// `Ok(false)` on timeout.  `out` is `clear()`'d on entry.
+    pub fn receive_timeout_into(
+        &mut self,
+        timeout: Duration,
+        out: &mut Vec<u8>,
+    ) -> Result<bool> {
+        out.clear();
         if let Some(payload) = self.next_wal_record()? {
-            return Ok(Some(payload));
+            out.extend_from_slice(&payload);
+            return Ok(true);
         }
         let deadline = Instant::now() + timeout;
-        let mut out = Vec::new();
         loop {
-            if let Some(new_cursor) =
-                self.ring.try_receive(self.cursor_idx, self.cursor, &mut out)
-            {
+            if let Some(new_cursor) = self.ring.try_receive(self.cursor_idx, self.cursor, out) {
                 self.cursor = new_cursor;
-                return Ok(Some(out));
+                return Ok(true);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Ok(None);
+                return Ok(false);
             }
             let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
             match self.wait_wakeup(ms) {
@@ -317,7 +342,7 @@ impl Subscriber {
                     if e.kind() == io::ErrorKind::WouldBlock
                         || e.kind() == io::ErrorKind::TimedOut =>
                 {
-                    return Ok(None);
+                    return Ok(false);
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -326,15 +351,28 @@ impl Subscriber {
 
     /// Non-blocking poll. Returns `None` if no message is ready.
     pub fn try_receive(&mut self) -> Option<Vec<u8>> {
-        if let Ok(Some(payload)) = self.next_wal_record() {
-            return Some(payload);
-        }
         let mut out = Vec::new();
-        if let Some(new_cursor) = self.ring.try_receive(self.cursor_idx, self.cursor, &mut out) {
-            self.cursor = new_cursor;
+        if self.try_receive_into(&mut out) {
             Some(out)
         } else {
             None
+        }
+    }
+
+    /// Buffer-reusing variant of [`Self::try_receive`].  Returns
+    /// `true` and fills `out` if a message was available; returns
+    /// `false` immediately if not.  `out` is `clear()`'d on entry.
+    pub fn try_receive_into(&mut self, out: &mut Vec<u8>) -> bool {
+        out.clear();
+        if let Ok(Some(payload)) = self.next_wal_record() {
+            out.extend_from_slice(&payload);
+            return true;
+        }
+        if let Some(new_cursor) = self.ring.try_receive(self.cursor_idx, self.cursor, out) {
+            self.cursor = new_cursor;
+            true
+        } else {
+            false
         }
     }
 

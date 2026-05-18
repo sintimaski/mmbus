@@ -22,14 +22,38 @@ impl Subscription {
         self.sub.receive()
     }
 
+    /// Buffer-reusing variant of [`Self::recv`].  `out` is `clear()`'d
+    /// then refilled with the next message's payload.  Saves one
+    /// allocation per receive in tight loops.
+    pub fn recv_into(&mut self, out: &mut Vec<u8>) -> Result<()> {
+        self.sub.receive_into(out)
+    }
+
     /// Block with a timeout. Returns `Ok(None)` if no message arrives in time.
     pub fn recv_timeout(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>> {
         self.sub.receive_timeout(timeout)
     }
 
+    /// Buffer-reusing variant of [`Self::recv_timeout`].  Returns
+    /// `Ok(true)` and fills `out` on success; `Ok(false)` on timeout.
+    pub fn recv_timeout_into(
+        &mut self,
+        timeout: Duration,
+        out: &mut Vec<u8>,
+    ) -> Result<bool> {
+        self.sub.receive_timeout_into(timeout, out)
+    }
+
     /// Non-blocking poll. Returns `None` immediately if no message is ready.
     pub fn try_recv(&mut self) -> Option<Vec<u8>> {
         self.sub.try_receive()
+    }
+
+    /// Buffer-reusing variant of [`Self::try_recv`].  Returns `true`
+    /// and fills `out` if a message was available; returns `false`
+    /// immediately otherwise.
+    pub fn try_recv_into(&mut self, out: &mut Vec<u8>) -> bool {
+        self.sub.try_receive_into(out)
     }
 
     /// How many messages this subscriber is behind the producer.

@@ -210,10 +210,44 @@ def smoke_example_fastapi_broadcast() -> None:
     print("  fastapi_broadcast example PASSED")
 
 
+def smoke_recv_batch() -> None:
+    """Subscription.recv_batch(n, timeout) amortises GIL+PyO3 dispatch
+    across N messages.  Verifies the API shape (returns a list of
+    bytes) and the basic semantics (blocks for first, drains
+    non-blockingly thereafter, empty list on timeout).
+    """
+    received: list[bytes] = []
+
+    def subscriber() -> None:
+        bus = mmbus.Bus("docker-test-batch")
+        sub = bus.subscribe("ch", timeout_secs=10.0)
+        # Empty list on timeout with nothing published yet.
+        empty = sub.recv_batch(n=5, timeout_secs=0.05)
+        assert empty == [], f"expected empty list on timeout, got {empty!r}"
+        # Drain a burst of 10 in one call.
+        batch = sub.recv_batch(n=20, timeout_secs=2.0)
+        received.extend(batch)
+
+    t = threading.Thread(target=subscriber, daemon=True)
+    t.start()
+    pub = mmbus.Bus("docker-test-batch")
+    pub.wait_for_subscribers("ch", n=1, timeout_secs=10.0)
+    # Give the subscriber's timeout-test call a moment to land first.
+    import time
+    time.sleep(0.1)
+    for i in range(10):
+        pub.publish("ch", f"msg-{i:02}".encode())
+    t.join(timeout=5.0)
+    assert len(received) == 10, f"recv_batch: expected 10, got {len(received)}"
+    assert received[0] == b"msg-00" and received[-1] == b"msg-09"
+    print(f"  recv_batch PASSED ({len(received)} msgs in one call)")
+
+
 def main() -> None:
     smoke_sync()
     smoke_async()
     smoke_backpressure_kwarg()
+    smoke_recv_batch()
     smoke_bridge_module()
     smoke_example_np_pipeline()
     smoke_example_fastapi_broadcast()

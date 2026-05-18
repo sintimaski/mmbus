@@ -6,6 +6,32 @@ All notable changes to mmbus are recorded here.  Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`Subscription.recv_batch(n, timeout_secs)`** — Python-side batch
+  recv that drains up to `n` messages under a single GIL release.
+  Blocks for the first message up to `timeout_secs`, then drains
+  non-blockingly until the ring is empty or `n` is reached.
+  Returns a `list[bytes]` (empty on timeout).  Designed to close
+  most of the small-payload throughput gap vs `pyzmq` on
+  burst-heavy workloads where per-call PyO3 + GIL dispatch
+  dominates.
+- **Rust buffer-reuse API:** `Subscriber::receive_into(&mut Vec<u8>)`,
+  `try_receive_into`, `receive_timeout_into` + matching
+  `Subscription::recv_into` / `try_recv_into` /
+  `recv_timeout_into`.  Saves one allocation per receive in tight
+  loops; backs the Python recv hot path.
+- `PySubscription` holds a reusable `recv_buf: Vec<u8>` across
+  calls — `recv()`, `recv_timeout()`, `try_recv()`, and `__next__`
+  all reuse it.  Combined with `PyBytes::new_bound_with`,
+  eliminates the per-call `Vec` intermediate that used to sit
+  between the ring read and the Python bytes object.
+- `mmbus.WalError` Python exception class — surfaces non-cursor
+  WAL failures (`WalError::Poisoned`, `WalError::PayloadTooLarge`,
+  underlying I/O).
+
+### Notes
+
 WAL v2 (lock-free mmap-backed) RFC + plan landed; implementation
 gated behind `--features wal_v2` and tracked by tasks W2-1..W2-8.
 See `docs/rfc-wal-v2-lockfree.md`.

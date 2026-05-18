@@ -40,6 +40,7 @@ from mmbus._mmbus import (  # noqa: F401
     CursorTooOldError,
     MessageTooLargeError,
     TooManySubscribersError,
+    WalError,
 )
 
 

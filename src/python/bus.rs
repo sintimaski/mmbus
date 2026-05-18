@@ -56,6 +56,11 @@ impl PyBus {
             slot_size: slot_size.unwrap_or(defaults.slot_size),
             max_subscribers: max_subscribers.unwrap_or(defaults.max_subscribers),
             backpressure: policy,
+            // WAL is opt-in and has no Python-surface kwarg yet — keep
+            // it disabled by default for Python users.  A future
+            // `wal="batched"|"each"|"none"|None` kwarg lands when the
+            // v0.2 lock-free WAL hits the <10% overhead gate.
+            wal: defaults.wal,
         };
         Ok(PyBus { inner: Bus::with_config(name, config) })
     }

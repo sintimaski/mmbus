@@ -5,7 +5,7 @@ use crate::python::exceptions::mmbus_err;
 use crate::stats::TopicStats;
 use crate::subscription::Subscription;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyList};
 use std::time::Duration;
 
 /// Active subscription to a topic.
@@ -20,20 +20,42 @@ use std::time::Duration;
 #[pyclass(name = "Subscription", module = "mmbus._mmbus")]
 pub struct PySubscription {
     inner: Subscription,
+    /// Reusable scratch buffer for the recv hot path — saves one
+    /// per-call `Vec` allocation vs the original API that returned
+    /// a fresh `Vec<u8>` from `Subscription::recv()`.  Cleared on
+    /// every recv; capacity grows to the largest payload seen.
+    recv_buf: Vec<u8>,
 }
 
 impl PySubscription {
     pub(crate) fn new(inner: Subscription) -> Self {
-        Self { inner }
+        Self { inner, recv_buf: Vec::new() }
     }
+}
+
+/// Build a Python `bytes` object from a slice in one shot.
+///
+/// Uses `PyBytes::new_bound_with` so PyO3 allocates the PyBytes
+/// once at the right length and we memcpy directly into its
+/// internal buffer — no `Vec<u8>` intermediate, no double-copy.
+/// (`PyBytes::new_bound(py, &slice)` does the same memcpy
+/// internally, so this is mostly a stylistic guarantee that no
+/// future refactor reintroduces a copy.)
+fn payload_to_pybytes<'py>(py: Python<'py>, payload: &[u8]) -> Bound<'py, PyBytes> {
+    PyBytes::new_bound_with(py, payload.len(), |buf| {
+        buf.copy_from_slice(payload);
+        Ok(())
+    })
+    .expect("PyBytes allocation cannot fail for a slice we already hold")
 }
 
 #[pymethods]
 impl PySubscription {
     /// Block until the next message.  Releases the GIL.
     fn recv<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let data = py.allow_threads(|| self.inner.recv()).map_err(mmbus_err)?;
-        Ok(PyBytes::new_bound(py, &data))
+        py.allow_threads(|| self.inner.recv_into(&mut self.recv_buf))
+            .map_err(mmbus_err)?;
+        Ok(payload_to_pybytes(py, &self.recv_buf))
     }
 
     /// Block up to ``timeout_secs``.  Returns ``None`` on timeout.
@@ -44,14 +66,76 @@ impl PySubscription {
         timeout_secs: f64,
     ) -> PyResult<Option<Bound<'py, PyBytes>>> {
         let timeout = Duration::from_secs_f64(timeout_secs);
-        let result =
-            py.allow_threads(|| self.inner.recv_timeout(timeout)).map_err(mmbus_err)?;
-        Ok(result.map(|data| PyBytes::new_bound(py, &data)))
+        let got = py
+            .allow_threads(|| self.inner.recv_timeout_into(timeout, &mut self.recv_buf))
+            .map_err(mmbus_err)?;
+        Ok(got.then(|| payload_to_pybytes(py, &self.recv_buf)))
     }
 
     /// Non-blocking poll.  Returns ``None`` immediately if no message is ready.
     fn try_recv<'py>(&mut self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
-        self.inner.try_recv().map(|data| PyBytes::new_bound(py, &data))
+        if self.inner.try_recv_into(&mut self.recv_buf) {
+            Some(payload_to_pybytes(py, &self.recv_buf))
+        } else {
+            None
+        }
+    }
+
+    /// Drain up to ``n`` messages into a list under a single GIL
+    /// release.  Blocks up to ``timeout_secs`` for the FIRST message;
+    /// once at least one has arrived, returns immediately with
+    /// whatever is currently available (up to ``n``).  Designed for
+    /// burst-heavy workloads where the per-call PyO3 + GIL overhead
+    /// of single-message ``recv()`` dominates.
+    ///
+    /// Returns an empty list on timeout.
+    #[pyo3(signature = (n, timeout_secs=1.0))]
+    fn recv_batch<'py>(
+        &mut self,
+        py: Python<'py>,
+        n: usize,
+        timeout_secs: f64,
+    ) -> PyResult<Bound<'py, PyList>> {
+        if n == 0 {
+            return Ok(PyList::empty_bound(py));
+        }
+        let timeout = Duration::from_secs_f64(timeout_secs);
+
+        // Phase 1 (GIL released): block for the first message up to
+        // `timeout`, then drain non-blockingly until either the ring
+        // is empty or we've collected `n` payloads.  We accumulate
+        // into `Vec<Vec<u8>>` so we can build the PyList in one shot
+        // after re-acquiring the GIL.  Yes, this allocates per
+        // message — but `recv_batch` is for amortising the PyO3
+        // dispatch over many messages, not for chasing the absolute
+        // minimum allocation count (that's `recv_into`'s job).
+        let payloads: Vec<Vec<u8>> = py
+            .allow_threads(|| -> Result<Vec<Vec<u8>>, Error> {
+                let mut out = Vec::with_capacity(n);
+                let mut first_buf = Vec::new();
+                if !self.inner.recv_timeout_into(timeout, &mut first_buf)? {
+                    return Ok(out); // timeout before any message
+                }
+                out.push(first_buf);
+                while out.len() < n {
+                    let mut buf = Vec::new();
+                    if !self.inner.try_recv_into(&mut buf) {
+                        break;
+                    }
+                    out.push(buf);
+                }
+                Ok(out)
+            })
+            .map_err(mmbus_err)?;
+
+        // Phase 2 (GIL held): build the PyList.  `PyBytes::new_bound`
+        // is the only unavoidable per-payload cost left — it allocs
+        // a Python bytes object + memcpy's the payload in.
+        let list = PyList::empty_bound(py);
+        for p in &payloads {
+            list.append(payload_to_pybytes(py, p))?;
+        }
+        Ok(list)
     }
 
     /// How many messages this subscriber is behind the producer.
@@ -84,8 +168,12 @@ impl PySubscription {
     /// raises on publisher disconnect.  Use from ``asyncio.add_reader``
     /// callbacks for true zero-thread async.
     fn poll_recv<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        // poll_recv stays on the Vec-returning API because it's
+        // entered from a wakeup callback (no GIL release) — the
+        // intermediate Vec is one-shot anyway.  If this ever becomes
+        // a profile hit, add a `poll_recv_into` on Subscription.
         match self.inner.poll_recv() {
-            Ok(Some(data)) => Ok(Some(PyBytes::new_bound(py, &data))),
+            Ok(Some(data)) => Ok(Some(payload_to_pybytes(py, &data))),
             Ok(None) => Ok(None),
             Err(e) => Err(mmbus_err(e)),
         }
@@ -98,8 +186,8 @@ impl PySubscription {
     }
 
     fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
-        match py.allow_threads(|| self.inner.recv()) {
-            Ok(data) => Ok(Some(PyBytes::new_bound(py, &data))),
+        match py.allow_threads(|| self.inner.recv_into(&mut self.recv_buf)) {
+            Ok(()) => Ok(Some(payload_to_pybytes(py, &self.recv_buf))),
             Err(Error::Io(e))
                 if e.kind() == std::io::ErrorKind::UnexpectedEof
                     || e.kind() == std::io::ErrorKind::ConnectionReset =>
