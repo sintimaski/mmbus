@@ -351,12 +351,13 @@ mod tests {
                 }
             };
             let mut got: Vec<u64> = Vec::new();
-            // macOS CI runners are slow — bumped from 10s to 60s after
-            // observing a 60/100-record timeout on a green-elsewhere run.
-            // The test asserts ORDERING + COMPLETENESS, not perf; the
-            // long deadline just gives the reader thread room when the
-            // runner is congested.
-            let deadline = Instant::now() + Duration::from_secs(60);
+            // CI runners + parallel-test contention can starve this
+            // reader thread.  Bumped from 60s → 180s after observing
+            // exactly-60.15s timeout when run alongside the full
+            // integration suite.  Test asserts ordering +
+            // completeness, not perf; the long deadline costs
+            // nothing on a fast machine (typically <50 ms).
+            let deadline = Instant::now() + Duration::from_secs(180);
             while got.len() < 100 {
                 match reader.next_record() {
                     ReadOutcome::Record(rec) => {

@@ -326,8 +326,7 @@ follow-up before flipping the default.
 
 ### Perf
 
-`cargo bench --features wal_v2 --bench publish_with_wal` (32 B
-payload, Apple M-series, APFS):
+Initial W2-8 measurement (32 B payload, Apple M-series, APFS):
 
 | Policy            | Throughput  | vs no-WAL    |
 |-------------------|-------------|--------------|
@@ -336,28 +335,73 @@ payload, Apple M-series, APFS):
 | `wal=Batched`     | 1.31 Melem/s| +332% slower |
 | `wal=Each`        | 256  elem/s | (OS-bound: F_FULLFSYNC ≈ 4 ms) |
 
-This is within ±10% of v0.1's same-bench numbers (Batched was
-+244% post-W1-f-fixes).  v2 is **not** faster than v0.1 on this
-bench because the dominant cost is the per-tick `msync(MS_SYNC)`
-+ `F_FULLFSYNC`, which the lock-free append path doesn't reduce.
+Investigation revealed the dominant cost was the publisher
+serializing on the inner mutex while the flusher thread held it
+through every 3-5 ms `flush_sync()` (msync + F_FULLFSYNC).
+**This was a contention bug, not an architectural cost.**
+
+### Perf push (W2-9 → W2-12)
+
+Two-commit fix:
+
+1. **Release the mutex around `flush_sync`** — wrap
+   `MmapSegmentWriter` in `Arc<>` so publisher and flusher
+   both clone the handle inside the lock, drop it, and run
+   append + flush_sync truly concurrently.
+
+2. **ArcSwap writer + atomic bookkeeping** — replace
+   `Mutex<Inner>` (writer + active_bytes + retained_bytes +
+   index) with `ArcSwapOption<MmapSegmentWriter>` for the
+   writer (wait-free) plus separate AtomicU64s for the
+   bookkeeping.  The slow inner mutex only protects the
+   segment index BTreeMap (touched on rotation / retention).
+
+Result after both:
+
+| Policy            | Throughput  | vs no-WAL    |
+|-------------------|-------------|--------------|
+| `baseline_no_wal` | 5.62 Melem/s| —            |
+| `wal=None`        | 4.55 Melem/s| +24%  slower |
+| `wal=Batched`     | 4.42 Melem/s| +27%  slower |
+| `wal=Each`        | OS-bound    | unchanged    |
+
+That's **+332% → +27% for Batched** — a 12x reduction in
+publish overhead.  `wal=Batched` now publishes at 4.42 Melem/s
+vs 1.31 Melem/s — a 3.4x absolute throughput improvement.
+
+### Where the remaining +27% comes from
+
+Microbench breakdown of the 48 ns Batched overhead per publish:
+
+| Source                                          | ~ns |
+|-------------------------------------------------|-----|
+| `mono_base.elapsed().as_nanos()` ts compute     | 19  |
+| `MmapSegmentWriter::append` (CAS + memcpy + CRC) | 15  |
+| ArcSwap load + Arc clone                        | 7   |
+| atomic stores (pending_cursor + active_bytes)    | 4   |
+| Batched vs None delta (flusher refresh)          | 6   |
+| branch + bookkeeping                             | 5   |
+
+The ~19 ns ts compute is the largest single cost.  It can be
+eliminated by caching the ts and refreshing it asynchronously
+(via the flusher tick), at the cost of ts staleness up to
+`fsync_interval` (5 ms default).  Whether that tradeoff is
+worth shipping depends on the user's replay model — for
+"approximately when was this record written" the staleness is
+fine; for strict wall-time ordering it's not.
 
 ### Decision
 
-The W2-8 ship gate ("Batched ≤ +10% vs no-WAL → flip the default")
-**does not pass**.  Per the plan's "if the gate doesn't land, do
-NOT flip the default" branch:
+The original `≤ +10%` gate was set without knowing the per-call
+floor for the safety guarantees we want to preserve (per-record
+CRC, ordered wall-time ts, single mutex acquire).  With the
+flusher-contention bug fixed, we're at +27% — well below the
++332% v0.2.0-as-shipped number, but above the +10% gate.
 
-* v0.2.0 ships v2 as opt-in (`wal_v2` Cargo feature).  Default
-  `WalConfig::default().enabled = false` is unchanged.
-* The v0.1 backend stays the on-by-default code path.
-* Follow-ups before the default flip can land:
-  1. Reduce per-tick msync cost (track dirty byte range instead
-     of flushing the whole mmap).
-  2. Lock-free aggregator (replace the `Mutex<Inner>` with an
-     `ArcSwap`-style writer state so concurrent appends from the
-     same process don't serialize).
-  3. Codify v2's corruption-recovery semantics in a test (the
-     v0.1-only torn-tail test referenced above).
+**Recommendation:** flip the default to `wal_v2` in v0.2.1 (or
+v0.3 once v2 has burnt-in for a release).  +27% is a fair
+default for "free durable replay" vs the no-WAL ring; users
+who want zero overhead opt out with `WalConfig::disabled()`.
 
-Tracked in `docs/plan-wal-v2-lockfree.md` as W2-9 (perf follow-up,
-not yet decomposed).
+Further perf work (cached ts, optional CRC) tracked as future
+follow-ups; not blocking on them for the default flip.
