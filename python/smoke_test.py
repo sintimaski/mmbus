@@ -12,7 +12,15 @@ import subprocess
 import sys
 import threading
 
-import mmbus
+# Strip the script's directory (`python/`) from sys.path so `import mmbus`
+# picks up the installed wheel (which has the compiled `_mmbus.so`)
+# instead of the in-tree source `python/mmbus/__init__.py` — the latter's
+# `from mmbus._mmbus import ...` line fails because no `.so` lives next
+# to it.
+if sys.path and os.path.basename(sys.path[0]) == "python":
+    sys.path.pop(0)
+
+import mmbus  # noqa: E402  (must follow the sys.path fix above)
 
 
 def smoke_sync() -> None:
