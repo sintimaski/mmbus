@@ -328,7 +328,11 @@ impl PySubscription {
 
 // ── TopicStats ────────────────────────────────────────────────────────────────
 
-/// Ring-buffer and socket snapshot for a topic.
+/// Ring-buffer, socket, and counters snapshot for a topic.
+///
+/// `*_total` fields are monotonic counters since `Publisher::create`.
+/// Use them as Prometheus-style rate sources (e.g. compute
+/// `delta(published_total[1m])/60` for publishes/sec).
 #[pyclass(name = "TopicStats", module = "mmbus._mmbus")]
 #[derive(Clone)]
 pub struct PyTopicStats {
@@ -340,6 +344,16 @@ pub struct PyTopicStats {
     pub lags: Vec<u64>,
     #[pyo3(get)]
     pub connected_sockets: usize,
+    #[pyo3(get)]
+    pub published_total: u64,
+    #[pyo3(get)]
+    pub full_rejected_total: u64,
+    #[pyo3(get)]
+    pub subscribers_dropped_total: u64,
+    /// WAL snapshot when the publisher's WAL is enabled; `None`
+    /// otherwise.
+    #[pyo3(get)]
+    pub wal: Option<PyWalStats>,
 }
 
 impl From<TopicStats> for PyTopicStats {
@@ -349,6 +363,10 @@ impl From<TopicStats> for PyTopicStats {
             active_subscribers: s.ring.active_subscribers,
             lags: s.ring.lags,
             connected_sockets: s.connected_sockets,
+            published_total: s.published_total,
+            full_rejected_total: s.full_rejected_total,
+            subscribers_dropped_total: s.subscribers_dropped_total,
+            wal: s.wal.map(Into::into),
         }
     }
 }
@@ -357,8 +375,83 @@ impl From<TopicStats> for PyTopicStats {
 impl PyTopicStats {
     fn __repr__(&self) -> String {
         format!(
-            "TopicStats(tail={}, active_subscribers={}, lags={:?}, connected_sockets={})",
-            self.tail, self.active_subscribers, self.lags, self.connected_sockets
+            "TopicStats(tail={}, active_subscribers={}, lags={:?}, \
+             connected_sockets={}, published_total={}, \
+             full_rejected_total={}, subscribers_dropped_total={}, \
+             wal={})",
+            self.tail,
+            self.active_subscribers,
+            self.lags,
+            self.connected_sockets,
+            self.published_total,
+            self.full_rejected_total,
+            self.subscribers_dropped_total,
+            self.wal
+                .as_ref()
+                .map(|_| "<WalStats>")
+                .unwrap_or("None"),
+        )
+    }
+}
+
+/// WAL snapshot: cursors, segment counts, on-disk byte usage,
+/// and monotonic op counters.  Mirrors Rust's
+/// [`mmbus::wal::WalStats`].
+#[pyclass(name = "WalStats", module = "mmbus._mmbus")]
+#[derive(Clone)]
+pub struct PyWalStats {
+    #[pyo3(get)]
+    pub pending_cursor: u64,
+    #[pyo3(get)]
+    pub durable_cursor: u64,
+    #[pyo3(get)]
+    pub oldest_cursor: u64,
+    #[pyo3(get)]
+    pub active_segment_bytes: u64,
+    #[pyo3(get)]
+    pub total_wal_bytes: u64,
+    #[pyo3(get)]
+    pub segments: usize,
+    #[pyo3(get)]
+    pub appends_total: u64,
+    #[pyo3(get)]
+    pub append_bytes_total: u64,
+    #[pyo3(get)]
+    pub flushes_total: u64,
+}
+
+impl From<crate::wal::WalStats> for PyWalStats {
+    fn from(s: crate::wal::WalStats) -> Self {
+        Self {
+            pending_cursor: s.pending_cursor,
+            durable_cursor: s.durable_cursor,
+            oldest_cursor: s.oldest_cursor,
+            active_segment_bytes: s.active_segment_bytes,
+            total_wal_bytes: s.total_wal_bytes,
+            segments: s.segments,
+            appends_total: s.appends_total,
+            append_bytes_total: s.append_bytes_total,
+            flushes_total: s.flushes_total,
+        }
+    }
+}
+
+#[pymethods]
+impl PyWalStats {
+    fn __repr__(&self) -> String {
+        format!(
+            "WalStats(pending={}, durable={}, oldest={}, \
+             active_bytes={}, total_bytes={}, segments={}, \
+             appends_total={}, append_bytes_total={}, flushes_total={})",
+            self.pending_cursor,
+            self.durable_cursor,
+            self.oldest_cursor,
+            self.active_segment_bytes,
+            self.total_wal_bytes,
+            self.segments,
+            self.appends_total,
+            self.append_bytes_total,
+            self.flushes_total,
         )
     }
 }

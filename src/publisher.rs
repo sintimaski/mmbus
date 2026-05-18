@@ -6,6 +6,7 @@ use crate::stats::TopicStats;
 use crate::wal::Wal;
 use std::fs;
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -19,7 +20,7 @@ use std::os::fd::OwnedFd;
 #[cfg(windows)]
 use std::os::windows::io::OwnedHandle;
 #[cfg(windows)]
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::AtomicBool;
 #[cfg(windows)]
 use std::sync::{mpsc, Arc};
 #[cfg(windows)]
@@ -111,6 +112,11 @@ pub struct Publisher {
     /// the WAL *before* the ring write — a failed WAL append leaves
     /// the ring untouched (caller can retry).
     wal: Option<Wal>,
+    /// Observability counters surfaced via [`TopicStats`].  Relaxed
+    /// ordering — pure observability, ~1 ns hot-path cost.
+    published_total: AtomicU64,
+    full_rejected_total: AtomicU64,
+    subscribers_dropped_total: AtomicU64,
 }
 
 impl Publisher {
@@ -165,6 +171,15 @@ impl Publisher {
         let (accept_rx, accept_stop, accept_thread, accept_pipe_name) =
             spawn_windows_accept_thread(name)?;
 
+        tracing::info!(
+            target: "mmbus::publisher",
+            topic = name,
+            ring_capacity = ring.capacity,
+            slot_size = ring.slot_payload_size,
+            wal_enabled = wal.is_some(),
+            backpressure = ?cfg.backpressure,
+            "publisher created",
+        );
         Ok(Self {
             ring,
             #[cfg(unix)]
@@ -181,6 +196,9 @@ impl Publisher {
             backpressure: cfg.backpressure,
             _lock: lock,
             wal,
+            published_total: AtomicU64::new(0),
+            full_rejected_total: AtomicU64::new(0),
+            subscribers_dropped_total: AtomicU64::new(0),
         })
     }
 
@@ -229,8 +247,11 @@ impl Publisher {
             BackpressurePolicy::DropOldest => self.ring.publish_drop_oldest(data),
         };
         if !published {
+            self.full_rejected_total
+                .fetch_add(1, AtomicOrdering::Relaxed);
             return Err(Error::Full);
         }
+        self.published_total.fetch_add(1, AtomicOrdering::Relaxed);
 
         self.broadcast_wakeup();
 
@@ -309,6 +330,8 @@ impl Publisher {
         }
 
         if count > 0 {
+            self.published_total
+                .fetch_add(count as u64, AtomicOrdering::Relaxed);
             self.broadcast_wakeup();
         }
         Ok(count)
@@ -323,6 +346,13 @@ impl Publisher {
                 i += 1;
             } else {
                 self.clients.swap_remove(i);
+                self.subscribers_dropped_total
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                tracing::info!(
+                    target: "mmbus::publisher",
+                    remaining_clients = self.clients.len(),
+                    "subscriber dropped (wake failed; peer closed)",
+                );
             }
         }
     }
@@ -348,6 +378,13 @@ impl Publisher {
             ring: self.ring.stats(),
             connected_sockets: self.clients.len(),
             wal: self.wal.as_ref().map(|w| w.stats()),
+            published_total: self.published_total.load(AtomicOrdering::Relaxed),
+            full_rejected_total: self
+                .full_rejected_total
+                .load(AtomicOrdering::Relaxed),
+            subscribers_dropped_total: self
+                .subscribers_dropped_total
+                .load(AtomicOrdering::Relaxed),
         }
     }
 

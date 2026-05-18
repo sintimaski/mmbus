@@ -1,6 +1,6 @@
 [package]
 name = "mmbus"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Zero-copy pub/sub over mmap for local IPC"
 license = "MIT"
@@ -20,6 +20,12 @@ wal_v2 = ["arc-swap"]
 [dependencies]
 memmap2 = "0.9"
 thiserror = "1"
+# Structured logging via the de-facto-standard `tracing` crate.
+# Zero overhead when no subscriber is registered (the `event!`
+# macros short-circuit on an atomic check).  Downstream users
+# wire a subscriber (`tracing_subscriber::fmt::init()`) to see
+# the events — see README.md "Observability".
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
 pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
 # Wait-free Arc<T> swapper for the v2 WAL hot path: lets the
 # publisher load the active MmapSegmentWriter without taking the

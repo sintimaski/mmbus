@@ -82,6 +82,10 @@ pub struct Wal {
     /// publish overhead.
     wall_base_nanos: u64,
     mono_base: Instant,
+    /// Observability counters — see [`WalStats`].
+    appends_total: Arc<AtomicU64>,
+    append_bytes_total: Arc<AtomicU64>,
+    flushes_total: Arc<AtomicU64>,
 }
 
 /// State guarded by the inner Mutex.  `writer` is `Option` because
@@ -206,11 +210,15 @@ impl Wal {
         }));
         let shutdown = Arc::new(AtomicBool::new(false));
         let poisoned = Arc::new(AtomicBool::new(false));
+        let appends_total = Arc::new(AtomicU64::new(0));
+        let append_bytes_total = Arc::new(AtomicU64::new(0));
+        let flushes_total = Arc::new(AtomicU64::new(0));
 
         let flusher_thread = if cfg.enabled && matches!(cfg.fsync_policy, FsyncPolicy::Batched) {
             Some(spawn_flusher_thread(
                 inner.clone(),
                 durable_cursor.clone(),
+                flushes_total.clone(),
                 shutdown.clone(),
                 poisoned.clone(),
                 cfg.fsync_interval,
@@ -237,6 +245,9 @@ impl Wal {
             poisoned,
             wall_base_nanos,
             mono_base,
+            appends_total,
+            append_bytes_total,
+            flushes_total,
         })
     }
 
@@ -302,12 +313,16 @@ impl Wal {
             inner.active_bytes = bytes;
             self.pending_cursor.store(pending, Ordering::Release);
         }
+        self.appends_total.fetch_add(1, Ordering::Relaxed);
+        self.append_bytes_total
+            .fetch_add(payload.len() as u64, Ordering::Relaxed);
 
         // Under Each, fsync inline and advance durable_cursor.
         if matches!(self.cfg.fsync_policy, FsyncPolicy::Each) {
             let w = inner.writer.as_mut().unwrap();
             let d = w.fsync()?;
             self.durable_cursor.store(d, Ordering::Release);
+            self.flushes_total.fetch_add(1, Ordering::Relaxed);
         }
 
         // Retention: cheap pre-check against tracked retained_bytes +
@@ -327,6 +342,7 @@ impl Wal {
         if let Some(w) = inner.writer.as_mut() {
             let d = w.fsync()?;
             self.durable_cursor.store(d, Ordering::Release);
+            self.flushes_total.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -409,6 +425,9 @@ impl Wal {
             active_segment_bytes: inner.active_bytes,
             total_wal_bytes: inner.retained_bytes + inner.active_bytes,
             segments,
+            appends_total: self.appends_total.load(Ordering::Relaxed),
+            append_bytes_total: self.append_bytes_total.load(Ordering::Relaxed),
+            flushes_total: self.flushes_total.load(Ordering::Relaxed),
         }
     }
 
@@ -529,6 +548,7 @@ impl Iterator for WalReplayer {
 fn spawn_flusher_thread(
     inner: Arc<Mutex<Inner>>,
     durable_cursor: Arc<AtomicU64>,
+    flushes_total: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     poisoned: Arc<AtomicBool>,
     fsync_interval: Duration,
@@ -574,6 +594,7 @@ fn spawn_flusher_thread(
                 return;
             }
             durable_cursor.store(pending, Ordering::Release);
+            flushes_total.fetch_add(1, Ordering::Relaxed);
         }
     })
 }

@@ -26,4 +26,15 @@ pub struct WalStats {
     /// Number of segment files on disk (>= 1 once any record has
     /// been written; 0 before the first append).
     pub segments: usize,
+    /// Monotonic count of successful `append()` calls since this
+    /// WAL handle was opened.  Useful as a rate counter via
+    /// `rate(appends_total[1m])` in Prometheus.
+    pub appends_total: u64,
+    /// Monotonic count of payload bytes appended since open
+    /// (excludes per-record framing).
+    pub append_bytes_total: u64,
+    /// Monotonic count of completed `flush_sync` calls.  Each
+    /// policy increments inline per publish; Batched increments
+    /// per flusher tick (typically every `fsync_interval`).
+    pub flushes_total: u64,
 }

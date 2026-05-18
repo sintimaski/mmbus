@@ -20,6 +20,7 @@ pub fn _mmbus(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<bus::PyBus>()?;
     m.add_class::<subscription::PySubscription>()?;
     m.add_class::<subscription::PyTopicStats>()?;
+    m.add_class::<subscription::PyWalStats>()?;
     exceptions::register(py, m)?;
     Ok(())
 }

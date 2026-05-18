@@ -6,6 +6,61 @@ All notable changes to mmbus are recorded here.  Format follows
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-05-18
+
+### Added — Observability
+
+- **`tracing` crate integration** for structured logging.  Replaces
+  the one `eprintln!` in `wal::segment_reader::recover_truncate`
+  with `tracing::warn!`, and adds INFO-level events at the slow-
+  path transitions: `wal::v2 opened`, `wal segment rotated`,
+  `wal first segment opened`, `wal retention pruned segment`,
+  `publisher created`, `subscriber connected`,
+  `subscriber dropped`.  Zero overhead when no subscriber is
+  registered.  Downstream users wire `tracing_subscriber::fmt::init()`
+  to see the events.
+
+- **Monotonic event counters** on `TopicStats` + `WalStats`:
+  - `TopicStats.published_total` — successful publishes
+  - `TopicStats.full_rejected_total` — publishes rejected with
+    `Error::Full` under `BackpressurePolicy::Error`
+  - `TopicStats.subscribers_dropped_total` — subscribers dropped
+    by the publisher because their wakeup failed (peer died)
+  - `WalStats.appends_total` — successful WAL appends
+  - `WalStats.append_bytes_total` — payload bytes appended
+  - `WalStats.flushes_total` — completed `flush_sync` calls
+    (Each-policy inline + Batched flusher tick)
+
+  All counters use `Relaxed` ordering — pure observability with
+  ~1 ns per-publish cost.
+
+- **`PyWalStats`** Python class exposing the WAL counters via
+  `TopicStats.wal` (was previously `None` from Python).  Both
+  v0.1 and v0.2 WAL backends populate it.
+
+- **`examples/observability.py`** demonstrates scraping
+  `Bus.stats()` and emitting Prometheus text-format lines.
+
+### Performance
+
+`cargo bench --features wal_v2 --bench publish_with_wal` after the
+observability wiring:
+
+| Policy         | Throughput | vs v0.2.0 |
+|----------------|------------|-----------|
+| baseline_no_wal | 5.65 Melem/s | unchanged |
+| wal=None        | 4.61 Melem/s | unchanged |
+| wal=Batched     | 4.46 Melem/s | -3% (counters + 1 tracing event) |
+
+`wal=Batched` overhead vs no-WAL: +27% (was +22% in v0.2.0).
++5 ns per publish is the observability tax — 3 atomic fetch_add
+counters plus per-event tracing dispatch (zero work when no
+subscriber).
+
+### Fixed
+
+- None — this release is additive.
+
 ## [0.2.0] - 2026-05-18
 
 ### Added — WAL v2 (lock-free mmap-backed, ON BY DEFAULT)
@@ -439,7 +494,8 @@ high-throughput burst workloads.
 
 This is the first public release.  Wire format starts at v4.
 
-[Unreleased]: https://github.com/sintimaski/mmbus/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/sintimaski/mmbus/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/sintimaski/mmbus/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/sintimaski/mmbus/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/sintimaski/mmbus/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/sintimaski/mmbus/compare/v0.1.1...v0.1.2

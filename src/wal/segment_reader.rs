@@ -288,11 +288,12 @@ pub fn recover_truncate(path: &Path) -> Result<RecoveryReport, ReaderError> {
         file.set_len(last_good_end)?;
         file.sync_all()?;
         let dropped = original_len - last_good_end;
-        eprintln!(
-            "mmbus::wal: recover_truncate {} dropped {} bytes at offset {}",
-            path.display(),
-            dropped,
-            last_good_end
+        tracing::warn!(
+            target: "mmbus::wal",
+            path = %path.display(),
+            bytes_dropped = dropped,
+            truncate_offset = last_good_end,
+            "recover_truncate dropped trailing torn bytes",
         );
         Ok(RecoveryReport {
             final_len: last_good_end,

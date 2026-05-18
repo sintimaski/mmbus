@@ -258,6 +258,15 @@ impl Subscriber {
         ring.set_cursor(cursor_idx, live_cursor);
         let generation = ring.generation();
 
+        tracing::info!(
+            target: "mmbus::subscriber",
+            topic = name,
+            cursor,
+            cursor_idx,
+            generation,
+            replaying_via_wal = wal_replay.is_some(),
+            "subscriber connected",
+        );
         Ok(Self {
             ring,
             #[cfg(unix)]

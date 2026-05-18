@@ -112,6 +112,12 @@ pub struct Wal {
     /// `mono_base.elapsed()` call.  Staleness: up to
     /// `fsync_interval` (5 ms default).  See [`Self::current_ts`].
     cached_ts: Arc<AtomicU64>,
+    /// Observability: monotonic counts surfaced via [`Self::stats`].
+    /// Use Relaxed ordering — these are pure observability, not
+    /// synchronization; the ~1 ns hot-path cost is acceptable.
+    appends_total: Arc<AtomicU64>,
+    append_bytes_total: Arc<AtomicU64>,
+    flushes_total: Arc<AtomicU64>,
     /// Wall + monotonic clock anchors used to (re)compute
     /// `cached_ts`.  The publisher's anchors are NOT shared — each
     /// Wal owns its own.
@@ -250,6 +256,9 @@ impl Wal {
             .unwrap_or(0);
         let mono_base = Instant::now();
         let cached_ts = Arc::new(AtomicU64::new(wall_base_nanos));
+        let appends_total = Arc::new(AtomicU64::new(0));
+        let append_bytes_total = Arc::new(AtomicU64::new(0));
+        let flushes_total = Arc::new(AtomicU64::new(0));
         let inner = Arc::new(Mutex::new(Inner {
             segments,
             segment_sizes,
@@ -263,6 +272,7 @@ impl Wal {
                 durable_cursor.clone(),
                 pending_cursor_atomic.clone(),
                 cached_ts.clone(),
+                flushes_total.clone(),
                 wall_base_nanos,
                 mono_base,
                 shutdown.clone(),
@@ -273,7 +283,7 @@ impl Wal {
             None
         };
 
-        Ok(Self {
+        let wal = Self {
             dir: wal_dir,
             cfg,
             writer: writer_slot,
@@ -284,12 +294,28 @@ impl Wal {
             active_bytes: active_bytes_atomic,
             retained_bytes: retained_bytes_atomic,
             cached_ts,
+            appends_total,
+            append_bytes_total,
+            flushes_total,
             wall_base_nanos,
             mono_base,
             shutdown,
             flusher_thread,
             poisoned,
-        })
+        };
+        tracing::info!(
+            target: "mmbus::wal::v2",
+            dir = %wal.dir.display(),
+            pending_cursor = wal.pending_cursor.load(Ordering::Acquire),
+            durable_cursor = wal.durable_cursor.load(Ordering::Acquire),
+            active_bytes = wal.active_bytes.load(Ordering::Acquire),
+            retained_bytes = wal.retained_bytes.load(Ordering::Acquire),
+            fsync_policy = ?wal.cfg.fsync_policy,
+            segment_size_max = wal.cfg.segment_size_max,
+            retention_bytes = wal.cfg.retention_bytes,
+            "wal::v2 opened",
+        );
+        Ok(wal)
     }
 
     /// Current wall-clock timestamp in unix nanos for use in WAL
@@ -389,6 +415,9 @@ impl Wal {
         self.pending_cursor.store(next_cursor, Ordering::Release);
         let new_active_bytes = writer.current_tail();
         self.active_bytes.store(new_active_bytes, Ordering::Release);
+        self.appends_total.fetch_add(1, Ordering::Relaxed);
+        self.append_bytes_total
+            .fetch_add(payload.len() as u64, Ordering::Relaxed);
 
         // Retention: cheap atomic-based pre-check; only take the
         // slow lock if we actually need to prune.
@@ -405,6 +434,7 @@ impl Wal {
             // syscall doesn't block concurrent appends.
             writer.flush_sync()?;
             self.durable_cursor.store(next_cursor, Ordering::Release);
+            self.flushes_total.fetch_add(1, Ordering::Relaxed);
         }
 
         Ok(())
@@ -415,6 +445,7 @@ impl Wal {
     pub fn fsync(&self) -> Result<(), WalError> {
         if let Some(w) = self.writer.load_full() {
             w.flush_sync()?;
+            self.flushes_total.fetch_add(1, Ordering::Relaxed);
         }
         self.durable_cursor
             .store(self.pending_cursor.load(Ordering::Acquire), Ordering::Release);
@@ -484,6 +515,9 @@ impl Wal {
             total_wal_bytes: self.retained_bytes.load(Ordering::Acquire)
                 + self.active_bytes.load(Ordering::Acquire),
             segments,
+            appends_total: self.appends_total.load(Ordering::Relaxed),
+            append_bytes_total: self.append_bytes_total.load(Ordering::Relaxed),
+            flushes_total: self.flushes_total.load(Ordering::Relaxed),
         }
     }
 
@@ -509,6 +543,13 @@ impl Wal {
             self.active_bytes.store(new_w.current_tail(), Ordering::Release);
             self.writer.store(Some(Arc::new(new_w)));
             drop(old_arc);
+            tracing::info!(
+                target: "mmbus::wal",
+                old_first_cursor = first,
+                new_first_cursor,
+                bytes = final_bytes,
+                "wal segment rotated",
+            );
         } else {
             // No writer yet — first append after a deferred-create.
             // Just open the segment + publish via active.dat.
@@ -518,6 +559,11 @@ impl Wal {
             self.active_bytes.store(w.current_tail(), Ordering::Release);
             self.writer.store(Some(Arc::new(w)));
             self.active.store_active(new_first_cursor)?;
+            tracing::info!(
+                target: "mmbus::wal",
+                new_first_cursor,
+                "wal first segment opened",
+            );
         }
         Ok(())
     }
@@ -542,10 +588,18 @@ impl Wal {
                     if let Some(path) = inner.segments.remove(&k) {
                         let _ = fs::remove_file(&path);
                     }
-                    if let Some(size) = inner.segment_sizes.remove(&k) {
+                    let pruned_bytes = inner.segment_sizes.remove(&k).unwrap_or(0);
+                    if pruned_bytes > 0 {
                         self.retained_bytes
-                            .fetch_sub(size, Ordering::Release);
+                            .fetch_sub(pruned_bytes, Ordering::Release);
                     }
+                    tracing::info!(
+                        target: "mmbus::wal",
+                        first_cursor = k,
+                        bytes_pruned = pruned_bytes,
+                        retention_cap = self.cfg.retention_bytes,
+                        "wal retention pruned segment",
+                    );
                 }
                 None => return Ok(()),
             }
@@ -622,6 +676,7 @@ fn spawn_flusher_thread(
     durable_cursor: Arc<AtomicU64>,
     pending_cursor: Arc<AtomicU64>,
     cached_ts: Arc<AtomicU64>,
+    flushes_total: Arc<AtomicU64>,
     wall_base_nanos: u64,
     mono_base: Instant,
     shutdown: Arc<AtomicBool>,
@@ -662,6 +717,7 @@ fn spawn_flusher_thread(
             match flush_result {
                 Ok(()) => {
                     durable_cursor.store(snapshot, Ordering::Release);
+                    flushes_total.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(_) => {
                     poisoned.store(true, Ordering::Release);

@@ -14,4 +14,19 @@ pub struct TopicStats {
 
     /// WAL state when `BusConfig::wal.enabled = true`; otherwise `None`.
     pub wal: Option<WalStats>,
+
+    /// Monotonic count of successful publishes since this Publisher
+    /// was created.  Use `rate(published_total[1m])` for a per-
+    /// second publish rate in Prometheus.
+    pub published_total: u64,
+
+    /// Monotonic count of publishes rejected with `Error::Full`
+    /// (only fires under `BackpressurePolicy::Error`; DropOldest
+    /// never rejects).
+    pub full_rejected_total: u64,
+
+    /// Monotonic count of subscribers dropped by the publisher
+    /// because their wakeup call failed (typically: peer closed
+    /// the connection / process died).
+    pub subscribers_dropped_total: u64,
 }
