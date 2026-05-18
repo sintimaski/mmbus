@@ -130,6 +130,10 @@ pub(crate) mod linux {
         // prefix; we write one c_int there. iov references `dummy` on
         // the stack which lives until `sendmsg` returns.
         unsafe {
+            // CMSG_FIRSTHDR returns `*mut cmsghdr` on Linux but
+            // `*const cmsghdr` on macOS — the cast is necessary on
+            // one and a no-op on the other.
+            #[allow(clippy::unnecessary_cast)]
             let cmsg = libc::CMSG_FIRSTHDR(&msg) as *mut libc::cmsghdr;
             (*cmsg).cmsg_level = libc::SOL_SOCKET;
             (*cmsg).cmsg_type = libc::SCM_RIGHTS;

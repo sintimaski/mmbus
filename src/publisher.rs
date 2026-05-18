@@ -27,7 +27,12 @@ use std::thread;
 
 /// Per-subscriber connection state held by the publisher.
 struct Client {
+    /// On macOS, the wakeup channel — see [`Client::wake`].  On
+    /// Linux, held only to keep the handshake socket alive (we
+    /// wake via eventfd) so the peer detects publisher death via
+    /// EOF on its end.  Hence the dead-code allow on Linux.
     #[cfg(unix)]
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     sock: UnixStream,
 
     /// On Linux: the write-end of the subscriber's eventfd, received via
