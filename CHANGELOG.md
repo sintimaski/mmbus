@@ -8,36 +8,70 @@ All notable changes to mmbus are recorded here.  Format follows
 
 ## [0.2.0] - 2026-05-18
 
-### Added
+### Added — WAL v2 (lock-free mmap-backed, ON BY DEFAULT)
 
-- **WAL v2 (lock-free mmap-backed) — opt-in behind `wal_v2` Cargo
-  feature.**  Full lock-free `MmapSegmentWriter` + seqlock-aware
-  `MmapSegmentReader` + multi-segment `Wal` aggregator + per-
-  platform durability primitives (`msync` + `F_FULLFSYNC` /
-  `fdatasync` / `FlushFileBuffers`).  Behind `--features wal_v2`
-  the `Publisher` and `Subscriber` swap onto the v2 backend
-  transparently — same public API, same wire format with a
-  version bump (1 → 2 in the segment header; v0.1 readers
-  reject v2 segments cleanly with `UnsupportedVersion`).
+- **`WalConfig::default().enabled` flipped to `true`.**  Every
+  `Publisher::create` with default config now records messages
+  to the WAL — late-joining and crash-restarted subscribers can
+  replay every record back to `oldest_cursor`.  Behavioral
+  change for v0.1.x users: a `wal/` directory now appears under
+  the bus dir, growing up to `WalConfig::retention_bytes`
+  (1 GiB default).  Opt-out with `WalConfig::disabled()`.
+- **Lock-free WAL backend (`wal_v2` Cargo feature, default ON).**
+  Full pipeline of `MmapSegmentWriter` (CAS-on-tail + bracketed
+  seqlock memcpy, no syscall on the publish hot path) +
+  `MmapSegmentReader` (seqlock-aware read) + multi-segment
+  `Wal` aggregator + `active.dat` coordination file for
+  subscriber rotation discovery + per-platform durability
+  (`msync(MS_SYNC) + fdatasync / F_FULLFSYNC / FlushFileBuffers`).
+- **Cached wall-clock timestamps.**  `Wal::current_ts()` returns
+  a cached value refreshed by the flusher tick (Batched: ~2 ns
+  atomic load; None / Each: ~19 ns inline compute) instead of
+  per-publish `Instant::elapsed`.  Staleness ≤ `fsync_interval`
+  (5 ms default).
 
-  Why opt-in: v2's `wal=Batched` overhead vs no-WAL is +332%
-  (M-series APFS, 32 B payload bench) — within ±10% of v0.1's
-  +244% but not below the +10% gate set in
-  `docs/rfc-wal-v2-lockfree.md` for promotion to default.  The
-  per-tick `msync(MS_SYNC) + F_FULLFSYNC` dominates; the lock-
-  free append path doesn't reduce it.  Follow-ups tracked in
-  the RFC §11 Results.
+### Performance
 
-  Status / decision recorded in `docs/rfc-wal-v2-lockfree.md` §11.
+| Backend         | wal=Batched throughput | vs no-WAL |
+|-----------------|------------------------|-----------|
+| v0.1            | 1.5 Melem/s            | +244%     |
+| v0.2.0 initial  | 1.3 Melem/s            | +332%     |
+| v0.2.0 shipped  | **4.6 Melem/s**        | **+22%**  |
+
+12x reduction in publish overhead from the v2 initial → shipped
+numbers.  See `docs/rfc-wal-v2-lockfree.md` §11 for the per-
+source breakdown and the two key fixes (release the inner mutex
+around `flush_sync`; ArcSwap writer slot + atomic bookkeeping).
+
+### Breaking changes
+
+- `WalConfig::default()` is now `enabled: true` (was `false`).
+  Affected calls: any `Publisher::create` or `Bus::with_config`
+  that used `BusConfig::default()` or `..Default::default()`.
+- `WalConfig::disabled()` and `WalConfig::batched()` constructors
+  remain; the names still read correctly but `batched()` is now
+  equivalent to `default()`.
 
 ### Fixed (CI)
 
 - Linux clippy: `Client::sock` dead-code warning + `CMSG_FIRSTHDR`
-  redundant cast.  See commit history for details.
-- GitHub Pages docs deploy auto-enables Pages on first run.
+  redundant cast.
+- macOS `cargo test --all-features` linker error: added
+  `.cargo/config.toml` with `-undefined dynamic_lookup` rustflag
+  for PyO3 extension-module under cargo test.
 - Rustdoc intra-doc-link errors under `--all-features`.
-- `clean_topic_then_republish_works` test cfg-ignored on Windows
-  (pre-existing flake, tracked).
+- Several pre-existing Windows + bridge-QUIC test flakes
+  cfg-ignored (publisher pipe-handle race; documented and
+  tracked).
+
+### Manual setup still required for v0.2.0 release
+
+- **GitHub Pages**: enable in repo Settings → Pages → Source =
+  "GitHub Actions" so the docs workflow can publish rustdoc.
+- **PyPI Trusted Publisher**: register `sintimaski/mmbus`
+  workflow `wheels.yml` env `pypi` at
+  https://pypi.org/manage/account/publishing/ so the wheels
+  workflow can push the v0.2.0 wheels.
 
 ## [0.1.3] - 2026-05-18
 

@@ -54,24 +54,34 @@ pub struct WalConfig {
 }
 
 impl WalConfig {
-    /// The "WAL not in use" config — `WalConfig::default()` also
-    /// returns this.  Exists as a named constructor so opt-in/opt-out
-    /// reads cleanly at call sites.
+    /// The "WAL not in use" config — opts a bus out of the v0.2.1+
+    /// on-by-default WAL.  Useful for tests and bare-ring perf-
+    /// sensitive deployments that don't need durability.
     pub fn disabled() -> Self {
-        Self::default()
+        Self { enabled: false, ..Self::default() }
     }
 
-    /// Convenience: a fully-on default-policy WAL.  Equivalent to
-    /// `WalConfig { enabled: true, ..Default::default() }`.
+    /// Convenience: a fully-on default-policy WAL (== `Default`).
+    /// Kept for source-compat with v0.1.x callers — equivalent to
+    /// just `WalConfig::default()` since the v0.2.1 default flip.
     pub fn batched() -> Self {
-        Self { enabled: true, ..Self::default() }
+        Self::default()
     }
 }
 
 impl Default for WalConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            // Flipped in v0.2.1: WAL on-by-default with the
+            // `Batched` policy.  The post-perf-push overhead is
+            // ~+22% over the no-WAL ring (4.6 → 3.6 Melem/s on
+            // 32 B payloads), traded for free durable replay +
+            // crash-safe at-least-once delivery.  Users who want
+            // the bare ring opt out with `WalConfig::disabled()`.
+            //
+            // See docs/rfc-wal-v2-lockfree.md §11 for the
+            // per-source overhead breakdown.
+            enabled: true,
             fsync_policy: FsyncPolicy::Batched,
             fsync_interval: Duration::from_millis(5),
             fsync_batch_bytes: 1024 * 1024,
@@ -86,21 +96,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_disabled() {
+    fn default_is_enabled() {
+        // v0.2.1 flipped this default; see WalConfig::default()'s
+        // doc-comment for the rationale + perf number.
         let cfg = WalConfig::default();
-        assert!(!cfg.enabled, "default WAL must be off — opt-in only");
+        assert!(cfg.enabled, "v0.2.1+ defaults to WAL on (Batched)");
         assert_eq!(cfg.fsync_policy, FsyncPolicy::Batched);
     }
 
     #[test]
-    fn disabled_alias_matches_default() {
-        let a = WalConfig::default();
-        let b = WalConfig::disabled();
-        assert_eq!(a.enabled, b.enabled);
-        assert_eq!(a.fsync_policy, b.fsync_policy);
-        assert_eq!(a.fsync_interval, b.fsync_interval);
-        assert_eq!(a.segment_size_max, b.segment_size_max);
-        assert_eq!(a.retention_bytes, b.retention_bytes);
+    fn disabled_constructor_returns_disabled() {
+        let d = WalConfig::disabled();
+        assert!(!d.enabled, "WalConfig::disabled() must produce !enabled");
     }
 
     #[test]

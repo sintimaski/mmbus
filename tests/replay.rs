@@ -1,5 +1,6 @@
 //! Phase-A in-ring replay: `subscribe_with_history` + `subscribe_from`.
 
+use mmbus::wal::WalConfig;
 use mmbus::{Bus, BusConfig, Error};
 use std::hint::spin_loop;
 use std::time::Duration;
@@ -9,6 +10,12 @@ fn cfg(name: &str) -> BusConfig {
         capacity: 32,
         slot_size: 16,
         base_dir: std::env::temp_dir().join("mmreplay").join(name),
+        // This file tests Phase-A in-ring replay specifically — WAL
+        // OFF so the ring wrap is the only history mechanism.
+        // (v0.2.1 flipped the default WAL to on; without this opt-out
+        // the WAL would satisfy subscribe_from(very_old) and
+        // CursorTooOld would never fire.)
+        wal: WalConfig::disabled(),
         ..Default::default()
     }
 }

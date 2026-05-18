@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwapOption;
 
@@ -105,6 +105,18 @@ pub struct Wal {
     /// active <= cap` without a lock.  Mutated only by rotation +
     /// retention (both serialized under `inner` mutex).
     retained_bytes: Arc<AtomicU64>,
+    /// Cached wall-clock ts (unix nanos).  Refreshed by the flusher
+    /// thread every `fsync_interval` (Batched) or computed inline
+    /// per-publish (None / Each — no refresh thread).  Hot append
+    /// path reads it via a single atomic load instead of a 19 ns
+    /// `mono_base.elapsed()` call.  Staleness: up to
+    /// `fsync_interval` (5 ms default).  See [`Self::current_ts`].
+    cached_ts: Arc<AtomicU64>,
+    /// Wall + monotonic clock anchors used to (re)compute
+    /// `cached_ts`.  The publisher's anchors are NOT shared — each
+    /// Wal owns its own.
+    wall_base_nanos: u64,
+    mono_base: Instant,
     shutdown: Arc<AtomicBool>,
     flusher_thread: Option<JoinHandle<()>>,
     poisoned: Arc<AtomicBool>,
@@ -227,6 +239,17 @@ impl Wal {
         let retained_bytes_atomic = Arc::new(AtomicU64::new(retained_bytes));
         let writer_slot: Arc<ArcSwapOption<MmapSegmentWriter>> =
             Arc::new(ArcSwapOption::from(writer));
+        // Wall-clock anchor — captured once, then ts is computed as
+        // wall_base + Instant::elapsed.  cached_ts starts at
+        // wall_base; the flusher (Batched) refreshes it every
+        // fsync_interval, or it gets refreshed inline on a stale
+        // read (None / Each have no flusher).
+        let wall_base_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let mono_base = Instant::now();
+        let cached_ts = Arc::new(AtomicU64::new(wall_base_nanos));
         let inner = Arc::new(Mutex::new(Inner {
             segments,
             segment_sizes,
@@ -239,6 +262,9 @@ impl Wal {
                 writer_slot.clone(),
                 durable_cursor.clone(),
                 pending_cursor_atomic.clone(),
+                cached_ts.clone(),
+                wall_base_nanos,
+                mono_base,
                 shutdown.clone(),
                 poisoned.clone(),
                 cfg.fsync_interval,
@@ -257,10 +283,28 @@ impl Wal {
             pending_cursor: pending_cursor_atomic,
             active_bytes: active_bytes_atomic,
             retained_bytes: retained_bytes_atomic,
+            cached_ts,
+            wall_base_nanos,
+            mono_base,
             shutdown,
             flusher_thread,
             poisoned,
         })
+    }
+
+    /// Current wall-clock timestamp in unix nanos for use in WAL
+    /// records.  Cheap (~2 ns: one atomic load) for the Batched
+    /// flusher-tick policy; inline fresh compute (~19 ns) for
+    /// `None` / `Each` since they have no refresh thread.
+    /// Staleness for Batched: up to `fsync_interval` (5 ms default).
+    pub fn current_ts(&self) -> u64 {
+        match self.cfg.fsync_policy {
+            FsyncPolicy::Batched => self.cached_ts.load(Ordering::Relaxed),
+            FsyncPolicy::None | FsyncPolicy::Each => {
+                self.wall_base_nanos
+                    .saturating_add(self.mono_base.elapsed().as_nanos() as u64)
+            }
+        }
     }
 
     /// Append one record.  Rotates the active segment if the record
@@ -577,6 +621,9 @@ fn spawn_flusher_thread(
     writer: Arc<ArcSwapOption<MmapSegmentWriter>>,
     durable_cursor: Arc<AtomicU64>,
     pending_cursor: Arc<AtomicU64>,
+    cached_ts: Arc<AtomicU64>,
+    wall_base_nanos: u64,
+    mono_base: Instant,
     shutdown: Arc<AtomicBool>,
     poisoned: Arc<AtomicBool>,
     fsync_interval: Duration,
@@ -590,6 +637,14 @@ fn spawn_flusher_thread(
                 continue;
             }
             next_tick = now + fsync_interval;
+
+            // Refresh the cached ts so publishers reading it via
+            // `Wal::current_ts()` see fresh-ish values without
+            // paying 19 ns of Instant::elapsed per publish.
+            // Staleness bounded by fsync_interval.
+            let ts = wall_base_nanos
+                .saturating_add(mono_base.elapsed().as_nanos() as u64);
+            cached_ts.store(ts, Ordering::Relaxed);
 
             // Snapshot the pending cursor BEFORE flushing so anything
             // that lands after our msync isn't falsely marked durable.

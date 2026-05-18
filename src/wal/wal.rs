@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::wal::config::{FsyncPolicy, WalConfig};
 use crate::wal::record::{Record, MAX_PAYLOAD_LEN};
@@ -75,6 +75,13 @@ pub struct Wal {
     /// subsequent appends should return `WalError::Poisoned` rather
     /// than silently dropping durability.
     poisoned: Arc<AtomicBool>,
+    /// Wall-clock anchors for [`Self::current_ts`].  The publisher
+    /// pulls per-record ts via this method so the v2 backend can
+    /// substitute a cached value (refreshed by its flusher); v0.1
+    /// just computes inline here, preserving its existing per-
+    /// publish overhead.
+    wall_base_nanos: u64,
+    mono_base: Instant,
 }
 
 /// State guarded by the inner Mutex.  `writer` is `Option` because
@@ -213,6 +220,12 @@ impl Wal {
             None
         };
 
+        let wall_base_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let mono_base = Instant::now();
+
         Ok(Self {
             dir: wal_dir,
             cfg,
@@ -222,7 +235,20 @@ impl Wal {
             shutdown,
             flusher_thread,
             poisoned,
+            wall_base_nanos,
+            mono_base,
         })
+    }
+
+    /// Current wall-clock timestamp for record stamping.  v0.1
+    /// computes inline (same cost as today's publisher-side path);
+    /// v0.2's `current_ts` overrides this with a cached version
+    /// updated by the flusher.  Publisher calls this method
+    /// instead of inlining the compute so the v2 win flows through
+    /// the type-alias swap.
+    pub fn current_ts(&self) -> u64 {
+        self.wall_base_nanos
+            .saturating_add(self.mono_base.elapsed().as_nanos() as u64)
     }
 
     /// Append one record.  Rotates the active segment if it would

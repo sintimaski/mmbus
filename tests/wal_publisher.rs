@@ -226,6 +226,9 @@ fn disabled_wal_leaves_publisher_and_stats_unchanged() {
         capacity: 16,
         slot_size: 32,
         base_dir: std::env::temp_dir().join("mmbus_wal_pub").join("disabled"),
+        // v0.2.1 flipped Default WAL → on; this test specifically
+        // verifies the disabled case so opt out explicitly.
+        wal: WalConfig::disabled(),
         ..Default::default()
     };
     cleanup(&cfg);

@@ -6,7 +6,7 @@ use crate::stats::TopicStats;
 use crate::wal::Wal;
 use std::fs;
 use std::io;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
@@ -111,14 +111,6 @@ pub struct Publisher {
     /// the WAL *before* the ring write — a failed WAL append leaves
     /// the ring untouched (caller can retry).
     wal: Option<Wal>,
-    /// Cached wall-clock anchor — `wall_base_nanos` is the unix-time
-    /// nanoseconds at `mono_base`.  Per-publish WAL timestamps are
-    /// computed as `wall_base_nanos + (Instant::now() - mono_base)`
-    /// which avoids a per-publish `clock_gettime(CLOCK_REALTIME)` —
-    /// `Instant::now()` is the cheaper monotonic clock on every
-    /// supported platform.
-    wall_base_nanos: u64,
-    mono_base: Instant,
 }
 
 impl Publisher {
@@ -189,11 +181,6 @@ impl Publisher {
             backpressure: cfg.backpressure,
             _lock: lock,
             wal,
-            wall_base_nanos: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0),
-            mono_base: Instant::now(),
         })
     }
 
@@ -231,9 +218,9 @@ impl Publisher {
                 return Err(Error::Full);
             }
             let cursor = self.ring.current_tail();
-            let ts = self
-                .wall_base_nanos
-                .saturating_add(self.mono_base.elapsed().as_nanos() as u64);
+            // wal.current_ts() — cached (v2 Batched, ~2 ns atomic
+            // load) or inline-computed (v0.1 + v2 None/Each, ~19 ns).
+            let ts = wal.current_ts();
             wal.append(cursor, ts, data)?;
         }
 
@@ -294,9 +281,7 @@ impl Publisher {
                     break; // partial publish; caller sees `count < items.len()`
                 }
                 let cursor = self.ring.current_tail();
-                let ts = self
-                    .wall_base_nanos
-                    .saturating_add(self.mono_base.elapsed().as_nanos() as u64);
+                let ts = wal.current_ts();
                 if let Err(e) = wal.append(cursor, ts, data) {
                     if count > 0 {
                         self.broadcast_wakeup();
