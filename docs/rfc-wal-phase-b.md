@@ -6,28 +6,33 @@ perf optimisation pass (see "Results" below).
 
 **Owner:** _unassigned_
 
-## Results (W1-f bench, 2026-05-17)
+## Results
 
 `benches/publish_with_wal.rs`, 32 B payload, capacity 4096, macOS
-25.4 APFS, 10-sample / 2s measurement window:
+25.4 APFS, 10-sample / 3s measurement window:
 
-| Policy        | ns/publish | Overhead vs baseline |
-|---------------|-----------:|---------------------:|
-| no WAL        |        185 |                    — |
-| `wal=None`    |        275 |                 +49% |
-| `wal=Batched` |        767 |                +315% |
-| `wal=Each`    |  3,700,000 | catastrophic (fsync) |
+| Policy        | W1-f (2026-05-17) | W2 opt (2026-05-18) | Overhead vs baseline |
+|---------------|------------------:|--------------------:|---------------------:|
+| no WAL        |        185 ns     |        185 ns       |                    — |
+| `wal=None`    |        275 ns     |        272 ns       |                 +47% |
+| `wal=Batched` |        767 ns     |        656 ns       |                +254% |
+| `wal=Each`    |        3.7 ms     |        3.8 ms       | catastrophic (fsync) |
 
-`Batched` overshoots the planned <10% regression gate, so the
-default-policy flip is deferred.  Investigation candidates:
+**W2 optimisation pass shipped:**
 
-1. `SystemTime::now()` per publish — replace with a coarse clock
-   or make the timestamp publisher-supplied.
-2. Mutex contention between `publish()` and the flusher thread —
-   the writer's `BufWriter::write_all` happens under the same lock
-   the flusher acquires every `fsync_interval`.
-3. A lock-free SPSC ring between publisher and a dedicated WAL
-   writer thread.
+1. ✅ `SystemTime::now()` per publish — replaced with cached
+   `(wall_base_nanos, Instant)` snapshot at `Publisher::create`; per
+   publish is now a cheap `Instant::now() + offset`.
+2. ✅ Mutex contention between `publish()` and the flusher — flusher
+   now holds the WAL mutex only for `BufWriter::flush() + try_clone(fd)`
+   (~µs), then releases it before the multi-ms `sync_data` runs on
+   the cloned fd.
+
+**Still open:**
+
+3. Lock-free SPSC ring between publisher and a dedicated WAL writer
+   thread.  Likely needed to close the remaining +254% Batched gap to
+   the <10% default-flip target.
 
 Acceptance tests (`tests/wal_acceptance.rs`, 7 scenarios) all pass
 under every policy.

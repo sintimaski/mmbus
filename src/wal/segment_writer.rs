@@ -124,6 +124,36 @@ impl SegmentWriter {
         Ok(self.durable_cursor)
     }
 
+    /// Two-phase fsync for the batched flusher: flush the BufWriter
+    /// into the kernel page cache, clone the file descriptor, and
+    /// return `(clone, pending_cursor_at_flush)`.  The caller can
+    /// release the WAL mutex and run `sync_data()` on the clone
+    /// without blocking concurrent publishers — `sync_data` on any
+    /// fd pointing at the same file flushes the inode's dirty data,
+    /// so the clone is just as durable as the original.
+    ///
+    /// Pair with [`Self::record_durable_at`] once the off-mutex
+    /// `sync_data` returns so the writer's `durable_cursor` stays
+    /// in sync.
+    pub fn flush_for_external_fsync(
+        &mut self,
+    ) -> Result<(std::fs::File, u64), WriterError> {
+        self.file.flush()?;
+        let clone = self.file.get_ref().try_clone()?;
+        Ok((clone, self.pending_cursor))
+    }
+
+    /// Update `durable_cursor` after an off-mutex `sync_data` has
+    /// completed for the cursor captured by
+    /// [`Self::flush_for_external_fsync`].  Caller is responsible
+    /// for ensuring monotonicity (the batched flusher always passes
+    /// a value >= the previous `durable_cursor`).
+    pub fn record_durable_at(&mut self, durable: u64) {
+        if durable > self.durable_cursor {
+            self.durable_cursor = durable;
+        }
+    }
+
     /// Final fsync + drop.  Equivalent to `fsync()` then letting
     /// the writer fall out of scope; named separately so callers
     /// can explicit the close point.

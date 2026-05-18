@@ -97,6 +97,14 @@ pub struct Publisher {
     /// the WAL *before* the ring write — a failed WAL append leaves
     /// the ring untouched (caller can retry).
     wal: Option<Wal>,
+    /// Cached wall-clock anchor — `wall_base_nanos` is the unix-time
+    /// nanoseconds at `mono_base`.  Per-publish WAL timestamps are
+    /// computed as `wall_base_nanos + (Instant::now() - mono_base)`
+    /// which avoids a per-publish `clock_gettime(CLOCK_REALTIME)` —
+    /// `Instant::now()` is the cheaper monotonic clock on every
+    /// supported platform.
+    wall_base_nanos: u64,
+    mono_base: Instant,
 }
 
 impl Publisher {
@@ -167,6 +175,11 @@ impl Publisher {
             backpressure: cfg.backpressure,
             _lock: lock,
             wal,
+            wall_base_nanos: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0),
+            mono_base: Instant::now(),
         })
     }
 
@@ -198,10 +211,9 @@ impl Publisher {
 
         if let Some(wal) = self.wal.as_ref() {
             let cursor = self.ring.current_tail();
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0);
+            let ts = self
+                .wall_base_nanos
+                .saturating_add(self.mono_base.elapsed().as_nanos() as u64);
             wal.append(cursor, ts, data)?;
         }
 

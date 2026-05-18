@@ -47,18 +47,23 @@ All notable changes to mmbus are recorded here.  Format follows
 
 ### Bench results (32 B payload, capacity 4096, macOS 25.4 APFS)
 
-| Policy        | ns/publish | Overhead vs baseline |
-|---------------|-----------:|---------------------:|
-| no WAL        |        185 |                    — |
-| `wal=None`    |        275 |                 +49% |
-| `wal=Batched` |        767 |                +315% |
-| `wal=Each`    |  3,700,000 | catastrophic (fsync) |
+| Policy        | ns/publish (W1-f) | ns/publish (W2 opt) | Overhead vs baseline |
+|---------------|------------------:|--------------------:|---------------------:|
+| no WAL        |               185 |                 185 |                    — |
+| `wal=None`    |               275 |                 272 |                 +47% |
+| `wal=Batched` |               767 |                 656 |                +254% |
+| `wal=Each`    |         3,700,000 |           3,800,000 | catastrophic (fsync) |
 
-`Batched` exceeds the planned <10% gate, so the default stays at
-`WalConfig::disabled()`.  Optimisation follow-ups (drop the
-per-publish `SystemTime::now`, reduce mutex contention against the
-flusher thread, lock-free batch) tracked before flipping the
-default.
+W2 optimisation pass: (a) flusher thread's multi-ms `sync_data` now
+runs OUTSIDE the WAL mutex — only the BufWriter flush + fd clone are
+under the lock; (b) per-publish `SystemTime::now()` replaced with a
+cached wall-clock offset + cheap `Instant::now()`.  Net: Batched
+overhead drops 315% → 254% (-14%); other policies are unchanged
+within noise.
+
+Still well above the planned <10% gate, so the default stays at
+`WalConfig::disabled()`.  Closing the gap further likely needs a
+lock-free SPSC handoff between publisher and flusher (a v0.2.x item).
 
 ## [0.1.0] - first public release
 

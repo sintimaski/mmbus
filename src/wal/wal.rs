@@ -488,19 +488,37 @@ fn spawn_flusher_thread(
                 continue;
             }
             next_tick = now + fsync_interval;
-            let mut guard = match inner.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            if let Some(w) = guard.writer.as_mut() {
-                match w.fsync() {
-                    Ok(d) => durable_cursor.store(d, Ordering::Release),
+
+            // Phase 1 (mutex held): flush BufWriter into the kernel
+            // page cache, then clone the underlying fd.  Fast — no
+            // disk I/O, just a memcpy + write(2).
+            let (file_clone, pending) = {
+                let mut guard = match inner.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                let Some(w) = guard.writer.as_mut() else {
+                    continue;
+                };
+                match w.flush_for_external_fsync() {
+                    Ok(pair) => pair,
                     Err(_) => {
                         poisoned.store(true, Ordering::Release);
                         return;
                     }
                 }
+            };
+
+            // Phase 2 (mutex released): the multi-ms sync_data runs
+            // here without blocking concurrent publishers.  The
+            // SegmentWriter's own `durable_cursor` field is internal
+            // bookkeeping only — Wal::stats() reads the atomic, so
+            // we skip re-acquiring the mutex just to mirror it.
+            if file_clone.sync_data().is_err() {
+                poisoned.store(true, Ordering::Release);
+                return;
             }
+            durable_cursor.store(pending, Ordering::Release);
         }
     })
 }
