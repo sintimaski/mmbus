@@ -10,7 +10,85 @@ WAL v2 (lock-free mmap-backed) implementation work — RFC + plan
 landed, code gated behind `--features wal_v2` and tracked by
 tasks W2-1..W2-8.  See `docs/rfc-wal-v2-lockfree.md`.
 
-## [0.1.0] - 2026-05-18 — first public release
+## [0.1.1] - 2026-05-18
+
+Python throughput + development-process polish on top of the
+v0.1.0 release.  No wire-format change, no API removal — pure
+additions + perf.
+
+### Added — Python batch APIs
+
+- **`Subscription.recv_batch(n, timeout_secs) -> list[bytes]`** —
+  drains up to `n` messages amortising per-call PyO3 + GIL
+  dispatch.  Blocks for the FIRST message up to `timeout_secs`
+  (GIL released), then drains non-blockingly with the GIL HELD.
+  Returns empty list on timeout.
+- **`Bus.publish_many(topic, payloads) -> int`** — batched
+  publish that fires ONE wakeup syscall per subscriber regardless
+  of N.  Pairs with `recv_batch` for end-to-end backlog
+  throughput.  Returns count actually written (less than
+  `len(payloads)` under `Error` backpressure when the ring fills
+  mid-batch; equals `len(payloads)` under `drop_oldest`).
+- **`Subscription.recv_into_buffer(buf, payload_size, timeout_secs)
+  -> int`** — zero-alloc fixed-size recv.  `buf` is any writable,
+  C-contiguous bytes-like (`bytearray`, `memoryview`, or numpy
+  uint8 array); drains up to `len(buf) // payload_size` messages
+  directly into rows.  Every drained payload must be exactly
+  `payload_size` bytes; mismatch raises `ValueError`.  Backed by
+  a new lock-free `RingBuffer::try_receive_into_slice` so ring
+  slot bytes memcpy straight into the user buffer — no `Vec<u8>`
+  or `PyBytes` intermediate.
+- **Rust buffer-reuse API** (foundation for the above): new
+  `Subscriber::receive_into`, `try_receive_into`,
+  `receive_timeout_into` + matching `Subscription::*_into` +
+  `Subscriber::try_receive_into_slice`.  `PySubscription` holds
+  a reusable `recv_buf` and `PyBytes::new_bound_with` writes
+  directly into the PyBytes allocation — no Vec intermediate on
+  the single-recv path either.
+- **`mmbus.WalError`** Python exception class — surfaces
+  non-cursor WAL failures (`Poisoned`, `PayloadTooLarge`,
+  underlying I/O).
+
+### Bench — end-to-end pub/sub (5k 32 B msgs, macOS arm64, CPython 3.9)
+
+| Pairing                                          | ns/msg | vs baseline |
+|--------------------------------------------------|-------:|------------:|
+| `publish()` × `recv()` (baseline)                |  1,741 |           — |
+| `publish_many(64)` × `recv()`                    |    536 | 3.2× faster |
+| `publish_many(256)` × `recv()`                   |    420 | 4.1× faster |
+| `publish_many(1024)` × `recv_batch(1024)`        |    335 | 5.2× faster |
+| `publish_many(1024)` × `recv_into_buffer(1024)`  |    325 | 5.4× faster |
+
+Largest lever is `publish_many` — collapsing N per-publish
+wakeup syscalls (eventfd_write / Unix-socket send /
+ReleaseSemaphore) into one drops publish-side from ~1500 to
+~200 ns/msg.  Use `recv()` for low-rate live streams (batch
+APIs don't help when the publisher is the bottleneck); use
+`publish_many` + `recv_batch` / `recv_into_buffer` for
+high-throughput burst workloads.
+
+### Added — development harness scaffolding
+
+Project-local `CLAUDE.md` codifying mmbus's load-bearing
+invariants + hot-path discipline; `CONTRIBUTING.md` workflow
+guide; `.github/PULL_REQUEST_TEMPLATE.md` with the Code Review
+Lanes (A correctness / B security / C perf / D DX-UX / E ops);
+`.github/ISSUE_TEMPLATE/{bug,feature}.md` for structured intake;
+`docs/templates/{spec,task,runbook}-template.md`; first concrete
+runbook at `docs/runbooks/wal-disk-pressure.md`;
+`docs/release-checklist.md`; `deny.toml` + a daily
+`.github/workflows/audit.yml` running `cargo-deny` +
+`cargo-audit` on dep changes.  No runtime impact.
+
+### Added — WAL v2 RFC + plan (preview)
+
+`docs/rfc-wal-v2-lockfree.md` + `docs/plan-wal-v2-lockfree.md`
+describe the lock-free mmap-backed WAL targeted at v0.2.0
+(closes the +244% `wal=Batched` overhead from v0.1.0).  Code
+lives behind the `wal_v2` Cargo feature and is currently empty
+(W2-0 only) — opt in at your own risk during v0.1.x.
+
+## [0.1.0] - 2026-05-17 — first public release
 
 ### Added
 
@@ -228,5 +306,6 @@ high-throughput burst workloads.
 
 This is the first public release.  Wire format starts at v4.
 
-[Unreleased]: https://github.com/sintimaski/mmbus/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/sintimaski/mmbus/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/sintimaski/mmbus/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/sintimaski/mmbus/releases/tag/v0.1.0

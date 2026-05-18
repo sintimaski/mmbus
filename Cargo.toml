@@ -1,6 +1,6 @@
 [package]
 name = "mmbus"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Zero-copy pub/sub over mmap for local IPC"
 license = "MIT"
