@@ -39,4 +39,10 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Audit
-        run: cargo audit
+        # `--ignore RUSTSEC-2025-0020`: PyO3 0.22.6's `PyString::from_object`
+        # advisory.  We don't call that function — verified via grep — so
+        # the risk doesn't apply.  Tracked for resolution in the PyO3
+        # 0.22 → 0.28 migration (v0.2.x).  Matches the parallel ignore
+        # in `deny.toml` (cargo-deny has its own config; cargo-audit
+        # doesn't read it).
+        run: cargo audit --ignore RUSTSEC-2025-0020

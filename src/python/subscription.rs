@@ -12,11 +12,13 @@ use std::time::Duration;
 
 /// Active subscription to a topic.
 ///
-/// Supports both synchronous and context-manager use::
+/// Supports both synchronous and context-manager use:
 ///
-///     with bus.subscribe("events") as sub:
-///         for msg in sub:
-///             print(msg)
+/// ```text
+/// with bus.subscribe("events") as sub:
+///     for msg in sub:
+///         print(msg)
+/// ```
 ///
 /// Use :class:`mmbus.AsyncSubscription` for asyncio.
 #[pyclass(name = "Subscription", module = "mmbus._mmbus")]
@@ -248,17 +250,26 @@ impl PySubscription {
         self.inner.cursor()
     }
 
-    /// The underlying wakeup fd (eventfd on Linux, socket on macOS).
-    /// Pass to ``asyncio.get_event_loop().add_reader()`` for zero-thread async.
-    fn fileno(&self) -> i32 {
-        self.inner.fileno()
+    /// The underlying wakeup primitive — eventfd on Linux, Unix
+    /// socket on macOS, semaphore HANDLE on Windows.  Pass to
+    /// ``asyncio.get_event_loop().add_reader()`` for zero-thread
+    /// async on Unix; on Windows the HANDLE is mostly diagnostic
+    /// (asyncio uses IOCP, not add_reader).
+    ///
+    /// Returned as i64 to fit both Unix `RawFd` (i32) and Windows
+    /// HANDLE (isize, which is i64 on 64-bit targets).  Python
+    /// just sees an int.
+    fn fileno(&self) -> i64 {
+        self.inner.fileno() as i64
     }
 
-    /// Handshake-socket fd for disconnect detection (Linux only differs from
-    /// :meth:`fileno`).  Register this alongside ``fileno`` with the event
-    /// loop so publisher death is detected while idle.
-    fn socket_fileno(&self) -> i32 {
-        self.inner.socket_fileno()
+    /// Handshake-socket fd/HANDLE for disconnect detection.  On
+    /// Linux this differs from :meth:`fileno` (eventfd vs socket);
+    /// on macOS it equals :meth:`fileno`; on Windows this is the
+    /// named-pipe HANDLE value.  Returned as i64 — see
+    /// :meth:`fileno` for the rationale.
+    fn socket_fileno(&self) -> i64 {
+        self.inner.socket_fileno() as i64
     }
 
     /// Non-blocking: drain one wakeup signal and try one ring read.

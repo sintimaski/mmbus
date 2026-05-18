@@ -37,11 +37,18 @@ jobs:
       #  - Native build for macOS / Windows.
       # PyO3 0.22's Python version cap (3.13) is satisfied because the
       # manylinux container ships Python 3.12.
+      # Pin Python to 3.12 so maturin doesn't pick 3.14 (the latest
+       # in maturin-action's cache) and trip PyO3 0.22's max-version
+       # check.  Will be removed in v0.2.x after the PyO3 upgrade.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
-          args: --release --out dist --features python
+          args: --release --out dist --features python --interpreter python3.12
           sccache: "true"
 
       - uses: actions/upload-artifact@v4
