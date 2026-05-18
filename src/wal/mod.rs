@@ -16,6 +16,8 @@ pub mod record;
 pub mod segment_reader;
 pub mod segment_writer;
 pub mod stats;
+#[cfg(feature = "wal_v2")]
+pub mod v2;
 #[allow(clippy::module_inception)]
 pub mod wal;
 

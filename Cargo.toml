@@ -13,6 +13,9 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 python = ["pyo3"]
+# Lock-free mmap-backed WAL (v0.2.0 experimental — see docs/rfc-wal-v2-lockfree.md).
+# Off by default; users opt in for one release of burn-in before promotion in v0.2.1.
+wal_v2 = []
 
 [dependencies]
 memmap2 = "0.9"
