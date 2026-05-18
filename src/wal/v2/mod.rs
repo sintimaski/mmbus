@@ -8,8 +8,12 @@
 //! aggregator + publisher/subscriber integration land in W2-2
 //! through W2-6.
 
+pub mod mmap_segment_reader;
 pub mod mmap_segment_writer;
 
+pub use mmap_segment_reader::{
+    MmapSegmentReader, ReadOutcome, ReaderError, SKIP_TO_END_SENTINEL,
+};
 pub use mmap_segment_writer::{
     align_record_len, AppendOutcome, MmapSegmentWriter, WriterError,
     SEGMENT_VERSION_V2, WRITING_BIT_U32,
