@@ -47,7 +47,7 @@ In-scope:
 We don't have a security mailing list yet.  Until we do, please open
 a GitHub security advisory:
 
-  https://github.com/OWNER/mmbus/security/advisories/new
+  https://github.com/sintimaski/mmbus/security/advisories/new
 
 (Once the repo is public.  In the interim, contact the maintainer
 listed in `Cargo.toml`.)

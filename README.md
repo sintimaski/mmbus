@@ -2,9 +2,8 @@
 
 > Zero-copy pub/sub over `mmap`. No broker. No server. `pip install` and go.
 
-<!-- Docs URL is wired up via .github/workflows/docs.yml — replace OWNER/REPO
-     once the project is published to GitHub. -->
-[API reference (rustdoc)](https://OWNER.github.io/mmbus/) ·
+<!-- Docs URL is published by .github/workflows/docs.yml. -->
+[API reference (rustdoc)](https://sintimaski.github.io/mmbus/) ·
 [Architecture](docs/architecture.md) ·
 [Roadmap](docs/roadmap.md)
 

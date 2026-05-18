@@ -6,81 +6,9 @@ All notable changes to mmbus are recorded here.  Format follows
 
 ## [Unreleased]
 
-### Added
-
-#### WAL Phase B (opt-in durability)
-
-- `BusConfig::wal` — per-bus write-ahead log.  Opt-in (default
-  `WalConfig::disabled()`); enables `subscribe_from(cursor)` to
-  replay arbitrarily-old cursors from on-disk segments instead of
-  only the in-ring history.
-- `WalConfig::fsync_policy` — `None` (no fsync), `Batched` (background
-  flusher every `fsync_interval` or `fsync_batch_bytes`; default),
-  `Each` (fsync inline per publish).
-- `Publisher` opens the WAL when enabled, aligns the ring's tail
-  with the WAL's pending cursor on restart, and appends every
-  record to the WAL before the ring write.  A failed WAL append
-  returns `Error::Wal` and the ring stays untouched.
-- `Subscriber::connect_with(StartPos::Explicit(c))` consults the
-  WAL when `c` falls behind the ring; transparently feeds records
-  through the existing `receive()` / `try_receive()` /
-  `receive_timeout()` / `poll_recv()` paths and then transitions
-  back to live ring reads.
-- `TopicStats.wal: Option<WalStats>` exposes pending / durable /
-  oldest cursors, active-segment bytes, and segment count.
-- Crash recovery: every `Wal::open` runs `recover_truncate` on
-  every segment so a power-loss-torn tail is dropped before any
-  reader sees it.
-- Retention: oldest segments are deleted once total bytes exceed
-  `retention_bytes` (default 1 GiB); subscribers asking for a
-  retention-evicted cursor get `Error::CursorTooOld { oldest:
-  wal.oldest_cursor }`.
-
-#### Acceptance + perf
-
-- `tests/wal_acceptance.rs` — 7 RFC §15 scenarios across the
-  three fsync policies (crash recovery, cursor monotonicity,
-  retention semantics, durable-cursor invariants per policy,
-  WAL→ring handoff under live publishing).
-- `benches/publish_with_wal.rs` — Criterion bench comparing
-  publish throughput across baseline / `None` / `Batched` / `Each`.
-
-### Bench results (32 B payload, capacity 4096, macOS 25.4 APFS)
-
-| Policy        | W1-f ns | W2 ns | Overhead vs baseline |
-|---------------|--------:|------:|---------------------:|
-| no WAL        |     185 |   176 |                    — |
-| `wal=None`    |     275 |   248 |                 +41% |
-| `wal=Batched` |     767 |   606 |                +244% |
-| `wal=Each`    |  3.7 ms | 3.6 ms | catastrophic (fsync) |
-
-W2 optimisation pass:
-
-- **Flusher sync_data outside WAL mutex** — only the BufWriter
-  flush + fd `try_clone` happen under the lock; the multi-ms
-  `sync_data` on the cloned fd runs without blocking publishers.
-- **Cached wall-clock anchor** — `SystemTime::now()` per publish
-  replaced with `wall_base + Instant::now().elapsed()`.
-- **Killed the per-publish `Vec` alloc** — `Record::encode_into`
-  was building a temporary `Vec` for `payload` on every record;
-  new free function `encode_record_into(&mut Vec, cursor, ts,
-  &[u8])` takes a slice.
-- **Active-segment bookkeeping outside BTreeMap** — every append
-  used to do a `BTreeMap::insert` on the active segment's size +
-  an O(n) `values().sum()` for the retention check.  Now tracked
-  as two `u64` fields (`active_bytes`, `retained_bytes`);
-  retention only walks segments when `retained + active > cap`.
-- **No-WAL hot path byte-identical to v0.1.0** — the `is_full`
-  pre-check (added in W1-d to prevent phantom WAL records) now
-  only runs inside the WAL-enabled branch.
-
-Cumulative deltas vs W1-f: no-WAL -5%; `wal=None` -10%;
-`wal=Batched` -21%.
-
-`Batched` still well above the planned <10% gate, so the default
-stays at `WalConfig::disabled()`.  Closing the remaining +244%
-likely needs a lock-free SPSC handoff between publisher and
-flusher (a v0.2.x item).
+WAL v2 (lock-free mmap-backed) RFC + plan landed; implementation
+gated behind `--features wal_v2` and tracked by tasks W2-1..W2-8.
+See `docs/rfc-wal-v2-lockfree.md`.
 
 ## [0.1.0] - first public release
 
@@ -124,6 +52,46 @@ flusher (a v0.2.x item).
   behaviour under sustained contention.  Subscribers detect torn
   reads and overwritten slots via the seq field and skip forward
   instead of returning garbage.
+
+#### WAL — opt-in durable replay (Phase B)
+
+- `BusConfig::wal` — per-bus write-ahead log.  Opt-in; default is
+  `WalConfig::disabled()` so existing callers see no change.
+- `WalConfig::fsync_policy` — `None` (no fsync), `Batched`
+  (background flusher every `fsync_interval` or `fsync_batch_bytes`),
+  `Each` (fsync inline per publish).
+- `Publisher` opens the WAL when enabled, aligns the ring's tail
+  with the WAL's pending cursor on restart (so cursors stay
+  monotonic across publisher restarts), and appends every record
+  to the WAL before the ring write.  WAL append failure returns
+  `Error::Wal` and leaves the ring untouched.
+- `Subscriber::connect_with(StartPos::Explicit(c))` consults the
+  WAL when `c` falls behind the ring; transparently feeds records
+  through `receive()` / `try_receive()` / `receive_timeout()` /
+  `poll_recv()` and then transitions back to live ring reads.
+- `TopicStats.wal: Option<WalStats>` — pending / durable / oldest
+  cursors, active-segment bytes, segment count.
+- Crash recovery: `Wal::open` runs `recover_truncate` on every
+  segment so a power-loss-torn tail is dropped before any reader
+  sees it.  Wire format documented in `docs/rfc-wal-phase-b.md`.
+- Retention: oldest segments deleted once total bytes exceed
+  `retention_bytes` (default 1 GiB); subscribers requesting a
+  retention-evicted cursor get `Error::CursorTooOld { oldest:
+  wal.oldest_cursor }`.
+
+#### WAL bench (32 B payload, capacity 4096, macOS 25.4 APFS)
+
+| Policy        | ns/publish | Overhead vs no-WAL |
+|---------------|-----------:|-------------------:|
+| no WAL        |    176     |                  — |
+| `wal=None`    |    248     |               +41% |
+| `wal=Batched` |    606     |              +244% |
+| `wal=Each`    |   3.6 ms   | (fsync per publish) |
+
+`Batched` exceeds the planned <10% gate, so the default remains
+`WalConfig::disabled()`.  Closing the gap needs the lock-free
+mmap-backed redesign tracked in `docs/rfc-wal-v2-lockfree.md`
+(v0.2.0).
 
 #### Async / framework integration
 
@@ -179,8 +147,10 @@ flusher (a v0.2.x item).
 ### Known gaps
 
 - **Windows support**: not yet (RFC ready; ~1 focused week of work).
-- **Durable replay**: only in-ring history today (Phase A); a WAL-
-  backed Phase B is designed but unimplemented.
+- **WAL=Batched overhead**: +244% vs no-WAL on the bench rig.
+  Acceptable for opt-in users prioritising durability; closing the
+  gap to <10% needs the lock-free WAL v2 (RFC + plan landed; impl
+  tracked as v0.2.0).
 - **`AnyioSubscription` perf**: uses a worker thread per recv; for
   asyncio-only workloads `AsyncSubscription` is strictly cheaper.
 - **`drop_oldest` recv-side skip signal**: subscribers on a
@@ -207,5 +177,5 @@ flusher (a v0.2.x item).
 
 This is the first public release.  Wire format starts at v4.
 
-[Unreleased]: https://github.com/OWNER/mmbus/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/OWNER/mmbus/releases/tag/v0.1.0
+[Unreleased]: https://github.com/sintimaski/mmbus/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/sintimaski/mmbus/releases/tag/v0.1.0
