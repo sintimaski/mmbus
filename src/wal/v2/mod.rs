@@ -8,9 +8,12 @@
 //! aggregator + publisher/subscriber integration land in W2-2
 //! through W2-6.
 
+pub mod active;
 pub mod mmap_segment_reader;
 pub mod mmap_segment_writer;
+pub mod rotation;
 
+pub use active::{peek as peek_active_coord, ActiveCoord, ACTIVE_COORD_FILENAME, ACTIVE_COORD_LEN};
 pub use mmap_segment_reader::{
     MmapSegmentReader, ReadOutcome, ReaderError, SKIP_TO_END_SENTINEL,
 };
@@ -18,3 +21,4 @@ pub use mmap_segment_writer::{
     align_record_len, AppendOutcome, MmapSegmentWriter, WriterError,
     SEGMENT_VERSION_V2, WRITING_BIT_U32,
 };
+pub use rotation::{open_segment_reader, rotate, segment_path, RotateError};

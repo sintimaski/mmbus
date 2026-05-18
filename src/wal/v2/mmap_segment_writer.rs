@@ -230,6 +230,45 @@ impl MmapSegmentWriter {
         self.tail_atomic().load(Ordering::Acquire)
     }
 
+    /// Write the `SKIP_TO_END` sentinel at the current tail and
+    /// advance tail past it, so any reader observing this segment
+    /// transitions to `ReadOutcome::EndOfSegment` and chases the
+    /// next segment.  Idempotent: if there isn't room for the 4-byte
+    /// sentinel, returns `Ok(false)` — readers fall through to
+    /// `EndOfSegment` via the `pos >= segment_size` guard anyway.
+    ///
+    /// Called by the W2-3 rotation path after an `append` returns
+    /// [`AppendOutcome::SegmentFull`].
+    pub fn write_skip_to_end(&self) -> Result<bool, WriterError> {
+        use crate::wal::v2::mmap_segment_reader::SKIP_TO_END_SENTINEL;
+        let segment_size = self.segment_size as u64;
+        let tail = self.tail_atomic();
+        let mut current = tail.load(Ordering::Acquire);
+        let offset = loop {
+            if current + 4 > segment_size {
+                // No room for the 4-byte marker — but that's fine:
+                // a reader whose pos lands at segment_size returns
+                // EndOfSegment without needing a marker.
+                return Ok(false);
+            }
+            match tail.compare_exchange_weak(
+                current,
+                current + 4,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break current,
+                Err(actual) => current = actual,
+            }
+        };
+        // SAFETY: offset+4 <= segment_size guarded above; offset is
+        // 4+-byte aligned (every prior reservation was 8-aligned via
+        // align_record_len).
+        let slot = unsafe { self.mmap.as_ptr().add(offset as usize) as *const AtomicU32 };
+        unsafe { (*slot).store(SKIP_TO_END_SENTINEL, Ordering::Release) };
+        Ok(true)
+    }
+
     pub fn first_cursor(&self) -> u64 {
         self.first_cursor
     }
