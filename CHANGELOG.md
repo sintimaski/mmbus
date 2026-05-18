@@ -6,10 +6,27 @@ All notable changes to mmbus are recorded here.  Format follows
 
 ## [Unreleased]
 
-WAL v2 (lock-free mmap-backed) implementation work in progress
-behind `--features wal_v2`.  W2-0 (RFC + plan + scaffold) and
-W2-1 (`MmapSegmentWriter` — lock-free append) shipped; W2-2
-through W2-8 pending.  See `docs/rfc-wal-v2-lockfree.md`.
+### Added
+
+- **WAL v2 (lock-free mmap-backed) — opt-in behind `wal_v2` Cargo
+  feature.**  Full lock-free `MmapSegmentWriter` + seqlock-aware
+  `MmapSegmentReader` + multi-segment `Wal` aggregator + per-
+  platform durability primitives (`msync` + `F_FULLFSYNC` /
+  `fdatasync` / `FlushFileBuffers`).  Behind `--features wal_v2`
+  the `Publisher` and `Subscriber` swap onto the v2 backend
+  transparently — same public API, same wire format with a
+  version bump (1 → 2 in the segment header; v0.1 readers
+  reject v2 segments cleanly with `UnsupportedVersion`).
+
+  Why opt-in: v2's `wal=Batched` overhead vs no-WAL is +332%
+  (M-series APFS, 32 B payload bench) — within ±10% of v0.1's
+  +244% but not below the +10% gate set in
+  `docs/rfc-wal-v2-lockfree.md` for promotion to default.  The
+  per-tick `msync(MS_SYNC) + F_FULLFSYNC` dominates; the lock-
+  free append path doesn't reduce it.  Follow-ups tracked in
+  the RFC §11 Results.
+
+  Status / decision recorded in `docs/rfc-wal-v2-lockfree.md` §11.
 
 ## [0.1.3] - 2026-05-18
 

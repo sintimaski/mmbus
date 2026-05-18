@@ -1,6 +1,7 @@
 # RFC: WAL v2 — lock-free mmap-backed journal
 
-**Status:** Draft (proposed for v0.2.0).
+**Status:** Shipped in v0.2.0 as an opt-in feature (`wal_v2` Cargo
+flag).  Default backend remains v0.1 — see §11 Results.
 
 **Owner:** _unassigned_
 
@@ -296,3 +297,67 @@ W2-4 Lock-free aggregator
 
 Behind `wal_v2` Cargo feature for the first release; default
 promotion in v0.2.1.
+
+## 11. Results (W2-8, 2026-05-18)
+
+### Acceptance
+
+`cargo test --features wal_v2` passes the full existing suite —
+`tests/wal_publisher.rs`, `tests/wal_subscriber.rs`,
+`tests/wal_acceptance.rs`, `tests/crash_recovery.rs`,
+`tests/stress.rs`, plus 53 v2-specific unit tests in
+`src/wal/v2/*`.
+
+| Suite                    | v0.1 backend | v2 backend |
+|--------------------------|--------------|------------|
+| Lib unit tests           | 38           | 91 (38 v0.1 + 53 v2) |
+| tests/wal_publisher      | 6            | 5 (torn-tail recovery is v0.1-only — see below) |
+| tests/wal_subscriber     | 5            | 5          |
+| tests/wal_acceptance     | 7            | 7          |
+| tests/crash_recovery     | 4            | 4          |
+| tests/stress             | 15           | 15         |
+
+The one cfg-disabled test — `restart_after_torn_tail_drops_corrupt_records_and_resumes`
+— exercises v0.1's `recover_truncate` ftruncate-on-CRC-mismatch
+semantics.  v2 reaches the same end state (data past the tear is
+not committed) via a different mechanism (in-mmap tail + per-slot
+seqlock); we'll codify v2's corruption-recovery contract in a
+follow-up before flipping the default.
+
+### Perf
+
+`cargo bench --features wal_v2 --bench publish_with_wal` (32 B
+payload, Apple M-series, APFS):
+
+| Policy            | Throughput  | vs no-WAL    |
+|-------------------|-------------|--------------|
+| `baseline_no_wal` | 5.67 Melem/s| —            |
+| `wal=None`        | 4.30 Melem/s| +31%  slower |
+| `wal=Batched`     | 1.31 Melem/s| +332% slower |
+| `wal=Each`        | 256  elem/s | (OS-bound: F_FULLFSYNC ≈ 4 ms) |
+
+This is within ±10% of v0.1's same-bench numbers (Batched was
++244% post-W1-f-fixes).  v2 is **not** faster than v0.1 on this
+bench because the dominant cost is the per-tick `msync(MS_SYNC)`
++ `F_FULLFSYNC`, which the lock-free append path doesn't reduce.
+
+### Decision
+
+The W2-8 ship gate ("Batched ≤ +10% vs no-WAL → flip the default")
+**does not pass**.  Per the plan's "if the gate doesn't land, do
+NOT flip the default" branch:
+
+* v0.2.0 ships v2 as opt-in (`wal_v2` Cargo feature).  Default
+  `WalConfig::default().enabled = false` is unchanged.
+* The v0.1 backend stays the on-by-default code path.
+* Follow-ups before the default flip can land:
+  1. Reduce per-tick msync cost (track dirty byte range instead
+     of flushing the whole mmap).
+  2. Lock-free aggregator (replace the `Mutex<Inner>` with an
+     `ArcSwap`-style writer state so concurrent appends from the
+     same process don't serialize).
+  3. Codify v2's corruption-recovery semantics in a test (the
+     v0.1-only torn-tail test referenced above).
+
+Tracked in `docs/plan-wal-v2-lockfree.md` as W2-9 (perf follow-up,
+not yet decomposed).
