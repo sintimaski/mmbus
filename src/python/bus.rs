@@ -30,6 +30,7 @@ impl PyBus {
         slot_size=None,
         max_subscribers=None,
         backpressure=None,
+        wal_enabled=None,
     ))]
     pub fn new(
         name: &str,
@@ -38,6 +39,7 @@ impl PyBus {
         slot_size: Option<u32>,
         max_subscribers: Option<u32>,
         backpressure: Option<&str>,
+        wal_enabled: Option<bool>,
     ) -> PyResult<Self> {
         let defaults = BusConfig::default();
         let policy = match backpressure {
@@ -50,17 +52,22 @@ impl PyBus {
                 )));
             }
         };
+        // wal_enabled overrides the Rust default's `enabled` field.
+        // The remaining WalConfig knobs (fsync_policy, etc.) stay at
+        // their Rust defaults.  Future expansion: a full `wal=` dict /
+        // dataclass kwarg surface.
+        let wal = match wal_enabled {
+            None => defaults.wal,
+            Some(true) => crate::wal::WalConfig { enabled: true, ..defaults.wal },
+            Some(false) => crate::wal::WalConfig::disabled(),
+        };
         let config = BusConfig {
             base_dir: base_dir.map(Into::into).unwrap_or(defaults.base_dir),
             capacity: capacity.unwrap_or(defaults.capacity),
             slot_size: slot_size.unwrap_or(defaults.slot_size),
             max_subscribers: max_subscribers.unwrap_or(defaults.max_subscribers),
             backpressure: policy,
-            // WAL is opt-in and has no Python-surface kwarg yet — keep
-            // it disabled by default for Python users.  A future
-            // `wal="batched"|"each"|"none"|None` kwarg lands when the
-            // v0.2 lock-free WAL hits the <10% overhead gate.
-            wal: defaults.wal,
+            wal,
         };
         Ok(PyBus { inner: Bus::with_config(name, config) })
     }

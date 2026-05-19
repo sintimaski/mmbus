@@ -57,6 +57,10 @@ class Bus:
         :exc:`BusFullError` when the ring is full) or ``"drop_oldest"``
         (overwrites the oldest unread slot; subscribers detect the skip
         via the per-slot seqlock).
+      - ``wal_enabled`` (bool): override the on-by-default WAL.  Pass
+        ``False`` to opt out — useful when you want bare-ring perf and
+        don't need durable replay.  Default ``None`` = inherit the
+        Rust default (currently ``True``, Batched fsync).
     """
 
     def __init__(self, name: str, **kwargs):
