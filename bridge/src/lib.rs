@@ -20,6 +20,9 @@ pub mod queue;
 #[cfg(feature = "quic")]
 pub mod quic;
 
+#[cfg(feature = "python")]
+mod python;
+
 pub use bridge::{Bridge, BridgeError};
 pub use config::{BridgeConfig, ConfigError, PeerConfig, TopicConfig, TransportKind};
 pub use frame::{DecodeError, Frame, FrameType, FRAME_VERSION, HEADER_LEN};

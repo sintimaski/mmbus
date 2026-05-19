@@ -213,7 +213,13 @@ impl BridgeConfig {
         Ok(cfg)
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
+    /// Run the semantic validation pass that `from_str` / `from_path`
+    /// already invoke at the end of parsing.  Exposed `pub` so the
+    /// Python bindings (which build `BridgeConfig` via
+    /// `serde_json::from_value` to skip a TOML round-trip on a dict
+    /// input) can apply the same checks before handing the config
+    /// off to `Bridge::start`.
+    pub fn validate(&self) -> Result<(), ConfigError> {
         if self.bus.trim().is_empty() {
             return Err(ConfigError::EmptyBus);
         }

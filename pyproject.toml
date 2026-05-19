@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "mmbus"
-version = "0.2.3"
+version = "0.3.0"
 description = "Zero-copy pub/sub over mmap — Python bindings"
 requires-python = ">=3.8"
 license = { file = "LICENSE" }
@@ -16,6 +16,13 @@ classifiers = [
     "Operating System :: POSIX",
 ]
 
+[project.optional-dependencies]
+# `pip install mmbus[bridge]` pulls in the in-process cross-machine
+# bridge wheel (built from `bridge/pyproject.toml`).  TCP-only — QUIC
+# users keep the standalone `mmbus-bridge` binary.  See
+# docs/rfc-bridge-python-sdk.md.
+bridge = ["mmbus-bridge"]
+
 [tool.maturin]
 # Build the Rust extension as the private mmbus._mmbus sub-module.
 # python/mmbus/__init__.py re-exports the public API.
@@ -25,6 +32,13 @@ classifiers = [
 # ships the v0.1 BufWriter backend at ~40k msg/s sustained
 # durable throughput; with it, ~4M msg/s.  See
 # docs/rfc-wal-v2-lockfree.md.
+#
+# The in-process bridge (v0.3.0) ships as a separate companion wheel
+# `mmbus-bridge` built from `bridge/pyproject.toml` — the cyclic
+# Cargo dep prevents bundling it into the core wheel.  See
+# docs/rfc-bridge-python-sdk.md.  Install with
+# `pip install mmbus[bridge]` (preferred) or
+# `pip install mmbus mmbus-bridge`.
 features = ["python", "wal_v2"]
 module-name = "mmbus._mmbus"
 python-source = "python"

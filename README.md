@@ -208,6 +208,46 @@ See [`docs/architecture.md`](docs/architecture.md) for the full design.
 - **Desktop apps** — cross-process events without a server
 - **Dev/test environments** — production-quality local pub/sub, no Docker
 
+## Cross-machine pub/sub
+
+mmbus is same-host by design, but the optional **bridge** relays topics
+across machines over TCP.  For embedded use (the recommended path), the
+`mmbus-bridge` companion wheel runs the bridge in-process:
+
+```bash
+pip install mmbus[bridge]      # pulls in the mmbus-bridge wheel
+```
+
+```python
+from mmbus_bridge import Bridge
+
+with Bridge({
+    "bus": "my-app",
+    "listen": "0.0.0.0:4443",
+    "topics": [{"name": "events"}],
+    "peers": [{"name": "b", "endpoint": "b.host:4443",
+               "preshared_key": "shared-secret"}],
+}) as bridge:
+    print(f"listening on {bridge.listen_addr}")
+    bridge.wait()              # blocks until Ctrl-C / shutdown()
+```
+
+A locally-published `events` message is forwarded to every peer and
+republished onto each peer's local bus.  The config dict mirrors the
+bridge TOML schema 1:1.
+
+**Which bridge entry point?**
+
+| You want…                                   | Use                                    |
+|---------------------------------------------|----------------------------------------|
+| The bridge inside your Python service       | `mmbus_bridge.Bridge` (this wheel)     |
+| systemd / supervised standalone daemon      | `mmbus.bridge.run` / `.spawn` (shells out to the binary) |
+| QUIC + TLS transport                        | standalone binary, `cargo install --path bridge --features quic` |
+
+The Python wheel is **TCP-only** — a QUIC peer config raises
+`BridgeQuicError` at `start()`.  See
+[`docs/rfc-bridge-python-sdk.md`](docs/rfc-bridge-python-sdk.md).
+
 ## Supported platforms
 
 |         | Linux        | macOS        | Windows  |

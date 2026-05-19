@@ -6,6 +6,74 @@ All notable changes to mmbus are recorded here.  Format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-20
+
+### Added — Bridge Python SDK (in-process cross-machine pub/sub)
+
+- **`mmbus_bridge` companion wheel** exposing an in-process bridge:
+  `from mmbus_bridge import Bridge`.  Forwards locally-published
+  mmbus topics to peer machines over TCP and republishes inbound
+  peer traffic onto the local bus — no standalone binary install,
+  no `subprocess` lifecycle.  Install with `pip install mmbus[bridge]`
+  (preferred) or `pip install mmbus mmbus-bridge`.
+
+  ```python
+  from mmbus_bridge import Bridge
+
+  with Bridge({
+      "bus": "my-app",
+      "listen": "0.0.0.0:4443",
+      "topics": [{"name": "events"}],
+      "peers": [{"name": "b", "endpoint": "b.host:4443",
+                 "preshared_key": "secret"}],
+  }) as bridge:
+      print(bridge.listen_addr)   # ('0.0.0.0', 4443)
+      bridge.wait()               # blocks until Ctrl-C / shutdown()
+  ```
+
+- **Public API:** `Bridge(dict)`, `Bridge.from_toml(str)`,
+  `Bridge.from_path(path)`; methods `start()`, `shutdown(timeout=None)`,
+  `wait()`, `is_running()`; properties `origin_id`, `listen_addr`;
+  context-manager protocol (`with Bridge(cfg) as b:`).  Config dict
+  mirrors the bridge TOML schema 1:1 and is validated eagerly at
+  construction time through the same `BridgeConfig::validate()` the
+  standalone binary uses.
+
+- **Typed exceptions:** `BridgeConfigError` (subclass of `ValueError`),
+  `BridgeListenError`, `BridgeQuicError`, and a `BridgeError` base.
+
+### Design notes
+
+- **Why a separate wheel, not a `mmbus` feature:** `mmbus-bridge`
+  depends on `mmbus` (it republishes onto a local `Bus`), so adding
+  the reverse edge would create a Cargo dependency cycle.  The PyO3
+  bindings therefore live in the bridge crate and ship as their own
+  `mmbus_bridge._mmbus_bridge` extension.  See
+  `docs/rfc-bridge-python-sdk.md`.
+
+- **TCP only.** The wheel deliberately omits the crate's `quic`
+  feature (tokio + quinn + rustls + ring + rcgen) to stay slim.  A
+  QUIC peer config raises `BridgeQuicError` at `start()`; QUIC users
+  keep the standalone `mmbus-bridge` binary
+  (`cargo install --path bridge --features quic`).
+
+- The existing subprocess shim (`mmbus.bridge.run` /
+  `mmbus.bridge.spawn`) is unchanged and still useful for
+  systemd-style supervision of the standalone binary.
+
+### Changed
+
+- `mmbus-bridge` crate version `0.0.1` → `0.3.0`; it now builds a
+  `cdylib` + `rlib` (`[lib] name = "mmbus_bridge"`) and gained an
+  optional `python` Cargo feature.  The standalone binary build path
+  is unaffected (still links the rlib; TCP-only unless `--features
+  quic`).
+
+### Backward compatibility
+
+Additive only.  The core `mmbus` wheel and Rust crate are unchanged
+except for the version bump and the new `[bridge]` install extra.
+
 ## [0.2.3] - 2026-05-19
 
 ### Fixed (Python wheel)
@@ -571,7 +639,8 @@ high-throughput burst workloads.
 
 This is the first public release.  Wire format starts at v4.
 
-[Unreleased]: https://github.com/sintimaski/mmbus/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/sintimaski/mmbus/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/sintimaski/mmbus/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/sintimaski/mmbus/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/sintimaski/mmbus/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/sintimaski/mmbus/compare/v0.2.0...v0.2.1

@@ -1,8 +1,20 @@
-"""Python helper for ``mmbus-bridge``.
+"""Python helper for the standalone ``mmbus-bridge`` binary.
 
-This module is a thin wrapper around the standalone ``mmbus-bridge``
-binary built from the ``bridge/`` crate.  It does not bundle the
-binary into the mmbus wheel — install it separately via::
+This module shells out to the standalone ``mmbus-bridge`` binary built
+from the ``bridge/`` crate — it is the right tool for systemd-style
+supervision of an external daemon.
+
+For running the bridge **in-process** (no subprocess, no separate
+binary install), prefer the ``mmbus_bridge`` companion wheel instead::
+
+    pip install mmbus[bridge]
+
+    from mmbus_bridge import Bridge
+    with Bridge(config_dict) as bridge:
+        bridge.wait()
+
+See ``docs/rfc-bridge-python-sdk.md``.  The functions below remain for
+the subprocess-supervision use case; install the binary separately via::
 
     cargo install --path bridge
 

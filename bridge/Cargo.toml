@@ -1,10 +1,18 @@
 [package]
 name = "mmbus-bridge"
-version = "0.0.1"
+version = "0.3.0"
 edition = "2021"
 description = "Cross-machine relay for mmbus topics over TCP/QUIC"
 license = "MIT"
-publish = false
+readme = "README.md"
+
+[lib]
+# rlib so `cargo test` and the binary can link us as a normal Rust crate;
+# cdylib so maturin can build the `mmbus_bridge._mmbus_bridge` Python
+# extension when `--features python` is on.  The cdylib output is
+# harmless to the binary build path — the binary still links the rlib.
+name = "mmbus_bridge"
+crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
@@ -12,12 +20,21 @@ default = []
 # quinn, rustls, and rcgen; the TCP-only build stays slim.  See
 # `docs/rfc-b4b-quic.md` for the design.
 quic = ["dep:quinn", "dep:tokio", "dep:rustls", "dep:rcgen", "dep:rustls-pki-types", "dep:ring"]
+# PyO3 bindings — built as the `mmbus_bridge._mmbus_bridge` Python
+# extension via maturin.  Pulls in pyo3 + serde_json (the latter
+# adapts Python dict → BridgeConfig by sharing the bridge's existing
+# Deserialize impl).  Off by default for plain Rust users; the
+# `bridge/pyproject.toml` wheel enables it.  See
+# `docs/rfc-bridge-python-sdk.md`.
+python = ["dep:pyo3", "dep:serde_json"]
 
 [dependencies]
 mmbus = { path = ".." }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 thiserror = "1"
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+serde_json = { version = "1", optional = true }
 
 # `quic` feature dependencies — all optional + off by default.
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"], optional = true }
