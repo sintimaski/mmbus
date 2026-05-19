@@ -6,6 +6,41 @@ All notable changes to mmbus are recorded here.  Format follows
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-05-19
+
+### Fixed (Python wheel)
+
+- **Python wheel now ships the `wal_v2` lock-free WAL backend by
+  default.** `[tool.maturin].features` in `pyproject.toml` now
+  reads `["python", "wal_v2"]` (was `["python"]`).  Before this
+  fix, Python users got the v0.1 BufWriter WAL at ~40 k msg/s
+  sustained durable throughput; after, ~1.06 M msg/s — a 26×
+  improvement, directly closing the v0.2.0/v0.2.1 perf-push
+  gap for Python consumers.  No code changes — purely a build
+  configuration miss surfaced by the v0.2.2 competitive
+  benchmark work.
+
+  Re-bench numbers (M-series, APFS, Python wheel via
+  `maturin develop --release`, 1M × 256 B messages):
+
+  | Configuration         | Sustained throughput |
+  |-----------------------|---------------------:|
+  | mmbus non-durable     | 1.34 M/s            |
+  | mmbus durable v0.2.2 wheel (v0.1 WAL) | 0.04 M/s |
+  | **mmbus durable v0.2.3 wheel (v0.2 WAL)** | **1.06 M/s** |
+
+  RESULTS.md and docs/benchmarks-vs-competition.md updated to
+  match.
+
+### Backward compatibility
+
+Additive only — existing Python code is unchanged.  The wheel
+now opens a `wal/` directory under each bus's `base_dir` by
+default (already the case in v0.2.0+; the wheel just wasn't
+using the FAST backend before this release).  Users who want
+the bare ring continue to opt out with
+`mmbus.Bus(..., wal_enabled=False)`.
+
 ## [0.2.2] - 2026-05-19
 
 ### Added — Prometheus exporter
@@ -536,7 +571,8 @@ high-throughput burst workloads.
 
 This is the first public release.  Wire format starts at v4.
 
-[Unreleased]: https://github.com/sintimaski/mmbus/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/sintimaski/mmbus/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/sintimaski/mmbus/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/sintimaski/mmbus/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/sintimaski/mmbus/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/sintimaski/mmbus/compare/v0.1.3...v0.2.0

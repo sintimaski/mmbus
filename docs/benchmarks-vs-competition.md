@@ -46,8 +46,8 @@ hot-loop micro-benchmark settings.
 
 | Framework       | Sustained throughput |
 |-----------------|---------------------:|
-| **ZeroMQ**      | **1.65 M/s**         |
-| **mmbus**       | **1.36 M/s**         |
+| **ZeroMQ** PUSH/PULL  | **1.65 M/s**   |
+| **mmbus**       | **1.34 M/s**         |
 | Redis           | — (durable column only — see below) |
 
 For ephemeral same-host pub/sub, ZeroMQ's `ipc://` PUSH/PULL wins
@@ -57,21 +57,23 @@ durability without changing libraries.
 
 ### Durable
 
-| Framework           | Sustained throughput | Multiplier |
+| Framework           | Sustained throughput | Multiplier vs mmbus |
 |---------------------|---------------------:|-----------:|
-| **mmbus** (v0.2 WAL, Rust criterion bench)  | **~4.6 M/s** (pub-only)   | reference  |
-| **mmbus** (v0.2 WAL, Python this harness)   | _pending wheel rebuild_   |            |
-| **Redis Streams**   | **0.12 M/s**         | ~38× slower than mmbus pub-only |
+| **mmbus** (Rust criterion, pure publish)    | **~4.6 M/s**         | 4.3×        |
+| **mmbus** (Python wheel, v0.2.3+)           | **1.06 M/s**         | reference   |
+| **Redis Streams**   | **0.12 M/s**         | **~8.8× slower than mmbus Python** |
 | **NATS JetStream**  | _(see RESULTS.md)_   |            |
 
-The mmbus number here is pure-publish from the Rust criterion
-bench (`cargo bench --bench publish_with_wal` after the v0.2.1
-perf push).  The Python harness in this directory currently
-ships the v0.1 WAL backend because `maturin develop --release`
-doesn't enable `wal_v2` by default — rebuild with
-`maturin develop --release --features wal_v2` for the v2 perf
-path.  We'll update once the Python wheel defaults to `wal_v2`
-(v0.2.3 release engineering task).
+The mmbus Python number assumes the wheel ships with `wal_v2`
+enabled (default since v0.2.3).  Before v0.2.3 the wheel used
+the v0.1 BufWriter backend at ~40 k/s — a release-engineering
+gap, fixed.
+
+The 4.6 M/s figure is from the Rust criterion bench
+(`cargo bench --bench publish_with_wal`) — pure publish loop
+with no consumer.  Python adds PyO3 + GIL-drop costs that cap
+the wheel-based throughput at ~1 M/s; the Rust API has no such
+cap.
 
 ## Headline reading
 
@@ -79,11 +81,11 @@ path.  We'll update once the Python wheel defaults to `wal_v2`
    on commodity hardware without breaking a sweat.  If you're
    reaching for Redis / NATS purely for same-host pub/sub, you're
    paying a real cost.
-2. **mmbus's WAL is competitive for durable.** Even at +22% Batched
-   overhead (v0.2.1's perf push result), mmbus's durable mode is
-   ~38× faster than Redis Streams' durable mode on the same
-   workload — durable on mmbus stays in microseconds-per-publish
-   territory while Redis hits the loopback TCP+fsync wall.
+2. **mmbus's durable mode is ~9× faster than Redis Streams on the
+   Python comparison** (1.06 M/s vs 0.12 M/s, same workload).  In
+   Rust the gap widens to ~38× because the PyO3 GIL-drop overhead
+   no longer dominates.  Either way, mmbus's mmap-backed WAL skips
+   the loopback-TCP + per-second-fsync wall that caps Redis.
 3. **The right comparison depends on your shape.** mmbus is for
    "same-host pub/sub with optional durable replay, one
    publisher per topic."  If you need cross-host, multi-publisher,
@@ -123,8 +125,8 @@ delimited) and a human-readable summary to `RESULTS.md`.
 
 ## Open questions / future work
 
-- Publish the wheel with `wal_v2` on by default so the
-  default Python perf matches the Rust criterion bench.
 - Add latency-percentile harness (p50/p99/p999, separate run).
 - Compare against Aeron, iceoryx, NNG — same shape, different
   trade-offs.
+- Find a NATS JetStream config that converges on macOS Docker,
+  or re-run on a native Linux host to fill the empty cell.

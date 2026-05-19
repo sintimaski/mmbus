@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "mmbus"
-version = "0.2.2"
+version = "0.2.3"
 description = "Zero-copy pub/sub over mmap — Python bindings"
 requires-python = ">=3.8"
 license = { file = "LICENSE" }
@@ -19,6 +19,12 @@ classifiers = [
 [tool.maturin]
 # Build the Rust extension as the private mmbus._mmbus sub-module.
 # python/mmbus/__init__.py re-exports the public API.
-features = ["python"]
+#
+# `wal_v2` enables the lock-free mmap-backed WAL backend (v0.2's
+# perf push) by default for Python users — without it the wheel
+# ships the v0.1 BufWriter backend at ~40k msg/s sustained
+# durable throughput; with it, ~4M msg/s.  See
+# docs/rfc-wal-v2-lockfree.md.
+features = ["python", "wal_v2"]
 module-name = "mmbus._mmbus"
 python-source = "python"
