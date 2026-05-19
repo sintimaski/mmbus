@@ -6,6 +6,48 @@ All notable changes to mmbus are recorded here.  Format follows
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-05-19
+
+### Added — Prometheus exporter
+
+- **`mmbus::prometheus` module** behind the new `prometheus`
+  Cargo feature.  Two pieces:
+  - `render(topic_name, &TopicStats) -> String` and
+    `render_all(&[(name, stats)])` — pure Prometheus
+    text-format renderers covering every counter / gauge from
+    v0.2.1.  Uses `std::fmt::Write`; no external deps.
+  - `serve_blocking(addr, scrape_fn)` — single-threaded
+    HTTP server (no tokio / hyper / tiny_http) that responds
+    to `GET /metrics` with `scrape_fn()`'s output.  ~80 LOC
+    of `std::net`.  Suitable for Prometheus's 15-60s scrape
+    cadence.
+
+- **Metrics surfaced**: `mmbus_published_total`,
+  `mmbus_full_rejected_total`, `mmbus_subscribers_dropped_total`,
+  `mmbus_connected_sockets`, `mmbus_ring_tail`,
+  `mmbus_active_subscribers`, `mmbus_max_subscriber_lag`, plus
+  the full WAL block (`mmbus_wal_appends_total`,
+  `mmbus_wal_append_bytes_total`, `mmbus_wal_flushes_total`,
+  `mmbus_wal_pending_cursor`, `mmbus_wal_durable_cursor`,
+  `mmbus_wal_replay_lag`, `mmbus_wal_total_bytes`,
+  `mmbus_wal_segments`).  WAL block is omitted when WAL is
+  disabled.
+
+- **`examples/prometheus_exporter.rs`** — 30-line publisher +
+  `/metrics` endpoint demo.  Run with
+  `cargo run --example prometheus_exporter --features prometheus`.
+
+### Tests
+
+7 new unit tests in `src/prometheus.rs` covering the render
+output shape, WAL-on/off branches, max-subscriber-lag derivation,
+label escaping, and an HTTP round-trip 404 case.
+
+### Backward compatibility
+
+Additive only — `prometheus` feature is opt-in.  No changes to
+the core public API.
+
 ## [0.2.1] - 2026-05-18
 
 ### Added — Observability
@@ -494,7 +536,8 @@ high-throughput burst workloads.
 
 This is the first public release.  Wire format starts at v4.
 
-[Unreleased]: https://github.com/sintimaski/mmbus/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/sintimaski/mmbus/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/sintimaski/mmbus/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/sintimaski/mmbus/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/sintimaski/mmbus/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/sintimaski/mmbus/compare/v0.1.2...v0.1.3

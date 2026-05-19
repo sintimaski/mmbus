@@ -671,6 +671,7 @@ impl Iterator for WalReplayer {
 
 // ── Flusher thread ────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)] // 10 atomics + a couple of clocks — splitting just shuffles fields around
 fn spawn_flusher_thread(
     writer: Arc<ArcSwapOption<MmapSegmentWriter>>,
     durable_cursor: Arc<AtomicU64>,

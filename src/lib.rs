@@ -7,6 +7,9 @@
 pub mod ring;
 pub mod wal;
 
+#[cfg(feature = "prometheus")]
+pub mod prometheus;
+
 mod bus;
 mod config;
 mod error;

@@ -1,6 +1,6 @@
 [package]
 name = "mmbus"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Zero-copy pub/sub over mmap for local IPC"
 license = "MIT"
@@ -16,6 +16,9 @@ python = ["pyo3"]
 # Lock-free mmap-backed WAL (v0.2.0 experimental — see docs/rfc-wal-v2-lockfree.md).
 # Off by default; users opt in for one release of burn-in before promotion in v0.2.1.
 wal_v2 = ["arc-swap"]
+# Prometheus text-format exporter + minimal blocking HTTP server.
+# Zero external deps — uses std::net.  See docs in src/prometheus.rs.
+prometheus = []
 
 [dependencies]
 memmap2 = "0.9"
@@ -68,6 +71,10 @@ name = "producer"
 
 [[example]]
 name = "consumer"
+
+[[example]]
+name = "prometheus_exporter"
+required-features = ["prometheus"]
 
 [[bench]]
 name = "ring"
