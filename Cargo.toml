@@ -23,13 +23,21 @@ crate-type = ["cdylib", "rlib"]
 lto = "thin"
 
 [features]
-python = ["pyo3"]
+# The Python extension also wants a built-in way to see the `tracing`
+# events (a Python process can't wire a Rust subscriber itself), so it
+# pulls in the `logging` feature for `mmbus.init_logging()`.
+python = ["pyo3", "logging"]
 # Lock-free mmap-backed WAL (v0.2.0 experimental — see docs/rfc-wal-v2-lockfree.md).
 # Off by default; users opt in for one release of burn-in before promotion in v0.2.1.
 wal_v2 = ["arc-swap"]
 # Prometheus text-format exporter + minimal blocking HTTP server.
 # Zero external deps — uses std::net.  See docs in src/prometheus.rs.
 prometheus = []
+# Opt-in stderr log subscriber (`init_logging`).  Pulls in
+# `tracing-subscriber`; off by default so the core crate stays lean —
+# pure-Rust users who want logs either enable this or wire their own
+# subscriber.  Always on in the Python wheel (see `python` above).
+logging = ["dep:tracing-subscriber"]
 
 [dependencies]
 memmap2 = "0.9"
@@ -40,6 +48,11 @@ thiserror = "1"
 # wire a subscriber (`tracing_subscriber::fmt::init()`) to see
 # the events — see README.md "Observability".
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+# Stderr log subscriber for the optional `logging` feature.  `env-filter`
+# gives the `RUST_LOG=mmbus=debug` per-target experience; `ansi` is left
+# off so log lines stay clean in files / non-tty.  Only pulled in when
+# `logging` (hence the Python wheel) is enabled.
+tracing-subscriber = { version = "0.3", optional = true, default-features = false, features = ["fmt", "env-filter", "std"] }
 pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
 # Wait-free Arc<T> swapper for the v2 WAL hot path: lets the
 # publisher load the active MmapSegmentWriter without taking the

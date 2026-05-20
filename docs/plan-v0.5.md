@@ -152,9 +152,23 @@ the hot path; need to bench that tradeoff.
 
 ---
 
-### M3: Structured logging — P1
+### M3: Structured logging — P1 ✓ SHIPPED
 
 **Goal:** replace ad-hoc `eprintln!`/stderr with the `tracing` crate throughout.
+
+> **Shipped** (Unreleased).  The Rust core already emitted `tracing` events
+> at lifecycle/WAL points; M3 adds the missing piece for Python users —
+> `mmbus.init_logging(level=None)` (Rust: `mmbus::init_logging`, behind a new
+> opt-in `logging` feature pulling `tracing-subscriber`; the wheel always
+> enables it).  `RUST_LOG` takes precedence over the level arg
+> (`RUST_LOG=mmbus=debug`, per-target like `mmbus::wal=trace`).  Idempotent.
+> Added a publisher-restart `warn` event in `poll_recv`.
+>
+> **Deviation from the original sketch:** `publish`/`publish_many`/`recv` are
+> deliberately NOT `#[instrument]`ed — that path is protected by the
+> hot-path discipline (no per-message atomic/span cost).  Events fire at
+> lifecycle + error granularity, which is also the right granularity for ops
+> (no log line per message).  Verified the no-WAL publish bench is unchanged.
 
 **Current state:** `tracing` is already in `Cargo.toml` and a few
 `tracing::info!` calls exist.  The gaps are: no `#[tracing::instrument]` on

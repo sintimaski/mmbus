@@ -17,6 +17,14 @@ All notable changes to mmbus are recorded here.  Format follows
 
 ### Added
 
+- **`mmbus.init_logging(level=None)`** — install a stderr subscriber for
+  mmbus's `tracing` events (publisher/subscriber lifecycle, publisher
+  restart, WAL rotation/retention) from Python.  Filtering follows
+  `RUST_LOG` if set (e.g. `RUST_LOG=mmbus=debug`), else the `level`
+  argument, else `"info"`.  Backed by the new opt-in `logging` Cargo
+  feature (`mmbus::init_logging` in Rust); the wheel always ships it.
+  Hot paths (`publish`/`recv`) are deliberately *not* instrumented — events
+  fire at lifecycle/error points only, so logging adds no per-message cost.
 - **Wakeup coalescing.**  The publisher fires a per-message wakeup syscall
   only for subscribers that have announced they are about to sleep (an
   eventcount handshake via the new flag table), instead of one wakeup per

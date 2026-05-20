@@ -602,7 +602,15 @@ impl Subscriber {
         if !self.try_drain_wakeup()? {
             return Ok(None);
         }
-        if self.ring.generation() != self.generation {
+        let current_gen = self.ring.generation();
+        if current_gen != self.generation {
+            tracing::warn!(
+                target: "mmbus::subscriber",
+                connected_generation = self.generation,
+                current_generation = current_gen,
+                cursor_idx = self.cursor_idx,
+                "publisher restarted (generation changed); ending subscription",
+            );
             return Err(Error::Io(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "publisher restarted (generation changed)",

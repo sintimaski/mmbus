@@ -311,6 +311,32 @@ Typed exceptions: `BusFullError`, `MessageTooLargeError`,
 `ConnectTimeoutError`, `TooManySubscribersError`, `AlreadyPublishingError`,
 `CursorTooOldError`.
 
+## Observability
+
+mmbus emits structured [`tracing`](https://docs.rs/tracing) events at
+lifecycle points — publisher created, subscriber connected/dropped,
+publisher restart, WAL rotation/retention.  They stay silent until a
+subscriber is installed.
+
+From Python, turn them on with `init_logging` (prints to stderr):
+
+```python
+import mmbus
+mmbus.init_logging("info")          # or "debug", "mmbus=trace", …
+# …or set RUST_LOG=mmbus=debug in the environment (takes precedence)
+```
+
+From Rust, enable the `logging` feature and call
+`mmbus::init_logging(Some("info"))`, or wire your own
+`tracing_subscriber`.  Filtering follows `RUST_LOG` when set (e.g.
+`RUST_LOG=mmbus=debug`, `RUST_LOG=mmbus::wal=trace`), otherwise the
+level argument.
+
+**Metrics:** `bus.stats(topic)` returns monotonic counters
+(`published_total`, `full_rejected_total`, `subscribers_dropped_total`,
+`wakeups_sent_total`) plus ring/WAL gauges.  The optional `prometheus`
+feature exposes them in Prometheus text format.
+
 ## Development
 
 ```bash

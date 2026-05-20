@@ -15,6 +15,19 @@ mod subscription;
 
 use pyo3::prelude::*;
 
+/// Install a global stderr subscriber for mmbus's Rust-side `tracing`
+/// events (publisher/subscriber lifecycle, WAL rotation/retention,
+/// publisher restart).  See [`crate::init_logging`].
+///
+/// Filtering: `RUST_LOG` if set (e.g. `RUST_LOG=mmbus=debug`), else the
+/// `level` argument, else `"info"`.  Idempotent — returns `True` only on
+/// the call that installs the subscriber.
+#[pyfunction]
+#[pyo3(signature = (level=None))]
+fn init_logging(level: Option<&str>) -> bool {
+    crate::init_logging(level)
+}
+
 #[pymodule]
 pub fn _mmbus(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<bus::PyBus>()?;
@@ -22,6 +35,7 @@ pub fn _mmbus(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<subscription::PySubscription>()?;
     m.add_class::<subscription::PyTopicStats>()?;
     m.add_class::<subscription::PyWalStats>()?;
+    m.add_function(wrap_pyfunction!(init_logging, m)?)?;
     exceptions::register(py, m)?;
     Ok(())
 }

@@ -13,6 +13,8 @@ pub mod prometheus;
 mod bus;
 mod config;
 mod error;
+#[cfg(feature = "logging")]
+mod logging;
 mod producer_lock;
 mod publisher;
 mod stats;
@@ -29,6 +31,9 @@ pub use stats::TopicStats;
 pub use subscriber::{StartPos, Subscriber};
 pub use subscription::Subscription;
 pub use wal::{FsyncPolicy, WalConfig};
+
+#[cfg(feature = "logging")]
+pub use logging::init_logging;
 
 #[cfg(feature = "python")]
 mod python;
