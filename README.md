@@ -348,6 +348,7 @@ the threat model and how to report issues.
 - [`docs/research.md`](docs/research.md) — competitive landscape and signals
 - [`docs/benchmarks-vs-competition.md`](docs/benchmarks-vs-competition.md) — mmbus vs ZeroMQ / Redis Streams / NATS, methodology + numbers
 - [`docs/roadmap.md`](docs/roadmap.md) — development phases
+- [`docs/plan-v0.5.md`](docs/plan-v0.5.md) — v0.5 plan: zero-copy receive, wakeup coalescing, structured logging
 - [`docs/rfc-wal-replay.md`](docs/rfc-wal-replay.md) — Phase A (in-ring history, shipped)
 - [`docs/rfc-wal-phase-b.md`](docs/rfc-wal-phase-b.md) — Phase B (durable WAL) full spec
 - [`docs/plan-wal-phase-b.md`](docs/plan-wal-phase-b.md) — Phase B implementation plan (W1-0 thru W1-f)

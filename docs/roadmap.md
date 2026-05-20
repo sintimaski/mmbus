@@ -1,5 +1,20 @@
 # Roadmap
 
+## Current state (as of v0.4.0)
+
+Shipped through v0.4.0: ring core, PyO3 bindings, async (asyncio + anyio),
+WAL Phase A (replay) + Phase B (durable mmap WAL v2), Prometheus exporter,
+tracing hooks, `mmbus-bridge` in-process Python SDK (TCP, v0.3.x), single-
+lookup publish hot path, zero-copy `publish_many`, `Bus.topic() → TopicPublisher`.
+
+Active plans:
+- [`docs/plan-v0.5.md`](plan-v0.5.md) — zero-copy receive, wakeup coalescing,
+  structured logging, NATS bench, bridge asyncio wrapper
+- Windows runtime CI (v0.6 gate)
+- v1.0 API freeze + release
+
+---
+
 ## Phase 1 — Rust Core ✓
 
 Goal: a working lock-free ring buffer over mmap with Unix socket signaling.
