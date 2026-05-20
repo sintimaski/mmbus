@@ -6,6 +6,16 @@ All notable changes to mmbus are recorded here.  Format follows
 
 ## [Unreleased]
 
+### Performance
+
+- **`publish_many` / `TopicPublisher.publish_many` are now zero-copy** at the
+  Python FFI boundary.  Previously each payload was extracted into an owned
+  `Vec<u8>` (N allocations + N memcpy); the new path accepts
+  `Vec<Bound<'_, PyBytes>>` and borrows the underlying buffer directly from
+  each Python `bytes` object.  The GIL is held across the batch rather than
+  released (ring writes are fast mmap stores + one wakeup; no per-message GIL
+  overhead).
+
 ## [0.4.0] - 2026-05-20
 
 ### Added

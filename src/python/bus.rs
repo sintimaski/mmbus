@@ -7,6 +7,7 @@ use crate::python::exceptions::mmbus_err;
 use crate::python::subscription::{PySubscription, PyTopicStats};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyBytesMethods};
 use std::time::Duration;
 
 /// Low-level Rust-backed Bus.  Prefer the Python ``Bus`` wrapper in
@@ -103,14 +104,20 @@ impl PyBus {
     /// failure mid-batch.  Both surface AFTER the wakeup is fired
     /// for whatever was already written, so committed records stay
     /// observable.
+    /// Publish a list of ``bytes`` to ``topic`` in a single call.
+    ///
+    /// Zero-copy: borrows each payload directly from the Python ``bytes``
+    /// objects while holding the GIL — no per-payload allocation.  Ring
+    /// writes are fast mmap stores + one wakeup syscall, so the GIL hold
+    /// is short and bounded by batch size.
     fn publish_many(
         &mut self,
-        py: Python<'_>,
+        _py: Python<'_>,
         topic: &str,
-        payloads: Vec<Vec<u8>>,
+        payloads: Vec<Bound<'_, PyBytes>>,
     ) -> PyResult<usize> {
-        py.allow_threads(|| self.inner.publish_many(topic, payloads))
-            .map_err(mmbus_err)
+        let slices: Vec<&[u8]> = payloads.iter().map(|b| b.as_bytes()).collect();
+        self.inner.publish_many(topic, slices).map_err(mmbus_err)
     }
 
     /// Return a :class:`TopicPublisher` bound to ``topic`` — a prepared
@@ -250,8 +257,12 @@ impl PyTopicPublisher {
     /// Publish a list of ``bytes`` in one call, firing a single wakeup per
     /// subscriber.  Returns the number of records written.  Mirrors
     /// :meth:`_RustBus.publish_many` minus the topic argument.
-    fn publish_many(&mut self, py: Python<'_>, payloads: Vec<Vec<u8>>) -> PyResult<usize> {
-        py.allow_threads(|| self.inner.publish_many(payloads)).map_err(mmbus_err)
+    ///
+    /// Zero-copy: borrows each payload directly from the Python ``bytes``
+    /// objects — no per-payload allocation.
+    fn publish_many(&mut self, _py: Python<'_>, payloads: Vec<Bound<'_, PyBytes>>) -> PyResult<usize> {
+        let slices: Vec<&[u8]> = payloads.iter().map(|b| b.as_bytes()).collect();
+        self.inner.publish_many(slices).map_err(mmbus_err)
     }
 
     /// Block until ``n`` subscribers are connected.  Releases the GIL.
