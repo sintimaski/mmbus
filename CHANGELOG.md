@@ -6,6 +6,34 @@ All notable changes to mmbus are recorded here.  Format follows
 
 ## [Unreleased]
 
+### Reliability (mmbus-bridge)
+
+- **Receive-side producers are now created eagerly at bridge
+  startup**, not lazily on the first republished message.  The
+  bridge's `publisher_main` pre-creates the producer + ring for every
+  `receive = true` topic via
+  `Bus::wait_for_subscribers(topic, 0, Duration::ZERO)`.  This closes
+  a race where a local subscriber connecting right after startup would
+  block — or attach mid-creation and miss the first forwarded message
+  — until inbound traffic triggered the lazy publish.  Fixes the
+  long-standing macOS flakiness in
+  `tests/psk_auth_smoke.rs::good_psk_authenticates_and_republishes`
+  (previously `#[ignore]`d on macOS; now un-ignored, 20/20 under
+  stress).  Also lets the Python loopback smoke check subscribe
+  deterministically (no retry loop on the receive side).
+
+### Build (mmbus-bridge)
+
+- **`pyo3/extension-module` is split out of the `python` Cargo
+  feature** into a separate `extension-module` feature (which the
+  wheel build enables via `bridge/pyproject.toml`).  `extension-module`
+  tells the linker not to provide libpython — correct for the wheel
+  cdylib, but it broke `cargo build/test --features python` for the
+  binary + test harnesses on platforms without `-undefined
+  dynamic_lookup` (i.e. Linux).  With the split, the wheel still links
+  correctly and `cargo build/test --features python` works on any
+  libpython-equipped host.
+
 ## [0.3.0] - 2026-05-20
 
 ### Added — Bridge Python SDK (in-process cross-machine pub/sub)

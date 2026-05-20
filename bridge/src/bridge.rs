@@ -287,10 +287,12 @@ impl Bridge {
                 let publish_shutdown = shutdown.clone();
                 let publisher_bus_cfg = bus_config(cfg);
                 let publisher_bus_name = cfg.bus.clone();
+                let publisher_receive_topics = receive_topics.clone();
                 let publish_handle = thread::spawn(move || {
                     publisher_main(
                         publisher_bus_name,
                         publisher_bus_cfg,
+                        publisher_receive_topics,
                         prx,
                         publish_shutdown,
                     );
@@ -839,10 +841,28 @@ fn handle_frame(
 fn publisher_main(
     bus_name: String,
     bus_cfg: BusConfig,
+    receive_topics: HashSet<String>,
     rx: mpsc::Receiver<(String, Vec<u8>)>,
     shutdown: Arc<AtomicBool>,
 ) {
     let mut bus = Bus::with_config(bus_name, bus_cfg);
+    // Eagerly create the producer (and its ring) for every receive
+    // topic at startup, instead of lazily on the first republish.
+    // This closes a race: a local subscriber that connects right after
+    // the bridge starts would otherwise block — or, worse, attach
+    // mid-creation and miss the first forwarded message — until some
+    // inbound traffic triggered the lazy `bus.publish`.  With the
+    // producer up front, subscribers attach to a stable ring before
+    // any traffic flows.  `wait_for_subscribers(_, 0, ZERO)` runs
+    // `ensure_publisher` then returns immediately (0 subscribers is
+    // trivially satisfied).
+    for topic in &receive_topics {
+        if let Err(e) = bus.wait_for_subscribers(topic, 0, Duration::from_millis(0)) {
+            eprintln!(
+                "bridge: could not pre-create producer for receive topic {topic:?}: {e}"
+            );
+        }
+    }
     while !shutdown.load(Ordering::Acquire) {
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok((topic, payload)) => {

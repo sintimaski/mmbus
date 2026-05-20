@@ -186,9 +186,16 @@ crate-type = ["cdylib", "rlib"]   # cdylib for the wheel, rlib for the binary
 
 [features]
 python = ["dep:pyo3", "dep:serde_json"]
+# `extension-module` is split OUT of `python` on purpose: it tells the
+# linker NOT to provide libpython (correct for a wheel, fatal for the
+# binary + `cargo test` harness, which need libpython linked).  Only
+# the wheel build enables it (via pyproject below).  This keeps
+# `cargo build/test --features python` working on every platform,
+# Linux included.
+extension-module = ["python", "pyo3/extension-module"]
 
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+pyo3 = { version = "0.22", optional = true }   # NO extension-module here
 serde_json = { version = "1", optional = true }
 ```
 
@@ -200,7 +207,7 @@ name = "mmbus-bridge"
 dependencies = ["mmbus==0.3.0"]
 
 [tool.maturin]
-features = ["python"]              # TCP-only; NOT the crate's `quic` feature
+features = ["extension-module"]    # pulls `python` transitively; TCP-only (no `quic`)
 module-name = "mmbus_bridge._mmbus_bridge"
 python-source = "python"
 ```
@@ -339,9 +346,29 @@ convention so it runs in any CI with the two wheels installed:
 The loopback round-trip is the integration heavyweight — it spins
 up two `Bridge` instances with non-overlapping `base_dir`s and
 asserts a message published on A's bus arrives on B's bus, proving
-the wiring works end-to-end without the standalone binary.  It is
-timing-tolerant (retries publish + recv against a 25 s deadline)
-since cross-process bus attach + TCP connect are inherently async.
+the wiring works end-to-end without the standalone binary.  The
+receive-side subscribe is deterministic (see eager-producer note
+below); only the publish loop retries, to cover the one inherently
+async step — the A→B TCP connect + PeerHello auth — against a 25 s
+safety deadline.
+
+### 5.6 Eager producer creation (reliability)
+
+The bridge's receive-side publisher used to create each topic's
+producer + ring **lazily**, on the first republished message.  That
+left a window where a local subscriber connecting right after bridge
+startup either blocked or attached mid-creation and missed the first
+forwarded message — the root cause of a long-standing macOS-flaky
+Rust test (`psk_auth_smoke::good_psk_authenticates_and_republishes`,
+previously `#[ignore]`d).
+
+Fix: `publisher_main` now pre-creates the producer for every
+`receive = true` topic at startup via
+`bus.wait_for_subscribers(topic, 0, Duration::ZERO)` (which runs
+`ensure_publisher` then returns immediately).  Subscribers attach to
+a stable ring before any traffic flows.  This made the flaky test
+deterministic (un-ignored; 20/20 under stress) and let the Python
+loopback smoke check drop its subscribe-retry loop.
 
 ## 6. Risks & mitigations
 

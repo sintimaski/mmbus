@@ -26,11 +26,13 @@ dependencies = ["mmbus==0.3.0"]
 # Build the Rust extension as the private mmbus_bridge._mmbus_bridge
 # sub-module; python/mmbus_bridge/__init__.py re-exports the public API.
 #
-# TCP-only: we deliberately do NOT enable the crate's `quic` feature
-# here — embedding tokio + quinn + rustls + ring + rcgen would bloat
-# the wheel for the common case.  QUIC users keep the standalone
+# `extension-module` pulls in `python` transitively (see
+# bridge/Cargo.toml) AND sets the no-link-libpython flag the wheel
+# needs.  TCP-only: we deliberately do NOT enable the crate's `quic`
+# feature here — embedding tokio + quinn + rustls + ring + rcgen would
+# bloat the wheel for the common case.  QUIC users keep the standalone
 # `mmbus-bridge` binary.  See docs/rfc-bridge-python-sdk.md.
-features = ["python"]
+features = ["extension-module"]
 module-name = "mmbus_bridge._mmbus_bridge"
 python-source = "python"
 # Don't try to build the `mmbus-bridge` binary into the wheel — the

@@ -23,17 +23,25 @@ quic = ["dep:quinn", "dep:tokio", "dep:rustls", "dep:rcgen", "dep:rustls-pki-typ
 # PyO3 bindings — built as the `mmbus_bridge._mmbus_bridge` Python
 # extension via maturin.  Pulls in pyo3 + serde_json (the latter
 # adapts Python dict → BridgeConfig by sharing the bridge's existing
-# Deserialize impl).  Off by default for plain Rust users; the
-# `bridge/pyproject.toml` wheel enables it.  See
+# Deserialize impl).  Off by default for plain Rust users.  See
 # `docs/rfc-bridge-python-sdk.md`.
 python = ["dep:pyo3", "dep:serde_json"]
+# `pyo3/extension-module` is deliberately split OUT of `python` and
+# enabled ONLY by the wheel build (maturin reads it from
+# `bridge/pyproject.toml`).  extension-module tells the linker NOT to
+# provide libpython — correct for a wheel (symbols resolve at import
+# time) but fatal for the `mmbus-bridge` binary + `cargo test`
+# harnesses, which need libpython linked.  Keeping it separate lets
+# `cargo build/test --features python` work on every platform
+# (Linux included) while the wheel still gets the right link flags.
+extension-module = ["python", "pyo3/extension-module"]
 
 [dependencies]
 mmbus = { path = ".." }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 thiserror = "1"
-pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+pyo3 = { version = "0.22", optional = true }
 serde_json = { version = "1", optional = true }
 
 # `quic` feature dependencies — all optional + off by default.

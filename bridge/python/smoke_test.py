@@ -173,6 +173,17 @@ def test_loopback_roundtrip():
     deadline = time.time() + 25.0
     payload = b"hello-across-the-wire"
 
+    # B's bridge eagerly creates the producer for receive topic
+    # "events" at startup, so this subscribe attaches deterministically
+    # to a stable ring — no retry loop needed on the receive side.
+    try:
+        sub_b = bus_b.subscribe("events", timeout_secs=10.0)
+    except Exception as e:  # noqa: BLE001
+        check("B subscriber attached to eager producer", False, str(e))
+        bridge_a.shutdown(); bridge_b.shutdown()
+        return
+    check("B subscriber attached to eager producer", True)
+
     # A's bridge subscriber connects to pub_a's topic once a producer
     # exists; publish a priming message to become the producer, then
     # wait for the bridge subscriber to attach.
@@ -185,19 +196,15 @@ def test_loopback_roundtrip():
         return
     check("A's bridge subscriber attached", True)
 
-    # B's bridge publisher only becomes a producer after the first
-    # forwarded message lands.  Keep A publishing while we retry the
-    # subscribe + recv on B until the payload shows up.
+    # The one inherently-async step left is the A->B TCP connect +
+    # PeerHello auth (the forwarder dials with backoff).  Publish the
+    # payload on A until it lands on B; identical payloads mean order
+    # doesn't matter, so the assertion stays deterministic.  On
+    # loopback this converges in well under a second; the deadline is
+    # only a safety net.
     got = None
-    sub_b = None
     while time.time() < deadline and got is None:
         pub_a.publish("events", payload)
-        if sub_b is None:
-            try:
-                sub_b = bus_b.subscribe("events", timeout_secs=0.5)
-            except Exception:  # noqa: BLE001
-                time.sleep(0.2)
-                continue
         msg = sub_b.recv_timeout(0.5)
         if msg == payload:
             got = msg
