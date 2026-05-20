@@ -6,6 +6,8 @@ All notable changes to mmbus are recorded here.  Format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-20
+
 ### Added
 
 - **`Bus.topic(name) -> TopicPublisher`** — a prepared publish handle for
