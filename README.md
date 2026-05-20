@@ -130,8 +130,9 @@ Needs `pip install anyio`; the import is lazy so it's a true opt-in.
 
 ## Performance
 
-Three regimes worth measuring separately.  Numbers from `cargo bench` /
-`benches/compare.py` on an Apple M-series laptop.
+Four regimes worth measuring separately.  Numbers from `cargo bench`,
+`benches/compare.py`, and `benches/competitive/` on an Apple M-series
+laptop (APFS).
 
 **1. Rust ring layer alone** — in-process publish + receive of a slot,
 no IPC wakeup:
@@ -166,18 +167,49 @@ cross-thread bench against `pyzmq` over `ipc://`, 10 000 messages each:
 | 1024 B  | ~198 K msg/s       | ~746 K msg/s       | pyzmq ~4× faster |
 | 16384 B | ~17 K msg/s        | ~204 K msg/s       | pyzmq ~12× faster |
 
-**Honest take:** for small Python publishes, pyzmq today is faster than
-mmbus.  Its Cython wrapper batches messages into a single socket write
-on a background I/O thread, while mmbus does one PyO3 call + one
-wakeup syscall + one `PyBytes` allocation per message.  Where mmbus
-wins is at the **Rust level** (table 1: ~40M ops/s, ~25 ns
-roundtrip) and in the operational story: no broker, no daemon, single
-`pip install`.  Until we add a zero-copy `memoryview` recv path (open;
-see roadmap), pyzmq is the right pick for high-rate small-payload
-Python pub/sub.
+**Honest take:** for small *single-message* Python publishes, pyzmq
+today is faster than mmbus.  Its Cython wrapper batches messages into a
+single socket write on a background I/O thread, while mmbus does one
+PyO3 call + one wakeup syscall + one `PyBytes` allocation per message.
+The per-call PyO3 cost — not the design — is the bottleneck:
+`publish_many` amortizes it and lifts same-host Python throughput to
+**~1.34 M msg/s** (table 4).  Where mmbus also wins is at the **Rust
+level** (table 1: ~40M ops/s, ~25 ns roundtrip) and in the operational
+story: no broker, no daemon, single `pip install`.
+
+**4. vs ZeroMQ / Redis Streams / NATS JetStream** — same machine,
+256 B payload, 1M messages, 1 publisher + 1 consumer, batched publishes
+where the framework supports them (mmbus uses `publish_many` to amortize
+the per-call cost table 3 pays).  Full methodology + caveats in
+[`docs/benchmarks-vs-competition.md`](docs/benchmarks-vs-competition.md):
+
+_Non-durable_ (ephemeral same-host pub/sub):
+
+| Framework            | Sustained    |
+|----------------------|--------------|
+| ZeroMQ PUSH/PULL (`ipc://`) | **1.65 M/s** |
+| **mmbus**            | **1.34 M/s** |
+
+_Durable_ (crash-safe, fsync on):
+
+| Framework                          | Sustained    |
+|------------------------------------|--------------|
+| **mmbus** (Rust criterion, pure publish) | **~4.6 M/s** |
+| **mmbus** (Python wheel)           | **1.06 M/s** |
+| Redis Streams                      | 0.12 M/s     |
+| NATS JetStream                     | _pending (macOS Docker didn't converge)_ |
+
+ZeroMQ edges mmbus on raw non-durable throughput (more aggressive
+outbound buffering) but has no built-in durability.  With durability
+on, mmbus's mmap-backed WAL is **~9× faster than Redis Streams** on the
+Python comparison (skipping the loopback-TCP + per-second-fsync wall),
+and ~38× in pure Rust.  Of the four, mmbus is the only one offering
+durable replay for same-host pub/sub without a separate broker or
+library.
 
 Reproduce: `cargo bench --bench ring && cargo bench --bench e2e &&
-python benches/compare.py`.
+python benches/compare.py`; competitive suite: `cd benches/competitive
+&& ./run_all.sh` (needs Docker for the Redis + NATS containers).
 
 ## How it works
 
@@ -313,12 +345,14 @@ the threat model and how to report issues.
 
 - [`docs/architecture.md`](docs/architecture.md) — technical design
 - [`docs/research.md`](docs/research.md) — competitive landscape and signals
+- [`docs/benchmarks-vs-competition.md`](docs/benchmarks-vs-competition.md) — mmbus vs ZeroMQ / Redis Streams / NATS, methodology + numbers
 - [`docs/roadmap.md`](docs/roadmap.md) — development phases
 - [`docs/rfc-wal-replay.md`](docs/rfc-wal-replay.md) — Phase A (in-ring history, shipped)
 - [`docs/rfc-wal-phase-b.md`](docs/rfc-wal-phase-b.md) — Phase B (durable WAL) full spec
 - [`docs/plan-wal-phase-b.md`](docs/plan-wal-phase-b.md) — Phase B implementation plan (W1-0 thru W1-f)
 - [`docs/rfc-multi-machine.md`](docs/rfc-multi-machine.md) — design for the `mmbus-bridge` relay
 - [`docs/rfc-b4b-quic.md`](docs/rfc-b4b-quic.md) — bridge B4b QUIC transport spec
+- [`docs/rfc-bridge-python-sdk.md`](docs/rfc-bridge-python-sdk.md) — in-process bridge Python SDK (`mmbus_bridge.Bridge`, v0.3.x)
 - [`docs/rfc-windows.md`](docs/rfc-windows.md) — design for Windows support
 
 ## License
