@@ -105,10 +105,15 @@ pub(crate) mod linux {
     // ── SCM_RIGHTS fd-passing ─────────────────────────────────────────────────
 
     /// Send `fd` to `sock` as SCM_RIGHTS ancillary data with a 1-byte payload.
-    pub fn send_fd(sock: &UnixStream, fd: RawFd) -> io::Result<()> {
-        let dummy: u8 = 1;
-        let iov =
-            libc::iovec { iov_base: &dummy as *const u8 as *mut libc::c_void, iov_len: 1 };
+    /// Send the subscriber's eventfd (via SCM_RIGHTS) plus its 4-byte
+    /// `cursor_idx` (in the regular iovec payload) to the publisher.  The
+    /// publisher uses the index to address this subscriber's wakeup flag.
+    pub fn send_fd(sock: &UnixStream, fd: RawFd, cursor_idx: u32) -> io::Result<()> {
+        let idx_bytes = cursor_idx.to_le_bytes();
+        let iov = libc::iovec {
+            iov_base: idx_bytes.as_ptr() as *mut libc::c_void,
+            iov_len: idx_bytes.len(),
+        };
         let fd_size = std::mem::size_of::<libc::c_int>() as u32;
         // SAFETY: CMSG_SPACE is a const-fn-equivalent macro that just
         // computes a size; it has no side effects.
@@ -146,12 +151,15 @@ pub(crate) mod linux {
         Ok(())
     }
 
-    /// Receive an fd sent via SCM_RIGHTS from `sock`.  The received fd is a
+    /// Receive an fd sent via SCM_RIGHTS from `sock`, plus the subscriber's
+    /// 4-byte `cursor_idx` from the regular payload.  The received fd is a
     /// fresh file-descriptor number in the caller's process (kernel dups it).
-    pub fn recv_fd(sock: &UnixStream) -> io::Result<OwnedFd> {
-        let mut dummy: u8 = 0;
-        let mut iov =
-            libc::iovec { iov_base: &mut dummy as *mut u8 as *mut libc::c_void, iov_len: 1 };
+    pub fn recv_fd(sock: &UnixStream) -> io::Result<(OwnedFd, u32)> {
+        let mut idx_bytes = [0u8; 4];
+        let mut iov = libc::iovec {
+            iov_base: idx_bytes.as_mut_ptr() as *mut libc::c_void,
+            iov_len: idx_bytes.len(),
+        };
         let fd_size = std::mem::size_of::<libc::c_int>() as u32;
         // SAFETY: pure size computation, no side effects.
         let cmsg_space = unsafe { libc::CMSG_SPACE(fd_size) } as usize;
@@ -184,7 +192,7 @@ pub(crate) mod linux {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "expected SCM_RIGHTS"));
             }
             let raw: libc::c_int = std::ptr::read(libc::CMSG_DATA(cmsg) as *const libc::c_int);
-            Ok(OwnedFd::from_raw_fd(raw))
+            Ok((OwnedFd::from_raw_fd(raw), u32::from_le_bytes(idx_bytes)))
         }
     }
 }
@@ -377,30 +385,34 @@ pub(crate) mod windows {
 
     // ── Handshake message (12 bytes: u32 pid + u64 handle value) ──────────────
 
-    /// Subscriber-side: tell the publisher which process we are and the
-    /// value of our semaphore handle (so the publisher can dup it).
-    pub fn send_handshake(pipe: HANDLE, sem: HANDLE) -> io::Result<()> {
+    /// Subscriber-side: tell the publisher which process we are, the value
+    /// of our semaphore handle (so the publisher can dup it), and our
+    /// `cursor_idx` (so the publisher can address our wakeup flag).
+    pub fn send_handshake(pipe: HANDLE, sem: HANDLE, cursor_idx: u32) -> io::Result<()> {
         // SAFETY: pipe is caller-owned and open for write; GetCurrentProcessId
-        // is a pure read of the current TEB.  We send a 12-byte buffer of
-        // (pid_le u32, handle_value_le u64) — handle values are pointer-
-        // sized on Windows but kernel handle numbers are always within
-        // the first 32 bits in practice; we encode as u64 for cross-
-        // architecture safety.
+        // is a pure read of the current TEB.  We send a 16-byte buffer of
+        // (pid_le u32, handle_value_le u64, cursor_idx_le u32) — handle
+        // values are pointer-sized on Windows but kernel handle numbers are
+        // always within the first 32 bits in practice; we encode as u64 for
+        // cross-architecture safety.
         let pid = unsafe { GetCurrentProcessId() };
-        let mut buf = [0u8; 12];
+        let mut buf = [0u8; 16];
         buf[0..4].copy_from_slice(&pid.to_le_bytes());
         buf[4..12].copy_from_slice(&(sem as usize as u64).to_le_bytes());
+        buf[12..16].copy_from_slice(&cursor_idx.to_le_bytes());
         write_all(pipe, &buf)
     }
 
     /// Publisher-side: read the subscriber's handshake and dup the
     /// subscriber's semaphore into our handle table.  Returns an owned
-    /// handle to the duplicated semaphore (drop = `CloseHandle`).
-    pub fn recv_handshake_and_dup(pipe: HANDLE) -> io::Result<OwnedHandle> {
-        let mut buf = [0u8; 12];
+    /// handle to the duplicated semaphore (drop = `CloseHandle`) plus the
+    /// subscriber's `cursor_idx`.
+    pub fn recv_handshake_and_dup(pipe: HANDLE) -> io::Result<(OwnedHandle, u32)> {
+        let mut buf = [0u8; 16];
         read_exact(pipe, &mut buf)?;
         let pid = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         let sub_sem_val = u64::from_le_bytes(buf[4..12].try_into().unwrap());
+        let cursor_idx = u32::from_le_bytes(buf[12..16].try_into().unwrap());
 
         // SAFETY: OpenProcess with PROCESS_DUP_HANDLE returns a handle we
         // own (must CloseHandle); pid is just an integer.  inherit_handle=
@@ -438,7 +450,7 @@ pub(crate) mod windows {
         // SAFETY: dup_handle was just written by DuplicateHandle into our
         // own process; ownership transfers to OwnedHandle which will
         // CloseHandle on Drop.
-        Ok(unsafe { OwnedHandle::from_raw_handle(dup_handle as RawHandle) })
+        Ok((unsafe { OwnedHandle::from_raw_handle(dup_handle as RawHandle) }, cursor_idx))
     }
 
     // ── Synchronous I/O helpers over a pipe HANDLE ────────────────────────────

@@ -6,8 +6,28 @@ All notable changes to mmbus are recorded here.  Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Wire format v4 → v5.**  The ring header gains a per-subscriber
+  `needs_wakeup` flag table (after the cursor table) for wakeup coalescing.
+  A v5 publisher refuses a v4 on-disk ring (and vice versa) with
+  `InvalidData` — upgrading requires restarting publisher + subscribers
+  together, as with any wire bump.  The connect handshake also now carries
+  the subscriber's `cursor_idx` to the publisher.
+
 ### Added
 
+- **Wakeup coalescing.**  The publisher fires a per-message wakeup syscall
+  only for subscribers that have announced they are about to sleep (an
+  eventcount handshake via the new flag table), instead of one wakeup per
+  subscriber per publish.  A subscriber that is keeping up or draining a
+  burst is not re-woken per message — it observes the new tail on its next
+  ring read.  Measured ~54% fewer wakeup syscalls on a 20 K-message Python
+  cross-thread burst (0.46 wakeups/publish); higher for idle/laggy
+  subscribers.  Missed-wakeup-safe (paired SeqCst fences); validated by
+  `tests/wakeup_coalescing.rs`.  New `TopicStats.wakeups_sent_total`
+  counter (also `mmbus_wakeups_sent_total` in the Prometheus exporter)
+  surfaces the coalescing ratio.
 - **`Subscription.recv_into(buf)` / `recv_timeout_into(buf, timeout_secs)` /
   `try_recv_into(buf)`** — allocation-free receive.  Each writes the next
   message's payload straight into a caller-provided writable buffer

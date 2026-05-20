@@ -255,37 +255,55 @@ class AsyncSubscription:
         """Await the next message.  Raises :exc:`EOFError` if the publisher
         disconnects while waiting."""
         loop = _asyncio.get_running_loop()
-        fut = loop.create_future()
         wfd = self._sub.fileno()
         sfd = self._sub.socket_fileno()
         # On macOS these are the same fd; on Linux wfd is the eventfd and
         # sfd is the handshake socket (POLLHUP signals publisher death).
         same_fd = wfd == sfd
 
-        def on_data() -> None:
-            try:
-                msg = self._sub.poll_recv()
-            except OSError as e:
+        while True:
+            # 1. Read directly from the ring (no wakeup needed).  Drains a
+            #    burst back-to-back without a syscall per message.
+            msg = self._sub.try_recv()
+            if msg is not None:
+                return msg
+            # 2. Ring empty: arm the wakeup flag and re-check (eventcount).
+            #    The publisher coalesces wakeups — it signals only
+            #    subscribers whose flag is set — so we MUST arm before
+            #    awaiting or we'd never be woken.  arm_wakeup returns True
+            #    if a message arrived while arming (re-read immediately).
+            if self._sub.arm_wakeup():
+                continue
+            # 3. Await fd readability; the publisher's next publish fires the
+            #    wakeup (and clears our flag).
+            fut = loop.create_future()
+
+            def on_data() -> None:
+                # Clear the pending wakeup unit so the level-triggered fd
+                # stops signalling, then re-read the ring on the next loop.
+                try:
+                    self._sub.drain_wakeup()
+                except OSError as e:
+                    if not fut.done():
+                        fut.set_exception(e)
+                    return
                 if not fut.done():
-                    fut.set_exception(e)
-                return
-            if msg is not None and not fut.done():
-                fut.set_result(msg)
-            # else: spurious wakeup — reader stays armed.
+                    fut.set_result(None)
 
-        def on_disconnect() -> None:
-            if not fut.done():
-                fut.set_exception(EOFError("publisher disconnected"))
+            def on_disconnect() -> None:
+                if not fut.done():
+                    fut.set_exception(EOFError("publisher disconnected"))
 
-        loop.add_reader(wfd, on_data)
-        if not same_fd:
-            loop.add_reader(sfd, on_disconnect)
-        try:
-            return await fut
-        finally:
-            loop.remove_reader(wfd)
+            loop.add_reader(wfd, on_data)
             if not same_fd:
-                loop.remove_reader(sfd)
+                loop.add_reader(sfd, on_disconnect)
+            try:
+                await fut
+            finally:
+                loop.remove_reader(wfd)
+                if not same_fd:
+                    loop.remove_reader(sfd)
+            # loop back: try_recv reads the now-available message(s)
 
     async def recv_timeout(self, timeout_secs: float = 1.0):
         """Await the next message up to *timeout_secs*.  Returns ``None`` on timeout."""

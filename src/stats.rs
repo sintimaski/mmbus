@@ -29,4 +29,11 @@ pub struct TopicStats {
     /// because their wakeup call failed (typically: peer closed
     /// the connection / process died).
     pub subscribers_dropped_total: u64,
+
+    /// Monotonic count of wakeup syscalls actually fired since this
+    /// Publisher was created.  With wakeup coalescing this is far
+    /// below `published_total` under bursts (a subscriber that is
+    /// keeping up or actively draining is not re-woken per message).
+    /// `wakeups_sent_total / published_total` is the coalescing ratio.
+    pub wakeups_sent_total: u64,
 }

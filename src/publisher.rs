@@ -28,6 +28,12 @@ use std::thread;
 
 /// Per-subscriber connection state held by the publisher.
 struct Client {
+    /// The subscriber's cursor-table slot index, received during the
+    /// handshake.  Used to address this subscriber's wakeup flag so the
+    /// publisher can coalesce: it fires a wakeup only when the flag is set
+    /// (the subscriber announced it is about to sleep).
+    cursor_idx: usize,
+
     /// On macOS, the wakeup channel — see [`Client::wake`].  On
     /// Linux, held only to keep the handshake socket alive (we
     /// wake via eventfd) so the peer detects publisher death via
@@ -117,6 +123,8 @@ pub struct Publisher {
     published_total: AtomicU64,
     full_rejected_total: AtomicU64,
     subscribers_dropped_total: AtomicU64,
+    /// Wakeup syscalls actually fired (coalescing skips most under bursts).
+    wakeups_sent_total: AtomicU64,
 }
 
 impl Publisher {
@@ -199,6 +207,7 @@ impl Publisher {
             published_total: AtomicU64::new(0),
             full_rejected_total: AtomicU64::new(0),
             subscribers_dropped_total: AtomicU64::new(0),
+            wakeups_sent_total: AtomicU64::new(0),
         })
     }
 
@@ -340,8 +349,31 @@ impl Publisher {
     /// Fire one wakeup per connected subscriber; drop any whose peer
     /// has closed.  Used by both `publish` and `publish_many`.
     fn broadcast_wakeup(&mut self) {
+        if self.clients.is_empty() {
+            return; // keeps the no-subscriber publish path free of the fence
+        }
+        // StoreLoad barrier between the ring's tail store (above, Release in
+        // `write_slot`) and the per-subscriber flag loads below.  Pairs with
+        // the subscriber's `set_wakeflag` + SeqCst fence in `wait_readable` /
+        // `arm_wakeup`: in the SeqCst total order either the subscriber sees
+        // our new tail (and doesn't sleep) or we see its flag (and wake it).
+        std::sync::atomic::fence(AtomicOrdering::SeqCst);
         let mut i = 0;
         while i < self.clients.len() {
+            let idx = self.clients[i].cursor_idx;
+            // Wake when the subscriber announced it is about to sleep
+            // (flag set) OR it released its cursor slot (clean disconnect —
+            // probe so a dead peer is reaped + the dropped counter ticks).
+            // A subscriber that is actively draining (claimed cursor, no
+            // flag) is skipped: it sees the new tail on its next ring read
+            // without a syscall.  This is the coalescing win.
+            let should_wake =
+                self.ring.take_wakeflag(idx) || self.ring.cursor_is_unclaimed(idx);
+            if !should_wake {
+                i += 1;
+                continue;
+            }
+            self.wakeups_sent_total.fetch_add(1, AtomicOrdering::Relaxed);
             if self.clients[i].wake() {
                 i += 1;
             } else {
@@ -385,6 +417,7 @@ impl Publisher {
             subscribers_dropped_total: self
                 .subscribers_dropped_total
                 .load(AtomicOrdering::Relaxed),
+            wakeups_sent_total: self.wakeups_sent_total.load(AtomicOrdering::Relaxed),
         }
     }
 
@@ -415,14 +448,28 @@ impl Publisher {
         #[cfg(unix)]
         loop {
             match self.listener.accept() {
-                Ok((sock, _)) => {
+                Ok((mut sock, _)) => {
                     sock.set_nonblocking(false)?;
                     suppress_sigpipe(&sock);
 
+                    // Linux: the eventfd + cursor_idx arrive together via
+                    // SCM_RIGHTS.  macOS: cursor_idx is the first 4 bytes
+                    // written on the socket, ahead of the 1-byte wakeups.
                     #[cfg(target_os = "linux")]
-                    let efd = crate::waker::linux::recv_fd(&sock)?;
+                    let (efd, cursor_idx) = {
+                        let (fd, idx) = crate::waker::linux::recv_fd(&sock)?;
+                        (fd, idx as usize)
+                    };
+                    #[cfg(target_os = "macos")]
+                    let cursor_idx = {
+                        use std::io::Read;
+                        let mut idx_bytes = [0u8; 4];
+                        sock.read_exact(&mut idx_bytes)?;
+                        u32::from_le_bytes(idx_bytes) as usize
+                    };
 
                     self.clients.push(Client {
+                        cursor_idx,
                         sock,
                         #[cfg(target_os = "linux")]
                         efd,
@@ -537,18 +584,18 @@ fn spawn_windows_accept_thread(
             // Throwaway connection from Drop — discard pipe and exit.
             break;
         }
-        // Read the subscriber's handshake + dup its semaphore.
-        let sem = match crate::waker::windows::recv_handshake_and_dup(
+        // Read the subscriber's handshake + dup its semaphore + cursor_idx.
+        let (sem, cursor_idx) = match crate::waker::windows::recv_handshake_and_dup(
             pipe.as_raw_handle() as crate::waker::windows::RawWinHandle,
         ) {
-            Ok(h) => h,
+            Ok((h, idx)) => (h, idx as usize),
             Err(e) => {
                 let _ = tx.send(Err(e));
                 continue;
             }
         };
         if tx
-            .send(Ok(Client { _pipe: pipe, sem }))
+            .send(Ok(Client { cursor_idx, _pipe: pipe, sem }))
             .is_err()
         {
             // Receiver dropped (Publisher gone) — exit.

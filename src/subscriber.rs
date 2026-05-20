@@ -143,7 +143,9 @@ impl Subscriber {
                     }
                 }
             };
-            if let Err(e) = crate::waker::linux::send_fd(&sock, efd.as_raw_fd()) {
+            if let Err(e) =
+                crate::waker::linux::send_fd(&sock, efd.as_raw_fd(), cursor_idx as u32)
+            {
                 ring.release_cursor(cursor_idx);
                 return Err(Error::Io(e));
             }
@@ -154,7 +156,7 @@ impl Subscriber {
         #[cfg(target_os = "macos")]
         let sock = {
             let sock_path = dir.join("signal.sock");
-            loop {
+            let mut s = loop {
                 match UnixStream::connect(&sock_path) {
                     Ok(s) => break s,
                     Err(_) if Instant::now() < deadline => {
@@ -165,7 +167,16 @@ impl Subscriber {
                         return Err(Error::Timeout(name.to_owned()));
                     }
                 }
+            };
+            // Handshake: send our cursor_idx (4 bytes LE) so the publisher
+            // can address our wakeup flag.  Subsequent traffic on this
+            // socket is the 1-byte per-message wakeup.
+            use std::io::Write;
+            if let Err(e) = s.write_all(&(cursor_idx as u32).to_le_bytes()) {
+                ring.release_cursor(cursor_idx);
+                return Err(Error::Io(e));
             }
+            s
         };
 
         // ── Windows: named pipe + semaphore handshake ────────────────────────
@@ -191,10 +202,12 @@ impl Subscriber {
                     }
                 }
             };
-            // Send our (pid, sem) so the publisher can DuplicateHandle.
+            // Send our (pid, sem, cursor_idx) so the publisher can
+            // DuplicateHandle and address our wakeup flag.
             if let Err(e) = crate::waker::windows::send_handshake(
                 pipe.as_raw_handle() as crate::waker::windows::RawWinHandle,
                 sem.as_raw_handle() as crate::waker::windows::RawWinHandle,
+                cursor_idx as u32,
             ) {
                 ring.release_cursor(cursor_idx);
                 return Err(Error::Io(e));
@@ -308,7 +321,10 @@ impl Subscriber {
                 self.cursor = new_cursor;
                 return Ok(());
             }
-            self.wait_wakeup(-1)?;
+            // Ring empty: arm the wakeup flag, re-check, then sleep.
+            // `wait_readable` performs the eventcount handshake so the
+            // publisher knows to wake us (it coalesces wakeups otherwise).
+            self.wait_readable(-1)?;
         }
     }
 
@@ -345,15 +361,9 @@ impl Subscriber {
                 return Ok(false);
             }
             let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
-            match self.wait_wakeup(ms) {
-                Ok(()) => {}
-                Err(e)
-                    if e.kind() == io::ErrorKind::WouldBlock
-                        || e.kind() == io::ErrorKind::TimedOut =>
-                {
-                    return Ok(false);
-                }
-                Err(e) => return Err(e.into()),
+            // eventcount handshake (see `wait_readable`); Ok(false) = timed out.
+            if !self.wait_readable(ms)? {
+                return Ok(false);
             }
         }
     }
@@ -437,16 +447,34 @@ impl Subscriber {
         }
     }
 
-    /// Block until one wakeup arrives (or the publisher disconnects),
-    /// without touching any payload buffer.  `timeout_ms = -1` blocks
-    /// indefinitely.  Returns `Ok(true)` when woken, `Ok(false)` on timeout.
+    /// Eventcount wait: the caller has just observed the ring empty.
+    /// Announce intent to sleep (set the wakeup flag so the publisher will
+    /// wake us — it coalesces wakeups to subscribers that don't), re-check
+    /// the ring to close the publish-between-check-and-sleep race, then
+    /// block.  `timeout_ms = -1` blocks indefinitely.
     ///
-    /// This is the "wait" half of the slice-target receive loop: the Python
+    /// Returns `Ok(true)` if the caller should retry its read (the re-check
+    /// found data, or we were woken); `Ok(false)` on timeout.
+    ///
+    /// Also the "wait" half of the slice-target receive loop: the Python
     /// binding holds a borrowed buffer pointer across this call (GIL
     /// released) and reads into it only afterwards (GIL held), so the wait
-    /// must not access the buffer.
+    /// must not access that buffer — it doesn't.
     pub fn wait_readable(&mut self, timeout_ms: i32) -> Result<bool> {
-        match self.wait_wakeup(timeout_ms) {
+        self.ring.set_wakeflag(self.cursor_idx);
+        // StoreLoad barrier: order the flag store before the tail load
+        // below, mirroring the publisher's fence between its tail store and
+        // its flag swap.  Together they guarantee no missed wakeup — either
+        // we observe the new tail here, or the publisher observes our flag
+        // and wakes us.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        if self.cursor < self.ring.current_tail() {
+            self.ring.clear_wakeflag(self.cursor_idx);
+            return Ok(true);
+        }
+        let r = self.wait_wakeup(timeout_ms);
+        self.ring.clear_wakeflag(self.cursor_idx);
+        match r {
             Ok(()) => Ok(true),
             Err(e)
                 if e.kind() == io::ErrorKind::WouldBlock
@@ -455,6 +483,25 @@ impl Subscriber {
                 Ok(false)
             }
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Arm the wakeup flag for an event-loop (`add_reader`) waiter that
+    /// sleeps outside this process (asyncio).  Sets the flag + the same
+    /// SeqCst barrier as [`Self::wait_readable`], then re-checks the ring.
+    ///
+    /// Returns `true` if data is already available (caller should read
+    /// immediately, not await); `false` if the flag is armed and the caller
+    /// should await fd readability — the publisher's next publish will fire
+    /// the wakeup and clear the flag.
+    pub fn arm_wakeup(&mut self) -> bool {
+        self.ring.set_wakeflag(self.cursor_idx);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        if self.cursor < self.ring.current_tail() {
+            self.ring.clear_wakeflag(self.cursor_idx);
+            true
+        } else {
+            false
         }
     }
 
@@ -562,6 +609,15 @@ impl Subscriber {
             )));
         }
         Ok(self.try_receive())
+    }
+
+    /// Public, `Result`-typed wrapper over [`Self::try_drain_wakeup`] for
+    /// the asyncio `add_reader` path: clear one pending wakeup unit so the
+    /// (level-triggered) fd stops signalling, then read the ring separately
+    /// via `try_receive`.  Returns `Ok(true)` if a unit was drained,
+    /// `Ok(false)` if none was pending; `Err` on publisher disconnect.
+    pub fn drain_wakeup(&mut self) -> Result<bool> {
+        self.try_drain_wakeup().map_err(Into::into)
     }
 
     /// Drain exactly one wakeup unit without blocking.

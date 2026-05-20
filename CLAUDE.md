@@ -20,11 +20,21 @@ format break or a crash-safety break.
 
 2. **Wire format version stamping.**  The ring header carries
    `MAGIC` (`mmbus\0\0\0` + 4-byte version) + `version: u32`.
-   Current version is `4`.  ANY layout change to the ring or the
-   per-slot framing requires a version bump + a reader fall-back
+   Current version is `5` (v5 added the per-cursor `needs_wakeup`
+   flag table after the cursor table — see the wakeup-coalescing
+   eventcount in `Subscriber::wait_readable`/`arm_wakeup` +
+   `Publisher::broadcast_wakeup`).  ANY layout change to the ring or
+   the per-slot framing requires a version bump + a reader fall-back
    (subscribers refuse mismatched mmaps with `InvalidData`, not
    undefined behaviour).  Same rule applies to WAL segments:
    `SEGMENT_MAGIC` + `SEGMENT_VERSION = 1`.
+
+   The handshake also carries the subscriber's `cursor_idx` to the
+   publisher (Linux: in the `SCM_RIGHTS` iovec; macOS: a 4-byte
+   prefix on the signal socket; Windows: in the semaphore-handshake
+   struct) so `broadcast_wakeup` can address each subscriber's flag.
+   A change to either the wire format or this handshake must keep the
+   two sides in lockstep.
 
 3. **No `ftruncate(0)` on a live ring.**  `RingBuffer::create_or_reuse`
    bumps the in-header `generation` counter instead.  A truncate
@@ -50,6 +60,21 @@ format break or a crash-safety break.
    the WAL is enabled.**  `Publisher::create` aligns
    `ring.tail = wal.pending_cursor()` on open.  Without this,
    `subscribe_from(N)` across a restart returns the wrong records.
+
+7. **Wakeup-coalescing eventcount: SeqCst fences on both sides.**
+   The publisher fires a wakeup only when a subscriber's
+   `needs_wakeup` flag is set.  A subscriber about to sleep does
+   `set_wakeflag` → `fence(SeqCst)` → re-check `cursor < tail`
+   (`Subscriber::wait_readable`/`arm_wakeup`); the publisher does
+   tail-store (Release in `write_slot`) → `fence(SeqCst)` →
+   `take_wakeflag` (`broadcast_wakeup`).  The paired SeqCst fences are
+   what prevent a missed wakeup (sleeper stranded): in the total
+   order, either the subscriber observes the new tail (doesn't sleep)
+   or the publisher observes the flag (wakes it).  Dropping a fence,
+   or weakening either flag op below SeqCst, reintroduces the race.
+   The publisher also wakes a client whose cursor went `UNCLAIMED`
+   (clean disconnect) so dead peers are still reaped.  Tests:
+   `tests/wakeup_coalescing.rs`.
 
 ## Hot-path discipline
 

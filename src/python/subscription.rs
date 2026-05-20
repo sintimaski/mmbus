@@ -372,6 +372,27 @@ impl PySubscription {
         self.inner.socket_fileno() as i64
     }
 
+    /// Arm the wakeup flag before an ``add_reader`` wait (asyncio path).
+    /// Call after :meth:`poll_recv` returns ``None``: returns ``True`` if a
+    /// message became available while arming (read again immediately, don't
+    /// await), ``False`` if the flag is armed and the caller should await fd
+    /// readability — the publisher's next publish fires the wakeup.
+    ///
+    /// Required for the coalescing handshake: the publisher only wakes
+    /// subscribers whose flag is set, so an event-loop waiter must arm
+    /// before sleeping or it would never be woken.
+    fn arm_wakeup(&mut self) -> bool {
+        self.inner.arm_wakeup()
+    }
+
+    /// Drain one pending wakeup unit so the (level-triggered) wakeup fd
+    /// stops signalling; read the ring separately via :meth:`try_recv`.
+    /// Returns ``True`` if a unit was drained.  Raises ``OSError`` on
+    /// publisher disconnect.  Used by the asyncio ``add_reader`` callback.
+    fn drain_wakeup(&mut self) -> PyResult<bool> {
+        self.inner.drain_wakeup().map_err(mmbus_err)
+    }
+
     /// Non-blocking: drain one wakeup signal and try one ring read.
     /// Returns ``None`` if no wakeup was pending or the ring was empty;
     /// raises on publisher disconnect.  Use from ``asyncio.add_reader``
@@ -450,6 +471,8 @@ pub struct PyTopicStats {
     pub full_rejected_total: u64,
     #[pyo3(get)]
     pub subscribers_dropped_total: u64,
+    #[pyo3(get)]
+    pub wakeups_sent_total: u64,
     /// WAL snapshot when the publisher's WAL is enabled; `None`
     /// otherwise.
     #[pyo3(get)]
@@ -466,6 +489,7 @@ impl From<TopicStats> for PyTopicStats {
             published_total: s.published_total,
             full_rejected_total: s.full_rejected_total,
             subscribers_dropped_total: s.subscribers_dropped_total,
+            wakeups_sent_total: s.wakeups_sent_total,
             wal: s.wal.map(Into::into),
         }
     }
@@ -478,7 +502,7 @@ impl PyTopicStats {
             "TopicStats(tail={}, active_subscribers={}, lags={:?}, \
              connected_sockets={}, published_total={}, \
              full_rejected_total={}, subscribers_dropped_total={}, \
-             wal={})",
+             wakeups_sent_total={}, wal={})",
             self.tail,
             self.active_subscribers,
             self.lags,
@@ -486,6 +510,7 @@ impl PyTopicStats {
             self.published_total,
             self.full_rejected_total,
             self.subscribers_dropped_total,
+            self.wakeups_sent_total,
             self.wal
                 .as_ref()
                 .map(|_| "<WalStats>")

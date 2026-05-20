@@ -109,9 +109,23 @@ their tensor size and reuses it across messages.
 
 ---
 
-### M2: Wakeup coalescing — P1
+### M2: Wakeup coalescing — P1 ✓ SHIPPED
 
 **Goal:** skip wakeup broadcast when subscribers already have unread messages.
+
+> **Shipped** (Unreleased) — the per-subscriber design (wire v4→v5).  A
+> per-cursor `needs_wakeup` flag table was added to the ring header; the
+> connect handshake now carries `cursor_idx` to the publisher (Linux
+> `SCM_RIGHTS` iovec / macOS socket prefix / Windows handshake struct) so
+> `broadcast_wakeup` can address each subscriber's flag.  Missed-wakeup
+> safety is an eventcount: subscriber `set_wakeflag` + SeqCst fence +
+> re-check (`wait_readable`/`arm_wakeup`); publisher tail-store + SeqCst
+> fence + `take_wakeflag`.  The asyncio path arms via `arm_wakeup` before
+> awaiting and drains via `drain_wakeup`.  Clean-disconnect reaping is
+> preserved by also probing clients whose cursor went `UNCLAIMED`.
+> Measured ~54% fewer wakeup syscalls on a 20 K-message Python burst.
+> Tests: `tests/wakeup_coalescing.rs` (+ fan-out/restart stress green on
+> v5).  New `wakeups_sent_total` counter exposes the ratio.
 
 **Problem:** high-throughput producers call `publish()` in a tight loop.  Each
 call fires a `write(eventfd, 1)` or `send(socket, b"\x01")` for each subscriber.

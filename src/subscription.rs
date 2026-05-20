@@ -76,6 +76,19 @@ impl Subscription {
         self.sub.wait_readable(timeout_ms)
     }
 
+    /// Arm the wakeup flag for an external (`add_reader`) waiter.  Returns
+    /// `true` if data is already available (read now, don't await).  See
+    /// [`crate::subscriber::Subscriber::arm_wakeup`].
+    pub fn arm_wakeup(&mut self) -> bool {
+        self.sub.arm_wakeup()
+    }
+
+    /// Drain one pending wakeup unit (asyncio `add_reader` path).  See
+    /// [`crate::subscriber::Subscriber::drain_wakeup`].
+    pub fn drain_wakeup(&mut self) -> Result<bool> {
+        self.sub.drain_wakeup()
+    }
+
     /// Largest payload a single message can carry (ring slot size).
     pub fn slot_size(&self) -> u32 {
         self.sub.slot_size()

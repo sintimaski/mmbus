@@ -1,11 +1,11 @@
 /// Lock-free SPMC ring buffer over a memory-mapped file.
 ///
-/// # Wire format (v4 — SPMC + generation + per-slot seqlock)
+/// # Wire format (v5 — SPMC + generation + per-slot seqlock + wakeup flags)
 ///
 /// ```text
 /// Bytes 0..64  — fixed header
 ///   0   u64    magic
-///   8   u32    version (= 4)
+///   8   u32    version (= 5)
 ///  12   u32    capacity (slot count)
 ///  16   u32    slot_payload_size (max bytes per message)
 ///  20   u32    max_subscribers
@@ -18,7 +18,17 @@
 ///                   CURSOR_UNCLAIMED (u64::MAX) = slot free
 ///                   any other value = subscriber's next-read position
 ///
-/// Bytes ALIGN64(64+8*max_subscribers) onwards — ring slots
+/// Bytes 64+8*max_subscribers .. 64+16*max_subscribers — wakeup-flag table
+///   wakeflag[i]  u64  (AtomicU64)
+///                   1 = subscriber i has announced it is about to sleep and
+///                       wants a wakeup on the next publish (eventcount
+///                       handshake); 0 = actively draining / not waiting.
+///                   The publisher fires a per-message wakeup ONLY for
+///                   subscribers whose flag is set, coalescing redundant
+///                   wakeups to a subscriber that is keeping up.  See
+///                   `Subscriber::block_until_readable` + `broadcast_wakeup`.
+///
+/// Bytes ALIGN64(64+16*max_subscribers) onwards — ring slots
 ///   slot[i]  [u64 seq][u32 len][payload (slot_payload_size bytes)]
 ///
 ///   `seq` carries the publisher's tail value at the moment this slot was
@@ -43,9 +53,12 @@ use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub const MAGIC: u64 = 0x6D6D_6275_7300_0004; // "mmbus" + format version 4
+pub const MAGIC: u64 = 0x6D6D_6275_7300_0005; // "mmbus" + format version 5
 pub const CURSOR_UNCLAIMED: u64 = u64::MAX;
 pub const MAX_SUBSCRIBERS_DEFAULT: u32 = 16;
+
+/// Wakeup-flag value meaning "subscriber is about to sleep, wake me".
+const WAKEFLAG_WAITING: u64 = 1;
 
 /// High bit of a slot's `seq` field: when set, the publisher is currently
 /// writing the slot's payload.  Subscribers that observe this bit retry.
@@ -64,9 +77,16 @@ const OFF_GENERATION: usize = 24; // AtomicU64 — incremented on publisher rest
 const OFF_TAIL: usize = 32; // AtomicU64 — producer cursor
 const OFF_CURSORS: usize = 64; // AtomicU64[max_subscribers]
 
-/// First byte offset of the ring slots (64-byte aligned, after cursor table).
+/// First byte offset of the per-subscriber wakeup-flag table — immediately
+/// after the cursor table.
+fn wakeflags_offset(max_subscribers: u32) -> usize {
+    OFF_CURSORS + 8 * max_subscribers as usize
+}
+
+/// First byte offset of the ring slots (64-byte aligned, after the cursor +
+/// wakeup-flag tables).
 pub fn slots_offset(max_subscribers: u32) -> usize {
-    let raw = OFF_CURSORS + 8 * max_subscribers as usize;
+    let raw = wakeflags_offset(max_subscribers) + 8 * max_subscribers as usize;
     (raw + 63) & !63
 }
 
@@ -132,7 +152,7 @@ impl RingBuffer {
         // reference to the mmap yet (we just returned from `map_mut`).
         unsafe {
             p.add(OFF_MAGIC).cast::<u64>().write_unaligned(MAGIC);
-            p.add(OFF_VERSION).cast::<u32>().write_unaligned(4);
+            p.add(OFF_VERSION).cast::<u32>().write_unaligned(5);
             p.add(OFF_CAPACITY).cast::<u32>().write_unaligned(capacity);
             p.add(OFF_SLOT_SIZE).cast::<u32>().write_unaligned(slot_payload_size);
             p.add(OFF_MAX_SUBS).cast::<u32>().write_unaligned(max_subscribers);
@@ -259,12 +279,50 @@ impl RingBuffer {
         unsafe { &*(self.base().add(OFF_CURSORS + idx * 8) as *const AtomicU64) }
     }
 
+    fn wakeflag_atomic(&self, idx: usize) -> &AtomicU64 {
+        debug_assert!(idx < self.max_subscribers as usize);
+        // SAFETY: idx < max_subscribers (debug-checked); the wakeup-flag
+        // table starts at wakeflags_offset(max_subscribers) and runs for
+        // 8*max_subscribers bytes, ending at slots_offset — within the
+        // mapped header region.  Each slot is 8-byte aligned.
+        let off = wakeflags_offset(self.max_subscribers) + idx * 8;
+        unsafe { &*(self.base().add(off) as *const AtomicU64) }
+    }
+
+    /// Subscriber-side: announce "I am about to sleep; wake me on the next
+    /// publish."  SeqCst so it is totally ordered against the publisher's
+    /// post-tail-store fence (the eventcount missed-wakeup guard).
+    pub fn set_wakeflag(&self, idx: usize) {
+        self.wakeflag_atomic(idx).store(WAKEFLAG_WAITING, Ordering::SeqCst);
+    }
+
+    /// Subscriber-side: clear the flag after waking (or after the re-check
+    /// found data).  Relaxed: only the owning subscriber writes 0 here, and
+    /// a stale 1 merely costs the publisher one redundant wakeup.
+    pub fn clear_wakeflag(&self, idx: usize) {
+        self.wakeflag_atomic(idx).store(0, Ordering::Relaxed);
+    }
+
+    /// Publisher-side: atomically take the flag, returning `true` if the
+    /// subscriber had announced it wants a wakeup.  SeqCst so it is totally
+    /// ordered against the subscriber's `set_wakeflag` + fence.
+    pub fn take_wakeflag(&self, idx: usize) -> bool {
+        self.wakeflag_atomic(idx).swap(0, Ordering::SeqCst) == WAKEFLAG_WAITING
+    }
+
+    /// Publisher-side: has this cursor slot been released (subscriber gone)?
+    /// Used to probe a cleanly-disconnected client for reaping even when it
+    /// never set its wakeup flag.
+    pub fn cursor_is_unclaimed(&self, idx: usize) -> bool {
+        self.cursor_atomic(idx).load(Ordering::Acquire) == CURSOR_UNCLAIMED
+    }
+
     // ── Subscriber cursor management ──────────────────────────────────────────
 
     /// Claim a free cursor slot, initialising it to `initial_cursor`.
     /// Returns the slot index on success, or `None` if all slots are taken.
     pub fn claim_cursor(&self, initial_cursor: u64) -> Option<usize> {
-        (0..self.max_subscribers as usize).find(|&i| {
+        let slot = (0..self.max_subscribers as usize).find(|&i| {
             self.cursor_atomic(i)
                 .compare_exchange(
                     CURSOR_UNCLAIMED,
@@ -273,7 +331,14 @@ impl RingBuffer {
                     Ordering::Relaxed,
                 )
                 .is_ok()
-        })
+        });
+        if let Some(i) = slot {
+            // Reset any stale wakeup flag left by a previous tenant of this
+            // slot so the publisher doesn't fire a spurious wakeup before
+            // we've even entered a wait.
+            self.clear_wakeflag(i);
+        }
+        slot
     }
 
     /// Release a cursor slot (subscriber disconnecting or being dropped).

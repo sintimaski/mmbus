@@ -102,6 +102,18 @@ fn render_into(out: &mut String, topic: &str, s: &TopicStats) -> std::fmt::Resul
         s.subscribers_dropped_total,
     )?;
 
+    writeln!(
+        out,
+        "# HELP mmbus_wakeups_sent_total Wakeup syscalls fired (coalesced; \
+         below published_total under bursts).",
+    )?;
+    writeln!(out, "# TYPE mmbus_wakeups_sent_total counter")?;
+    writeln!(
+        out,
+        "mmbus_wakeups_sent_total{{topic=\"{topic}\"}} {}",
+        s.wakeups_sent_total,
+    )?;
+
     // Gauges (current state).
     writeln!(
         out,
@@ -380,6 +392,7 @@ mod tests {
             published_total: 100,
             full_rejected_total: 3,
             subscribers_dropped_total: 1,
+            wakeups_sent_total: 42,
         }
     }
 
