@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "mmbus-bridge"
-version = "0.3.1"
+version = "0.5.0"
 description = "In-process cross-machine bridge for mmbus topics (TCP)"
 requires-python = ">=3.8"
 # License declared via the SPDX classifier below rather than a
@@ -20,7 +20,7 @@ classifiers = [
 ]
 # The bridge republishes onto a local mmbus Bus, so the companion core
 # wheel must be present at the same version.
-dependencies = ["mmbus==0.3.0"]
+dependencies = ["mmbus==0.5.0"]
 
 [tool.maturin]
 # Build the Rust extension as the private mmbus_bridge._mmbus_bridge

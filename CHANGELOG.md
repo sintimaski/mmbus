@@ -6,6 +6,13 @@ All notable changes to mmbus are recorded here.  Format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-20
+
+> Pre-1.0, in active development: **wire format v4 → v5 is a hard break**
+> (no compat shim).  A v5 publisher refuses a v4 on-disk ring with
+> `InvalidData` and vice versa — wipe stale rings (`bus.clean_topic`) or
+> restart all processes on the new build together.
+
 ### Changed
 
 - **Wire format v4 → v5.**  The ring header gains a per-subscriber
@@ -69,6 +76,17 @@ All notable changes to mmbus are recorded here.  Format follows
   each Python `bytes` object.  The GIL is held across the batch rather than
   released (ring writes are fast mmap stores + one wakeup; no per-message GIL
   overhead).
+
+### Fixed
+
+- **`mmbus_bridge.Bridge.shutdown()` deadlock** when a concurrent thread
+  polls `is_running()` (which the new `wait_async` does).  `shutdown` held
+  the internal state mutex across the GIL-releasing thread join, so the
+  poller — blocked on that mutex while holding the GIL — and the shutdown
+  thread — needing the GIL back after the join — deadlocked.  `shutdown`
+  now marks the state `Shutdown` and drops the lock *before* the join, so
+  the join runs lock-free and pollers observe "stopped" immediately.  Also
+  hardens the sync `wait()` + concurrent `shutdown()` path.
 
 ## [0.4.0] - 2026-05-20
 

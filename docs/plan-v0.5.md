@@ -240,10 +240,14 @@ event loop without blocking it.
 > `asyncio.sleep` until the bridge stops; `shutdown_async(timeout=None)`
 > joins off-loop via `run_in_executor` (3.8-compatible, not
 > `asyncio.to_thread`); `async with Bridge(cfg)` mirrors the sync CM.
-> Example: `bridge/examples/bridge_async.py`.  Logic verified against a
-> mock; the full bridge wheel build is blocked locally by its
-> `mmbus==0.3.0` pin (`bridge/pyproject.toml`) — that pin must be widened
-> to admit mmbus 0.4/0.5 when v0.5.0 is tagged.
+> Example: `bridge/examples/bridge_async.py`.  Verified end-to-end against
+> a real built bridge wheel (the `mmbus==0.3.0` pin was widened to
+> `==0.5.0`).  Real testing surfaced — and fixed — a pre-existing deadlock:
+> `shutdown()` held the state mutex across its GIL-releasing join, which
+> deadlocked against a concurrent `is_running()` poll (what `wait_async`
+> does).  Fix: mark `Shutdown` + drop the lock before the join.  Regression
+> guard added to `bridge/python/smoke_test.py`
+> (`test_async_wait_and_shutdown`, with a hard timeout).
 
 **Current:** `bridge.wait()` blocks the calling thread indefinitely.  Async
 users wrap it in `asyncio.to_thread(bridge.wait)`.  This is documented but

@@ -140,45 +140,49 @@ impl PyBridge {
     /// draining in the background).
     #[pyo3(signature = (timeout=None))]
     fn shutdown(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<()> {
-        let mut guard = self.state.lock().expect("PyBridge mutex poisoned");
-        match std::mem::replace(&mut *guard, State::Transitioning) {
-            State::Running(bridge) => {
-                // mmbus_bridge::Bridge::shutdown consumes self and joins
-                // unconditionally.  To time-bound the wait we move the
-                // bridge into a worker thread and time-bound the
-                // parent's join() instead.
-                let deadline = timeout.map(|secs| Instant::now() + Duration::from_secs_f64(secs));
-                let handle = thread::spawn(move || {
-                    bridge.shutdown();
-                });
-                let outcome = py.allow_threads(|| join_with_deadline(handle, deadline));
-                match outcome {
-                    JoinOutcome::Done => {
-                        *guard = State::Shutdown;
-                        Ok(())
-                    }
-                    JoinOutcome::TimedOut(handle) => {
-                        // Detach; subsequent shutdown() calls see
-                        // State::Shutdown and no-op.  The worker
-                        // finishes joining the bridge threads in the
-                        // background.
-                        drop(handle);
-                        *guard = State::Shutdown;
-                        Err(PyErr::new::<pyo3::exceptions::PyTimeoutError, _>(
-                            "Bridge.shutdown() timed out; threads detached",
-                        ))
-                    }
+        // Take the running bridge out of the shared state and mark it
+        // Shutdown *before* releasing the lock — and do the GIL-releasing
+        // join below with NO lock held.  Holding `guard` across
+        // `py.allow_threads` would deadlock: a concurrent `is_running()` /
+        // `wait()` poll (e.g. an asyncio `wait_async` loop) blocks on this
+        // mutex while holding the GIL, and this thread needs the GIL back
+        // after the join.  Setting Shutdown first also makes that poll
+        // observe "stopped" immediately, so it stops polling.
+        let bridge = {
+            let mut guard = self.state.lock().expect("PyBridge mutex poisoned");
+            match std::mem::replace(&mut *guard, State::Shutdown) {
+                State::Running(bridge) => Some(bridge),
+                // Configured-but-never-started, or already shut down: nothing
+                // to join — the state is now Shutdown either way (idempotent).
+                State::Configured(_) | State::Shutdown => None,
+                State::Transitioning => {
+                    unreachable!("Transitioning leaked across a method boundary")
                 }
             }
-            State::Configured(_) => {
-                *guard = State::Shutdown;
-                Ok(())
+        }; // guard dropped here — the join runs lock-free
+
+        let bridge = match bridge {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+
+        // mmbus_bridge::Bridge::shutdown consumes self and joins
+        // unconditionally.  To time-bound the wait we move the bridge into a
+        // worker thread and time-bound the parent's join() instead.
+        let deadline = timeout.map(|secs| Instant::now() + Duration::from_secs_f64(secs));
+        let handle = thread::spawn(move || {
+            bridge.shutdown();
+        });
+        match py.allow_threads(|| join_with_deadline(handle, deadline)) {
+            JoinOutcome::Done => Ok(()),
+            JoinOutcome::TimedOut(handle) => {
+                // Detach; the worker finishes joining the bridge threads in
+                // the background.  State is already Shutdown.
+                drop(handle);
+                Err(PyErr::new::<pyo3::exceptions::PyTimeoutError, _>(
+                    "Bridge.shutdown() timed out; threads detached",
+                ))
             }
-            State::Shutdown => {
-                *guard = State::Shutdown;
-                Ok(())
-            }
-            State::Transitioning => unreachable!("Transitioning leaked across a method boundary"),
         }
     }
 

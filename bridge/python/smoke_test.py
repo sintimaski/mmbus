@@ -9,6 +9,7 @@ the two wheels installed.  Exits non-zero on the first failed check.
 """
 from __future__ import annotations
 
+import asyncio
 import sys
 import tempfile
 import time
@@ -216,6 +217,39 @@ def test_loopback_roundtrip():
     bridge_b.shutdown()
 
 
+def test_async_wait_and_shutdown() -> None:
+    """`wait_async` polling concurrently with `shutdown_async` must not
+    deadlock (regression: shutdown used to hold the state mutex across the
+    GIL-releasing join while the wait poll held the GIL waiting for it).
+    The asyncio.wait_for timeout turns a regression into a failed check
+    instead of a hung CI job.
+    """
+    cfg = {
+        "bus": "smoke-async",
+        "listen": "127.0.0.1:0",
+        "topics": [{"name": "events", "forward": True, "receive": True}],
+        "peers": [],
+    }
+
+    async def scenario() -> bool:
+        async with Bridge(cfg) as bridge:
+            if not bridge.is_running():
+                return False
+
+            async def stop() -> None:
+                await asyncio.sleep(0.2)
+                await bridge.shutdown_async()
+
+            await asyncio.gather(bridge.wait_async(poll_interval=0.02), stop())
+            return not bridge.is_running()
+
+    try:
+        ok = asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+        check("async wait_async + shutdown_async (no deadlock)", ok)
+    except asyncio.TimeoutError:
+        check("async wait_async + shutdown_async (no deadlock)", False, "timed out (deadlock)")
+
+
 def main() -> int:
     print("mmbus_bridge Python SDK smoke test\n")
     test_bad_config_raises()
@@ -226,6 +260,7 @@ def main() -> int:
     test_context_manager()
     test_explicit_origin_id_preserved()
     test_loopback_roundtrip()
+    test_async_wait_and_shutdown()
     print()
     if _failures:
         print(f"{_failures} check(s) FAILED")
