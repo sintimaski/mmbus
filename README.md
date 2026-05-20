@@ -294,6 +294,10 @@ The Python wheel is **TCP-only** — a QUIC peer config raises
 | `bus.publish(topic, bytes)`                | publish a message                                  |
 | `bus.topic(topic) -> TopicPublisher`       | prepared publish handle for hot loops (skips per-call topic lookup) |
 | `bus.subscribe(topic) -> Subscription`     | sync subscription (iterator + context manager)     |
+| `sub.recv() -> bytes`                      | receive one message (allocates a fresh `bytes`)    |
+| `sub.recv_into(buf) -> int`                | allocation-free receive into a writable buffer (`bytearray`/`memoryview`/numpy `uint8`); returns byte count |
+| `sub.try_recv_into(buf) -> int \| None`    | non-blocking allocation-free receive; `None` if empty |
+| `sub.max_payload_size`                     | largest payload a message can carry (size `recv_into` buffers to this) |
 | `bus.subscribe_with_history(topic, n)`     | sync subscription replaying the last *n* in-ring messages |
 | `bus.subscribe_from(topic, cursor)`        | sync subscription starting at an explicit cursor   |
 | `bus.subscribe_async(topic)`               | asyncio subscription using `add_reader`            |

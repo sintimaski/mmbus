@@ -64,6 +64,23 @@ impl Subscription {
         self.sub.try_receive_into_slice(out)
     }
 
+    /// WAL-aware, single-message slice receive.  See
+    /// [`crate::subscriber::Subscriber::try_receive_one_into_slice`].
+    pub fn try_recv_one_into_slice(&mut self, out: &mut [u8]) -> Result<Option<usize>> {
+        self.sub.try_receive_one_into_slice(out)
+    }
+
+    /// Block for one wakeup without touching a payload buffer.  See
+    /// [`crate::subscriber::Subscriber::wait_readable`].
+    pub fn wait_readable(&mut self, timeout_ms: i32) -> Result<bool> {
+        self.sub.wait_readable(timeout_ms)
+    }
+
+    /// Largest payload a single message can carry (ring slot size).
+    pub fn slot_size(&self) -> u32 {
+        self.sub.slot_size()
+    }
+
     /// How many messages this subscriber is behind the producer.
     pub fn lag(&self) -> u64 {
         self.sub.lag()

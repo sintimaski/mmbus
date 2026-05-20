@@ -409,6 +409,62 @@ impl Subscriber {
         }
     }
 
+    /// WAL-aware, single-message variant of [`Self::try_receive_into_slice`].
+    /// Consults the WAL replayer first (catch-up), then the live ring, and
+    /// writes the next record's payload directly into `out`.
+    ///
+    /// Returns `Ok(Some(n))` with `n` bytes written, `Ok(None)` if nothing
+    /// is available, or `Err(Error::TooLarge)` if the payload is larger than
+    /// `out`.  On a live-ring oversize the record IS consumed (the seqlock
+    /// path cannot peek without advancing) — size `out` to [`Self::slot_size`]
+    /// so this never fires.  WAL-replay oversize reports the exact payload
+    /// size; ring oversize reports `slot_size` (the maximum a message can be).
+    pub fn try_receive_one_into_slice(&mut self, out: &mut [u8]) -> Result<Option<usize>> {
+        if let Some(payload) = self.next_wal_record()? {
+            if payload.len() > out.len() {
+                return Err(Error::TooLarge { size: payload.len(), max: out.len() });
+            }
+            out[..payload.len()].copy_from_slice(&payload);
+            return Ok(Some(payload.len()));
+        }
+        match self.try_receive_into_slice(out) {
+            Some(n) if n == usize::MAX => Err(Error::TooLarge {
+                size: self.ring.slot_payload_size as usize,
+                max: out.len(),
+            }),
+            Some(n) => Ok(Some(n)),
+            None => Ok(None),
+        }
+    }
+
+    /// Block until one wakeup arrives (or the publisher disconnects),
+    /// without touching any payload buffer.  `timeout_ms = -1` blocks
+    /// indefinitely.  Returns `Ok(true)` when woken, `Ok(false)` on timeout.
+    ///
+    /// This is the "wait" half of the slice-target receive loop: the Python
+    /// binding holds a borrowed buffer pointer across this call (GIL
+    /// released) and reads into it only afterwards (GIL held), so the wait
+    /// must not access the buffer.
+    pub fn wait_readable(&mut self, timeout_ms: i32) -> Result<bool> {
+        match self.wait_wakeup(timeout_ms) {
+            Ok(()) => Ok(true),
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The ring's fixed per-slot payload capacity — the largest payload a
+    /// single message can carry.  Size a `recv_into` buffer to this to
+    /// guarantee no message is ever rejected as too large.
+    pub fn slot_size(&self) -> u32 {
+        self.ring.slot_payload_size
+    }
+
     /// Pull the next record from the WAL replayer (if active) and
     /// advance `self.cursor`.  When the replayer is exhausted, drop
     /// it and re-sync the live ring cursor to our true position so

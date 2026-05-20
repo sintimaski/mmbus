@@ -8,7 +8,7 @@ use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Active subscription to a topic.
 ///
@@ -53,6 +53,29 @@ fn payload_to_pybytes<'py>(py: Python<'py>, payload: &[u8]) -> Bound<'py, PyByte
     .expect("PyBytes allocation cannot fail for a slice we already hold")
 }
 
+/// Resolve a writable, C-contiguous bytes-like object (``bytearray``,
+/// writable ``memoryview``, numpy ``uint8`` array) to a `PyBuffer<u8>`.
+///
+/// The returned `PyBuffer` pins the exporter's memory (the bytearray
+/// can't be resized or freed while it's held), so the caller may derive
+/// a `&mut [u8]` from `buf_ptr()`/`len_bytes()` and read into it.  The
+/// caller MUST keep the returned `PyBuffer` alive for as long as the
+/// slice is used, and must hold the GIL while writing through it.
+fn writable_view(buf: &Bound<'_, PyAny>) -> PyResult<PyBuffer<u8>> {
+    let pybuf = PyBuffer::<u8>::get_bound(buf)?;
+    if pybuf.readonly() {
+        return Err(PyTypeError::new_err(
+            "recv_into requires a writable buffer (got read-only)",
+        ));
+    }
+    if !pybuf.is_c_contiguous() {
+        return Err(PyTypeError::new_err(
+            "recv_into requires a C-contiguous buffer",
+        ));
+    }
+    Ok(pybuf)
+}
+
 #[pymethods]
 impl PySubscription {
     /// Block until the next message.  Releases the GIL.
@@ -83,6 +106,93 @@ impl PySubscription {
         } else {
             None
         }
+    }
+
+    /// Block for the next message and write it **directly into ``buf``**,
+    /// returning the number of bytes written.  ``buf`` is any writable,
+    /// C-contiguous bytes-like object — ``bytearray``, a writable
+    /// ``memoryview``, or a numpy ``uint8`` array.
+    ///
+    /// Unlike :meth:`recv` (which allocates a fresh ``bytes`` per message),
+    /// this copies the payload straight into the caller's buffer with no
+    /// per-message allocation.  Reuse one buffer across the receive loop for
+    /// an allocation-free, low-GC-pressure pipeline (the intended path for
+    /// numpy / tensor workloads).
+    ///
+    /// Raises :exc:`MessageTooLargeError` if the message is larger than
+    /// ``buf``.  Size ``buf`` to :attr:`max_payload_size` to guarantee any
+    /// message fits.  Raises on publisher disconnect, like :meth:`recv`.
+    fn recv_into(&mut self, py: Python<'_>, buf: &Bound<'_, PyAny>) -> PyResult<usize> {
+        let view = writable_view(buf)?;
+        // SAFETY: `view` (a held PyBuffer) pins the exporter's memory for
+        // its lifetime, so the pointer stays valid across the GIL-released
+        // wait below.  We only WRITE through the slice with the GIL held
+        // (inside try_recv_one_into_slice); the allow_threads closure does
+        // not touch it.  The buffer is verified writable + C-contiguous.
+        let slice =
+            unsafe { std::slice::from_raw_parts_mut(view.buf_ptr() as *mut u8, view.len_bytes()) };
+        loop {
+            if let Some(n) = self.inner.try_recv_one_into_slice(slice).map_err(mmbus_err)? {
+                return Ok(n);
+            }
+            // GIL released: wait for the next wakeup without touching `slice`.
+            py.allow_threads(|| self.inner.wait_readable(-1))
+                .map_err(mmbus_err)?;
+        }
+    }
+
+    /// Like :meth:`recv_into` but gives up after ``timeout_secs``.  Returns
+    /// the byte count on success, or ``None`` on timeout.
+    #[pyo3(signature = (buf, timeout_secs=1.0))]
+    fn recv_timeout_into(
+        &mut self,
+        py: Python<'_>,
+        buf: &Bound<'_, PyAny>,
+        timeout_secs: f64,
+    ) -> PyResult<Option<usize>> {
+        let view = writable_view(buf)?;
+        // SAFETY: see recv_into — `view` pins the memory; the slice is only
+        // written with the GIL held; the wait runs without touching it.
+        let slice =
+            unsafe { std::slice::from_raw_parts_mut(view.buf_ptr() as *mut u8, view.len_bytes()) };
+        let deadline = Instant::now() + Duration::from_secs_f64(timeout_secs);
+        loop {
+            if let Some(n) = self.inner.try_recv_one_into_slice(slice).map_err(mmbus_err)? {
+                return Ok(Some(n));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+            let woke = py
+                .allow_threads(|| self.inner.wait_readable(ms))
+                .map_err(mmbus_err)?;
+            if !woke {
+                return Ok(None); // timed out in the wait
+            }
+        }
+    }
+
+    /// Non-blocking variant of :meth:`recv_into`.  Writes the next message
+    /// into ``buf`` and returns the byte count, or ``None`` immediately if
+    /// no message is ready.  GIL held throughout — a single memcpy from the
+    /// ring slot straight into ``buf``, no allocation.
+    fn try_recv_into(&mut self, _py: Python<'_>, buf: &Bound<'_, PyAny>) -> PyResult<Option<usize>> {
+        let view = writable_view(buf)?;
+        // SAFETY: `view` pins the memory; GIL held for the whole call so the
+        // pointer cannot be invalidated; verified writable + C-contiguous.
+        let slice =
+            unsafe { std::slice::from_raw_parts_mut(view.buf_ptr() as *mut u8, view.len_bytes()) };
+        self.inner.try_recv_one_into_slice(slice).map_err(mmbus_err)
+    }
+
+    /// The largest payload a single message can carry on this topic (the
+    /// ring's fixed slot size).  Size a :meth:`recv_into` buffer to this to
+    /// guarantee no message is ever rejected as too large.
+    #[getter]
+    fn max_payload_size(&self) -> u32 {
+        self.inner.slot_size()
     }
 
     /// Drain up to ``n`` messages into a list, amortising the
@@ -163,17 +273,7 @@ impl PySubscription {
         if payload_size == 0 {
             return Err(PyValueError::new_err("payload_size must be > 0"));
         }
-        let pybuf = PyBuffer::<u8>::get_bound(buf)?;
-        if pybuf.readonly() {
-            return Err(PyTypeError::new_err(
-                "recv_into_buffer requires a writable buffer (got read-only)",
-            ));
-        }
-        if !pybuf.is_c_contiguous() {
-            return Err(PyTypeError::new_err(
-                "recv_into_buffer requires a C-contiguous buffer",
-            ));
-        }
+        let pybuf = writable_view(buf)?;
         let buf_len = pybuf.len_bytes();
         let capacity = buf_len / payload_size;
         if capacity == 0 {

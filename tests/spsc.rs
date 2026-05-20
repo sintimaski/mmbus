@@ -445,3 +445,74 @@ fn bus_api_iterator() {
     }
     cleanup_bus(&cfg);
 }
+
+#[test]
+fn bus_api_recv_into_slice_variable_size() {
+    // The zero-alloc receive path (M1): write messages of differing sizes
+    // straight into a caller buffer, returning the actual byte count.
+    let cfg = bus_cfg("bus_slice");
+    cleanup_bus(&cfg);
+
+    let cfg_sub = cfg.clone();
+    let consumer = std::thread::spawn(move || {
+        let bus = Bus::with_config("app", cfg_sub);
+        let mut sub = bus.subscribe("ch").unwrap();
+        assert_eq!(sub.slot_size(), 256, "slot_size accessor");
+        let mut buf = vec![0u8; sub.slot_size() as usize];
+        let mut got = Vec::new();
+        // First two via the WAL-aware non-blocking path after a wakeup,
+        // the rest via the blocking wait_readable + slice read loop.
+        while got.len() < 3 {
+            match sub.try_recv_one_into_slice(&mut buf).unwrap() {
+                Some(len) => got.push(buf[..len].to_vec()),
+                None => {
+                    sub.wait_readable(-1).unwrap();
+                }
+            }
+        }
+        got
+    });
+
+    let mut bus = Bus::with_config("app", cfg.clone());
+    bus.wait_for_subscribers("ch", 1, Duration::from_secs(5)).unwrap();
+    bus.publish("ch", b"a").unwrap();
+    bus.publish("ch", b"bcde").unwrap();
+    bus.publish("ch", &[0x7u8; 200]).unwrap();
+
+    let got = consumer.join().unwrap();
+    assert_eq!(got[0], b"a");
+    assert_eq!(got[1], b"bcde");
+    assert_eq!(got[2], [0x7u8; 200]);
+    cleanup_bus(&cfg);
+}
+
+#[test]
+fn bus_api_recv_into_slice_too_large_errors() {
+    // A buffer smaller than the live-ring payload yields Error::TooLarge.
+    let cfg = bus_cfg("bus_slice_big");
+    cleanup_bus(&cfg);
+
+    let cfg_sub = cfg.clone();
+    let consumer = std::thread::spawn(move || {
+        let bus = Bus::with_config("app", cfg_sub);
+        let mut sub = bus.subscribe("ch").unwrap();
+        let mut tiny = [0u8; 4];
+        loop {
+            match sub.try_recv_one_into_slice(&mut tiny) {
+                Ok(Some(_)) => panic!("4-byte payload should have fit; expected oversize"),
+                Ok(None) => sub.wait_readable(-1).unwrap(),
+                Err(e) => return e,
+            };
+        }
+    });
+
+    let mut bus = Bus::with_config("app", cfg.clone());
+    bus.wait_for_subscribers("ch", 1, Duration::from_secs(5)).unwrap();
+    bus.publish("ch", b"this payload is longer than four bytes").unwrap();
+
+    match consumer.join().unwrap() {
+        Error::TooLarge { max, .. } => assert_eq!(max, 4),
+        other => panic!("expected TooLarge, got {other:?}"),
+    }
+    cleanup_bus(&cfg);
+}

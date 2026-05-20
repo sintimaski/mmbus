@@ -60,9 +60,21 @@ With wakeup coalescing:
 
 ## v0.5.0 milestones
 
-### M1: Zero-copy receive (`recv_into`) — P0
+### M1: Zero-copy receive (`recv_into`) — P0 ✓ SHIPPED
 
 **Goal:** eliminate the per-message `PyBytes` allocation on the receive side.
+
+> **Shipped** (Unreleased).  Implemented as three single-message methods —
+> `recv_into(buf)`, `recv_timeout_into(buf, timeout_secs)`, `try_recv_into(buf)`
+> — plus the `max_payload_size` property.  WAL-replay aware.  Measured
+> ~1140 ns/msg vs ~4410 ns/msg for `try_recv` on a 1 KB drain bench (~3.9×;
+> the projected 300-400 ns figure was conservative — the `PyBytes` alloc + GC
+> + second memcpy cost more at 1 KB than estimated).  The blocking variants
+> use a wait-then-read loop: the wakeup wait runs with the GIL released and
+> never touches the buffer, then a single memcpy reads the ring slot straight
+> into the caller's buffer with the GIL held (the held `PyBuffer` pins the
+> memory across the wait).  Rust tests: `bus_api_recv_into_slice_*` in
+> `tests/spsc.rs`.
 
 **API:**
 ```python

@@ -6,8 +6,27 @@ All notable changes to mmbus are recorded here.  Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`Subscription.recv_into(buf)` / `recv_timeout_into(buf, timeout_secs)` /
+  `try_recv_into(buf)`** — allocation-free receive.  Each writes the next
+  message's payload straight into a caller-provided writable buffer
+  (`bytearray`, a writable `memoryview`, or a numpy `uint8` view) and returns
+  the byte count, instead of allocating a fresh `bytes` per message like
+  `recv()`.  Reuse one buffer across the receive loop for a low-GC-pressure
+  pipeline (the intended path for numpy / tensor workloads).  Raises
+  `MessageTooLargeError` if the message exceeds the buffer; the new
+  `Subscription.max_payload_size` property reports the size that always fits.
+  Distinct from the existing fixed-size batch drainer `recv_into_buffer`:
+  these handle a single, variable-size message.
+
 ### Performance
 
+- **Allocation-free receive** (above): on a 1 KB-payload drain micro-bench,
+  `try_recv_into` runs at ~1140 ns/msg vs ~4410 ns/msg for `try_recv`
+  (~3.3 µs/msg saved, ~3.9×) by eliminating the per-message `PyBytes`
+  allocation, the GC bookkeeping, and the second memcpy.  End-to-end
+  (wakeup-dominated) the gain is smaller (~1.2× on a 1 KB cross-thread loop).
 - **`publish_many` / `TopicPublisher.publish_many` are now zero-copy** at the
   Python FFI boundary.  Previously each payload was extracted into an owned
   `Vec<u8>` (N allocations + N memcpy); the new path accepts
