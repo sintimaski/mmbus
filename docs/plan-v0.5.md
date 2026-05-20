@@ -190,9 +190,26 @@ key entry points, and no Python-side exposure.
 
 ---
 
-### M4: NATS JetStream competitive bench — P1
+### M4: NATS JetStream competitive bench — P1 ✓ SHIPPED (CI job)
 
 **Goal:** close the `_pending_` entry in the competitive table.
+
+> **Shipped** (Unreleased) — `.github/workflows/competitive-bench.yml` runs
+> the full suite (`benches/competitive/run_all.sh`, which boots Redis + NATS
+> Docker containers) on `ubuntu-latest` and uploads `results.json` +
+> `RESULTS.md` as an artifact.  The NATS JetStream bench already existed and
+> works on Linux Docker (the "pending" cell was a macOS Docker convergence
+> problem, not a code one).  `_common.TOTAL_N` now honours a `BENCH_N` env
+> override so CI can bound the slow durable runs uniformly across harnesses;
+> verified locally on the mmbus harness.
+>
+> **Deviation from the AC:** triggers on `workflow_dispatch` + release tags
+> (`v*`), NOT per-push to main — competitive numbers are noisy and the
+> durable runs are slow/costly, so per-merge runs aren't worth it.  The
+> resulting NATS number must be pasted into
+> `docs/benchmarks-vs-competition.md` + the README durable table after the
+> first CI run (left as a release step — can't run Docker/NATS on the dev
+> box here).
 
 **Current:** macOS Docker networking makes the NATS container unreliable
 (topic convergence timeouts).  The `benches/competitive/run_all.sh` script

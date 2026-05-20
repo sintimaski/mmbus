@@ -1,0 +1,78 @@
+# Competitive benchmark suite (mmbus vs ZeroMQ / Redis Streams / NATS
+# JetStream) on a Linux runner with Docker.
+#
+# Why a dedicated workflow (not part of `ci.yml`):
+#   * It needs the Docker daemon (Redis + NATS containers) — available on
+#     ubuntu-latest but not the macOS/Windows CI runners.
+#   * Throughput numbers are noisy and the durable runs are slow, so this
+#     is NOT run per-PR.  It runs on demand (`workflow_dispatch`) and on
+#     release tags, where refreshing the published numbers is the point.
+#     (Add `push: branches: [main]` if you want a per-merge trend.)
+#
+# The NATS JetStream cell that `docs/benchmarks-vs-competition.md` /
+# `README.md` left "pending" (macOS Docker never converged) gets a real
+# number here.  Results are uploaded as an artifact; copy them into those
+# docs when cutting a release.
+name: Competitive bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      bench_n:
+        description: "Messages per run (lower = faster CI; default 200000)"
+        required: false
+        default: "200000"
+  push:
+    tags: ["v*"]
+
+jobs:
+  competitive:
+    name: mmbus vs zmq / redis / nats (ubuntu)
+    runs-on: ubuntu-latest
+    # A slow durable NATS/Redis run shouldn't hang CI forever.
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-python@v5
+        with:
+          # PyO3 0.22 supports up to CPython 3.13; pin 3.12 (matches ci.yml).
+          python-version: "3.12"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build + install mmbus (release, wal_v2)
+        # pyproject [tool.maturin] pins features = ["python", "wal_v2"], so
+        # this builds the durable WAL path the bench exercises.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+
+      - name: Install benchmark clients
+        run: python -m pip install pyzmq redis "nats-py>=2"
+
+      - name: Run competitive suite
+        # run_all.sh boots the Redis + NATS containers (docker run), runs
+        # every harness, and writes results.json + appends RESULTS.md.
+        # PY points the script at the runner's interpreter (no venv); BENCH_N
+        # bounds the slow durable runs so CI stays under the timeout.
+        env:
+          PY: python
+          BENCH_N: ${{ github.event.inputs.bench_n || '200000' }}
+        run: |
+          chmod +x benches/competitive/run_all.sh
+          benches/competitive/run_all.sh
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: competitive-results
+          path: |
+            benches/competitive/results.json
+            benches/competitive/RESULTS.md
+          if-no-files-found: warn

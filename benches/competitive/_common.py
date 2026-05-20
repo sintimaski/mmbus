@@ -2,13 +2,18 @@
 
 import dataclasses
 import json
+import os
 import resource
 import sys
 import time
 
 # Workload — keep these in lockstep with SPEC.md.
-WARMUP_N = 10_000
-TOTAL_N = 1_000_000
+#
+# `BENCH_N` overrides the message count for every harness (CI sets a
+# smaller value so the slow durable runs stay under the job timeout; the
+# published numbers use the default 1M).  WARMUP_N is clamped below it.
+TOTAL_N = int(os.environ.get("BENCH_N", "1000000"))
+WARMUP_N = min(int(os.environ.get("BENCH_WARMUP_N", "10000")), TOTAL_N // 10)
 PAYLOAD_SIZE = 256
 PAYLOAD = b"x" * PAYLOAD_SIZE
 

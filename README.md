@@ -197,7 +197,7 @@ _Durable_ (crash-safe, fsync on):
 | **mmbus** (Rust criterion, pure publish) | **~4.6 M/s** |
 | **mmbus** (Python wheel)           | **1.06 M/s** |
 | Redis Streams                      | 0.12 M/s     |
-| NATS JetStream                     | _pending (macOS Docker didn't converge)_ |
+| NATS JetStream                     | _measured by the `competitive-bench` CI job (Linux + Docker); pending first run_ |
 
 ZeroMQ edges mmbus on raw non-durable throughput (more aggressive
 outbound buffering) but has no built-in durability.  With durability
