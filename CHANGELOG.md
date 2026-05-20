@@ -17,6 +17,13 @@ All notable changes to mmbus are recorded here.  Format follows
 
 ### Added
 
+- **`mmbus_bridge.Bridge` async API** — `await bridge.wait_async()` suspends
+  until the bridge shuts down without blocking the event loop, and
+  `await bridge.shutdown_async()` joins the bridge threads off-loop.
+  `async with Bridge(cfg)` mirrors the sync context manager.  Pure Python
+  over the existing `is_running`/`shutdown` (Python 3.8+; uses
+  `run_in_executor`, not `asyncio.to_thread`).  Example:
+  `bridge/examples/bridge_async.py`.
 - **`mmbus.init_logging(level=None)`** — install a stderr subscriber for
   mmbus's `tracing` events (publisher/subscriber lifecycle, publisher
   restart, WAL rotation/retention) from Python.  Filtering follows

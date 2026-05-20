@@ -268,6 +268,10 @@ A locally-published `events` message is forwarded to every peer and
 republished onto each peer's local bus.  The config dict mirrors the
 bridge TOML schema 1:1.
 
+For asyncio services, `async with Bridge(...)` + `await bridge.wait_async()`
+runs the bridge without blocking the event loop (the bridge itself runs on
+its own threads).  See [`bridge/examples/bridge_async.py`](bridge/examples/bridge_async.py).
+
 **Which bridge entry point?**
 
 | You want…                                   | Use                                    |

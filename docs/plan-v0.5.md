@@ -212,10 +212,21 @@ aborts early on macOS.
 
 ---
 
-### M5: Bridge asyncio wrapper — P2
+### M5: Bridge asyncio wrapper — P2 ✓ SHIPPED
 
 **Goal:** `await bridge.wait_async()` so the bridge can run in an asyncio
 event loop without blocking it.
+
+> **Shipped** (Unreleased).  Pure-Python over the existing
+> `is_running`/`shutdown` (no Rust change needed — `wait()` was already a
+> liveness poll): `wait_async(poll_interval=0.1)` suspends via
+> `asyncio.sleep` until the bridge stops; `shutdown_async(timeout=None)`
+> joins off-loop via `run_in_executor` (3.8-compatible, not
+> `asyncio.to_thread`); `async with Bridge(cfg)` mirrors the sync CM.
+> Example: `bridge/examples/bridge_async.py`.  Logic verified against a
+> mock; the full bridge wheel build is blocked locally by its
+> `mmbus==0.3.0` pin (`bridge/pyproject.toml`) — that pin must be widened
+> to admit mmbus 0.4/0.5 when v0.5.0 is tagged.
 
 **Current:** `bridge.wait()` blocks the calling thread indefinitely.  Async
 users wrap it in `asyncio.to_thread(bridge.wait)`.  This is documented but
