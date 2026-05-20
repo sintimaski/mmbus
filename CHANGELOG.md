@@ -6,6 +6,36 @@ All notable changes to mmbus are recorded here.  Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`Bus.topic(name) -> TopicPublisher`** — a prepared publish handle for
+  hot loops.  Each `handle.publish(data)` skips the per-call topic hash
+  lookup, the `str` → UTF-8 conversion, and the Python wrapper frame that
+  `Bus.publish` pays.  The handle takes exclusive ownership of publishing to
+  `name` (it adopts an already-cached publisher or creates one); mixing it
+  with `Bus.publish` on the same topic raises `AlreadyPublishingError`.
+  Supports `publish`, `publish_many`, `wait_for_subscribers`, `stats`, and
+  the context-manager protocol.
+
+### Performance
+
+- **`Bus::publish` / `publish_many` now do a single hashmap lookup** on the
+  hot path (was two — one in `ensure_publisher`, one in the follow-up
+  `get_mut`).  Isolated per-call publish cost (no-subscriber micro-bench,
+  64 B) drops ~18–20% (≈324→≈259 ns/call WAL-off; ≈363→≈297 ns WAL-on).
+- **`Bus.publish` (Python) is bound directly to the Rust method** on exact
+  `Bus` instances, removing the wrapper frame from the hot path.  Subclasses
+  keep the overridable `publish` method.
+- **Release builds enable LTO** (see `Cargo.toml [profile.release]`) so the
+  PyO3 wrapper and the ring/WAL write inline across crate boundaries.
+
+  > Note: the cross-thread `benches/compare.py` 64 B figure can *fall* after
+  > this change.  That harness busy-spins on `BusFullError` with no backoff,
+  > and a cheaper publish does more GIL-releasing spin attempts per delivered
+  > message when the subscriber is the bottleneck — a contention artifact,
+  > not a publish regression.  Use a no-subscriber `drop_oldest` micro-bench
+  > for true per-call cost.
+
 ## [0.3.1] - 2026-05-20
 
 > Bridge-only patch. The core `mmbus` crate + wheel are unchanged at

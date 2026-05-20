@@ -33,6 +33,7 @@ import asyncio as _asyncio
 from mmbus._mmbus import (  # noqa: F401
     _RustBus,
     Subscription,
+    TopicPublisher,
     TopicStats,
     WalStats,
     AlreadyPublishingError,
@@ -65,15 +66,41 @@ class Bus:
 
     def __init__(self, name: str, **kwargs):
         self._bus = _RustBus(name, **kwargs)
+        # Fast path: bind the Rust publish method directly on the instance so
+        # the hot loop skips this wrapper's extra Python frame + `self._bus`
+        # lookup.  Guarded to the exact `Bus` type: a subclass uses the
+        # `publish` method below instead (which it may override), and the
+        # instance attribute would otherwise shadow that override.
+        if type(self) is Bus:
+            self.publish = self._bus.publish
 
     # ── Publishing ────────────────────────────────────────────────────────────
 
     def publish(self, topic: str, data: bytes) -> None:
         """Publish *data* to *topic*.
 
-        Raises :exc:`BusFullError` under the default ``Error`` backpressure policy.
+        Raises :exc:`BusFullError` under the default ``Error`` backpressure
+        policy.  On an exact :class:`Bus` instance this is replaced by a
+        direct binding to the Rust method (see :meth:`__init__`); the method
+        body here is the fallback used by subclasses.
         """
         self._bus.publish(topic, data)
+
+    def topic(self, name: str) -> TopicPublisher:
+        """Return a :class:`TopicPublisher` handle bound to *name* for hot
+        publish loops — each ``handle.publish(data)`` skips the per-call topic
+        lookup, string conversion, and Python wrapper frame::
+
+            t = bus.topic("events")
+            t.wait_for_subscribers(1)
+            for item in stream:
+                t.publish(item)
+
+        The handle takes exclusive ownership of publishing to *name*; don't
+        also call :meth:`publish` for the same topic on this bus (it would
+        raise :exc:`AlreadyPublishingError`).
+        """
+        return self._bus.topic(name)
 
     def publish_many(self, topic: str, payloads) -> int:
         """Publish a list/iterable of ``bytes`` to *topic* in a single call.
@@ -379,6 +406,7 @@ __all__ = [
     "AsyncSubscription",
     "AnyioSubscription",
     "Subscription",
+    "TopicPublisher",
     "TopicStats",
     "WalStats",
     "AlreadyPublishingError",

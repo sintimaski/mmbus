@@ -47,8 +47,12 @@ impl Bus {
     /// Publish `data` to `topic`. Publisher is created on the first call and
     /// cached. Returns `Err(Error::Full)` when the ring is saturated.
     pub fn publish(&mut self, topic: &str, data: &[u8]) -> Result<()> {
-        self.ensure_publisher(topic)?;
-        self.publishers.get_mut(topic).unwrap().publish(data)
+        // Hot path: one HashMap lookup.  The `if let` borrow ends at the
+        // `return`, so the cold-path `create_publisher` re-borrow is legal.
+        if let Some(p) = self.publishers.get_mut(topic) {
+            return p.publish(data);
+        }
+        self.create_publisher(topic)?.publish(data)
     }
 
     /// Publish a batch of records to `topic` in one call.  Fires a
@@ -62,8 +66,23 @@ impl Bus {
         I: IntoIterator<Item = B>,
         B: AsRef<[u8]>,
     {
-        self.ensure_publisher(topic)?;
-        self.publishers.get_mut(topic).unwrap().publish_many(items)
+        if let Some(p) = self.publishers.get_mut(topic) {
+            return p.publish_many(items);
+        }
+        self.create_publisher(topic)?.publish_many(items)
+    }
+
+    /// Take exclusive ownership of the publisher for `topic`, removing it from
+    /// this `Bus`'s cache (or creating a fresh one if none is cached).  The
+    /// caller becomes the sole publisher for `topic`; after this, `publish`
+    /// on the same `Bus` would create a *second* publisher and fail the
+    /// producer lock with [`Error::AlreadyPublishing`].  Backs the Python
+    /// `Bus.topic()` handle API.
+    pub fn take_publisher(&mut self, topic: &str) -> Result<Publisher> {
+        match self.publishers.remove(topic) {
+            Some(p) => Ok(p),
+            None => Publisher::create(topic, self.topic_config(topic)),
+        }
     }
 
     /// Subscribe to `topic`, waiting up to 30 seconds for the publisher.
@@ -147,8 +166,10 @@ impl Bus {
         n: usize,
         timeout: Duration,
     ) -> Result<()> {
-        self.ensure_publisher(topic)?;
-        self.publishers.get_mut(topic).unwrap().wait_for_subscribers(n, timeout)
+        if let Some(p) = self.publishers.get_mut(topic) {
+            return p.wait_for_subscribers(n, timeout);
+        }
+        self.create_publisher(topic)?.wait_for_subscribers(n, timeout)
     }
 
     /// Snapshot of ring and socket stats for `topic`.
@@ -204,12 +225,13 @@ impl Bus {
 
     // ── Internal ──────────────────────────────────────────────────────────────
 
-    fn ensure_publisher(&mut self, topic: &str) -> Result<()> {
-        if !self.publishers.contains_key(topic) {
-            let pub_ = Publisher::create(topic, self.topic_config(topic))?;
-            self.publishers.insert(topic.to_owned(), pub_);
-        }
-        Ok(())
+    /// Cold path for the publish/wait hot methods: create a publisher for
+    /// `topic`, cache it, and return `&mut` to it.  Runs at most once per
+    /// topic per process — callers check `get_mut` first and only fall
+    /// through here on a cache miss, keeping the steady state at one lookup.
+    fn create_publisher(&mut self, topic: &str) -> Result<&mut Publisher> {
+        let pub_ = Publisher::create(topic, self.topic_config(topic))?;
+        Ok(self.publishers.entry(topic.to_owned()).or_insert(pub_))
     }
 
     fn topic_config(&self, _topic: &str) -> BusConfig {

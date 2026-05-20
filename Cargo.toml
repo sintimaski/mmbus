@@ -11,6 +11,17 @@ name = "mmbus"
 # cdylib = Python extension (.so); rlib = Rust dependency
 crate-type = ["cdylib", "rlib"]
 
+# Release builds (and the maturin wheel) enable thin LTO so the PyO3 wrapper,
+# `Bus::publish`, and the ring/WAL write can inline across crate boundaries.
+# Thin (not fat) is deliberate: on a crate this small the measured per-call
+# publish delta between fat LTO, thin LTO, and no LTO was within noise
+# (~257-262 ns/call), so we take the cross-crate inlining at thin's lower
+# build cost rather than paying for fat with no measurable gain.  `panic` is
+# left at the default `unwind`: PyO3 converts Rust panics into Python
+# exceptions, which `abort` would break.
+[profile.release]
+lto = "thin"
+
 [features]
 python = ["pyo3"]
 # Lock-free mmap-backed WAL (v0.2.0 experimental — see docs/rfc-wal-v2-lockfree.md).

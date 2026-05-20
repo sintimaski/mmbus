@@ -292,6 +292,7 @@ The Python wheel is **TCP-only** — a QUIC peer config raises
 |--------------------------------------------|----------------------------------------------------|
 | `Bus(name, backpressure="error" \| "drop_oldest")` | open a named bus namespace                  |
 | `bus.publish(topic, bytes)`                | publish a message                                  |
+| `bus.topic(topic) -> TopicPublisher`       | prepared publish handle for hot loops (skips per-call topic lookup) |
 | `bus.subscribe(topic) -> Subscription`     | sync subscription (iterator + context manager)     |
 | `bus.subscribe_with_history(topic, n)`     | sync subscription replaying the last *n* in-ring messages |
 | `bus.subscribe_from(topic, cursor)`        | sync subscription starting at an explicit cursor   |

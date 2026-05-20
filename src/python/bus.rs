@@ -2,6 +2,7 @@
 
 use crate::bus::Bus;
 use crate::config::{BackpressurePolicy, BusConfig};
+use crate::publisher::Publisher;
 use crate::python::exceptions::mmbus_err;
 use crate::python::subscription::{PySubscription, PyTopicStats};
 use pyo3::exceptions::PyValueError;
@@ -112,6 +113,23 @@ impl PyBus {
             .map_err(mmbus_err)
     }
 
+    /// Return a :class:`TopicPublisher` bound to ``topic`` — a prepared
+    /// handle for hot publish loops.  Each ``handle.publish(data)`` skips
+    /// the per-call topic hash lookup, the ``str`` → UTF-8 conversion, and
+    /// the Python wrapper frame that ``Bus.publish`` pays.
+    ///
+    /// The handle takes *exclusive* ownership of publishing to ``topic``:
+    /// it adopts an already-cached publisher if one exists, otherwise
+    /// creates it.  After this call, ``publish``/``publish_many`` on this
+    /// ``_RustBus`` for the same topic would open a second publisher and
+    /// raise :exc:`AlreadyPublishingError` — pick one API per topic.
+    fn topic(&mut self, name: &str) -> PyResult<PyTopicPublisher> {
+        self.inner
+            .take_publisher(name)
+            .map(PyTopicPublisher::new)
+            .map_err(mmbus_err)
+    }
+
     /// Subscribe to ``topic`` with a custom connection timeout (seconds).
     /// Releases the GIL while waiting for the publisher.
     ///
@@ -200,5 +218,74 @@ impl PyBus {
     /// (including this process).  For test setup / dev tooling only.
     fn clean_topic(&mut self, topic: &str) -> PyResult<()> {
         self.inner.clean_topic(topic).map_err(mmbus_err)
+    }
+}
+
+/// Prepared publish handle for a single topic — see :meth:`_RustBus.topic`.
+///
+/// Owns a resolved :class:`~mmbus.Bus`-internal publisher, so the publish
+/// hot path is a direct call with no topic lookup and no string marshaling.
+/// Holds the per-topic producer lock for its lifetime; the lock releases
+/// when the handle is garbage-collected (or its ``with`` block exits).
+#[pyclass(name = "TopicPublisher", module = "mmbus._mmbus")]
+pub struct PyTopicPublisher {
+    inner: Publisher,
+}
+
+impl PyTopicPublisher {
+    pub(crate) fn new(inner: Publisher) -> Self {
+        Self { inner }
+    }
+}
+
+#[pymethods]
+impl PyTopicPublisher {
+    /// Publish bytes to this handle's topic.  Raises :exc:`BusFullError`
+    /// under the ``Error`` backpressure policy when the ring is saturated.
+    /// Releases the GIL — see :meth:`_RustBus.publish` for why.
+    fn publish(&mut self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
+        py.allow_threads(|| self.inner.publish(data)).map_err(mmbus_err)
+    }
+
+    /// Publish a list of ``bytes`` in one call, firing a single wakeup per
+    /// subscriber.  Returns the number of records written.  Mirrors
+    /// :meth:`_RustBus.publish_many` minus the topic argument.
+    fn publish_many(&mut self, py: Python<'_>, payloads: Vec<Vec<u8>>) -> PyResult<usize> {
+        py.allow_threads(|| self.inner.publish_many(payloads)).map_err(mmbus_err)
+    }
+
+    /// Block until ``n`` subscribers are connected.  Releases the GIL.
+    #[pyo3(signature = (n=1, timeout_secs=30.0))]
+    fn wait_for_subscribers(
+        &mut self,
+        py: Python<'_>,
+        n: usize,
+        timeout_secs: f64,
+    ) -> PyResult<()> {
+        let timeout = Duration::from_secs_f64(timeout_secs);
+        py.allow_threads(|| self.inner.wait_for_subscribers(n, timeout))
+            .map_err(mmbus_err)
+    }
+
+    /// Return a :class:`TopicStats` snapshot for this handle's topic.
+    fn stats(&self) -> PyTopicStats {
+        PyTopicStats::from(self.inner.stats())
+    }
+
+    // ── Context-manager protocol ──────────────────────────────────────────────
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
+    fn __exit__(
+        &mut self,
+        _exc_type: Option<&Bound<'_, PyAny>>,
+        _exc_val: Option<&Bound<'_, PyAny>>,
+        _exc_tb: Option<&Bound<'_, PyAny>>,
+    ) -> bool {
+        // Producer lock releases when the handle is GC'd (Drop for Publisher).
+        false
     }
 }
