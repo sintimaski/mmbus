@@ -6,6 +6,11 @@ All notable changes to mmbus are recorded here.  Format follows
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-05-20
+
+> Bridge-only patch. The core `mmbus` crate + wheel are unchanged at
+> 0.3.0; only the `mmbus-bridge` wheel bumps to 0.3.1.
+
 ### Reliability (mmbus-bridge)
 
 - **Receive-side producers are now created eagerly at bridge
@@ -667,7 +672,8 @@ high-throughput burst workloads.
 
 This is the first public release.  Wire format starts at v4.
 
-[Unreleased]: https://github.com/sintimaski/mmbus/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/sintimaski/mmbus/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/sintimaski/mmbus/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/sintimaski/mmbus/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/sintimaski/mmbus/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/sintimaski/mmbus/compare/v0.2.1...v0.2.2
