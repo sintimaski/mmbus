@@ -466,13 +466,16 @@ impl Publisher {
         #[cfg(unix)]
         loop {
             match self.listener.accept() {
-                Ok((mut sock, _)) => {
+                Ok((sock, _)) => {
                     sock.set_nonblocking(false)?;
                     suppress_sigpipe(&sock);
 
                     // Linux: the eventfd + cursor_idx arrive together via
                     // SCM_RIGHTS.  macOS: cursor_idx is the first 4 bytes
                     // written on the socket, ahead of the 1-byte wakeups.
+                    // (`Read for &UnixStream` lets us read without a `mut`
+                    // binding — which would be unused on Linux and trip
+                    // clippy's `unused_mut` under -D warnings.)
                     #[cfg(target_os = "linux")]
                     let (efd, cursor_idx) = {
                         let (fd, idx) = crate::waker::linux::recv_fd(&sock)?;
@@ -482,7 +485,7 @@ impl Publisher {
                     let cursor_idx = {
                         use std::io::Read;
                         let mut idx_bytes = [0u8; 4];
-                        sock.read_exact(&mut idx_bytes)?;
+                        (&sock).read_exact(&mut idx_bytes)?;
                         u32::from_le_bytes(idx_bytes) as usize
                     };
 

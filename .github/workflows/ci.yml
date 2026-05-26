@@ -50,13 +50,18 @@ jobs:
       # de-facto-standard Rust CI cache.  Replaced manual actions/cache.
       - uses: Swatinem/rust-cache@v2
 
-      # --test-threads=2 caps intra-binary parallelism.  Under the default
-      # (one thread per core) the macOS runners intermittently SIGBUS:
-      # heavyweight tests racing on create_or_reuse/mmap of ring files
-      # trip BSD's mmap-after-resize semantics.  Capping threads is the
-      # project's validated mitigation (see CLAUDE.md / spsc flakiness note).
+      # --test-threads=1 serialises the suite.  Two distinct flakes on the
+      # 2-core CI runners force this:
+      #  * macOS SIGBUS — heavyweight tests racing on create_or_reuse/mmap of
+      #    ring files trip BSD's mmap-after-resize semantics.
+      #  * wal rotation test starvation — rotation_under_concurrent_reader_no_loss
+      #    spawns a busy-spinning reader thread; when another test runs
+      #    concurrently on the 2-core runner the reader starves and hits its
+      #    (already-generous, 180s) deadline.
+      # Serial execution gives each test the whole runner.  The suite is
+      # small, so the wall-clock cost is minor; determinism wins.
       - name: cargo test
-        run: cargo test --all-features -- --test-threads=2
+        run: cargo test --all-features -- --test-threads=1
 
       - name: cargo clippy
         run: cargo clippy --all-features -- -D warnings
