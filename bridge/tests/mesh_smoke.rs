@@ -35,7 +35,11 @@ fn collect_n_frames(mut stream: std::net::TcpStream, want: usize) -> Vec<Frame> 
         .unwrap();
     let mut buf = Vec::with_capacity(want * MIN_FRAME_LEN * 2);
     let mut tmp = [0u8; 1024];
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // 30s is a generous safety-net, not a perf assertion: the loop returns
+    // the instant `want` frames arrive (typically <100ms).  A 5s deadline
+    // flaked on loaded CI runners where bridge startup + dialing peers +
+    // handshake + fan-out occasionally took longer.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if Instant::now() >= deadline {
             panic!("peer timed out at {} bytes (wanted {} frames)", buf.len(), want);

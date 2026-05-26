@@ -99,7 +99,9 @@ fn bridge_forwards_local_publishes_to_one_peer_over_tcp() {
     //    try decode each pass.
     let mut buf = Vec::with_capacity(8 * MIN_FRAME_LEN);
     let mut chunk = [0u8; 1024];
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // 30s safety-net (not a perf assertion); a 5s deadline is flake-prone on
+    // loaded CI runners — same fix as mesh_smoke's collect_n_frames.
+    let deadline = Instant::now() + Duration::from_secs(30);
     let (frames, _consumed) = loop {
         if Instant::now() >= deadline {
             panic!(
