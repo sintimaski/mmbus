@@ -9,6 +9,28 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      # Both crates share the repo-root rustfmt.toml (rustfmt discovers
+      # config by walking up the filesystem), so the same `--check` gate
+      # covers the core lib and the standalone bridge workspace.
+      - name: cargo fmt --check (core)
+        run: cargo fmt --check
+
+      - name: cargo fmt --check (bridge)
+        working-directory: crates/mmbus-bridge
+        run: cargo fmt --check
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -137,7 +159,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "bridge -> target"
+          workspaces: "crates/mmbus-bridge -> target"
           prefix-key: "v0-rust-bridge"
           key: ${{ matrix.features }}
 
@@ -146,9 +168,9 @@ jobs:
       # are heavyweight; serializing them avoids the macOS mmap SIGBUS seen
       # when several run concurrently.  Few tests, so the cost is negligible.
       - name: cargo test
-        working-directory: bridge
+        working-directory: crates/mmbus-bridge
         run: cargo test ${{ matrix.features }} -- --test-threads=1
 
       - name: cargo clippy
-        working-directory: bridge
+        working-directory: crates/mmbus-bridge
         run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings

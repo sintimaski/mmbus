@@ -3,8 +3,8 @@ name: Fuzz smoke
 on:
   pull_request:
     paths:
-      - 'src/ring.rs'
-      - 'fuzz/**'
+      - 'crates/mmbus/src/ring.rs'
+      - 'crates/mmbus/fuzz/**'
       - '.github/workflows/fuzz.yml'
   workflow_dispatch:
     inputs:
@@ -36,7 +36,7 @@ jobs:
       # doesn't pollute or invalidate the non-fuzz CI cache).
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "fuzz -> target"
+          workspaces: "crates/mmbus/fuzz -> target"
           prefix-key: "v0-rust-fuzz"
 
       # --target x86_64-unknown-linux-gnu is explicit on purpose: recent
@@ -46,13 +46,13 @@ jobs:
       # core for the musl std).  Pinning gnu (dynamically linked, std present
       # on the nightly toolchain) restores a working sanitizer build.
       - name: Run fuzz target (ring_publish_receive)
-        working-directory: fuzz
+        working-directory: crates/mmbus/fuzz
         run: |
           DURATION="${{ github.event.inputs.duration_seconds || '60' }}"
           cargo fuzz run ring_publish_receive --target x86_64-unknown-linux-gnu -- -max_total_time="$DURATION"
 
       - name: Run fuzz target (ring_concurrent)
-        working-directory: fuzz
+        working-directory: crates/mmbus/fuzz
         run: |
           DURATION="${{ github.event.inputs.duration_seconds || '60' }}"
           cargo fuzz run ring_concurrent --target x86_64-unknown-linux-gnu -- -max_total_time="$DURATION"
@@ -62,5 +62,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-crashes
-          path: fuzz/artifacts/
+          path: crates/mmbus/fuzz/artifacts/
           if-no-files-found: ignore
