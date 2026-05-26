@@ -86,7 +86,7 @@ b'tick 1'
 ...
 ```
 
-Full working scripts in [`examples/`](examples/).
+Full working scripts in [`crates/mmbus/examples/`](crates/mmbus/examples/).
 
 ## Async
 
@@ -131,8 +131,8 @@ Needs `pip install anyio`; the import is lazy so it's a true opt-in.
 ## Performance
 
 Four regimes worth measuring separately.  Numbers from `cargo bench`,
-`benches/compare.py`, and `benches/competitive/` on an Apple M-series
-laptop (APFS).
+`crates/mmbus/benches/compare.py`, and `crates/mmbus/benches/competitive/`
+on an Apple M-series laptop (APFS).
 
 **1. Rust ring layer alone** — in-process publish + receive of a slot,
 no IPC wakeup:
@@ -158,7 +158,7 @@ The wakeup syscall dominates; for fan-out workloads where the publisher
 outpaces any single subscriber, the ring-layer numbers in (1) are what
 matter in practice.
 
-**3. From Python** — `benches/compare.py` runs an apples-to-apples
+**3. From Python** — `crates/mmbus/benches/compare.py` runs an apples-to-apples
 cross-thread bench against `pyzmq` over `ipc://`, 10 000 messages each:
 
 | Payload | mmbus              | pyzmq              | gap |
@@ -208,8 +208,9 @@ durable replay for same-host pub/sub without a separate broker or
 library.
 
 Reproduce: `cargo bench --bench ring && cargo bench --bench e2e &&
-python benches/compare.py`; competitive suite: `cd benches/competitive
-&& ./run_all.sh` (needs Docker for the Redis + NATS containers).
+python crates/mmbus/benches/compare.py`; competitive suite:
+`cd crates/mmbus/benches/competitive && ./run_all.sh` (needs Docker for the
+Redis + NATS containers).
 
 ## How it works
 
@@ -234,8 +235,8 @@ See [`docs/architecture.md`](docs/architecture.md) for the full design.
 
 ## Target use cases
 
-- **ML inference pipelines** — pass tensors between workers without pickle copies ([`examples/np_pipeline.py`](examples/np_pipeline.py))
-- **Multi-worker web apps** — WebSocket broadcast without standing up Redis ([`examples/fastapi_broadcast.py`](examples/fastapi_broadcast.py))
+- **ML inference pipelines** — pass tensors between workers without pickle copies ([`crates/mmbus/examples/np_pipeline.py`](crates/mmbus/examples/np_pipeline.py))
+- **Multi-worker web apps** — WebSocket broadcast without standing up Redis ([`crates/mmbus/examples/fastapi_broadcast.py`](crates/mmbus/examples/fastapi_broadcast.py))
 - **Edge / embedded Python** — Raspberry Pi, Jetson; no daemon required
 - **Desktop apps** — cross-process events without a server
 - **Dev/test environments** — production-quality local pub/sub, no Docker
@@ -270,7 +271,7 @@ bridge TOML schema 1:1.
 
 For asyncio services, `async with Bridge(...)` + `await bridge.wait_async()`
 runs the bridge without blocking the event loop (the bridge itself runs on
-its own threads).  See [`bridge/examples/bridge_async.py`](bridge/examples/bridge_async.py).
+its own threads).  See [`crates/mmbus-bridge/examples/bridge_async.py`](crates/mmbus-bridge/examples/bridge_async.py).
 
 **Which bridge entry point?**
 

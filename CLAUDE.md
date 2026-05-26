@@ -40,21 +40,21 @@ format break or a crash-safety break.
    bumps the in-header `generation` counter instead.  A truncate
    would SIGBUS every subscriber holding the mmap.  This is the
    single most important crash-safety property; the regression test
-   is `tests/crash_recovery.rs::restart_invalidates_existing_subscriber`.
+   is `crates/mmbus/tests/crash_recovery.rs::restart_invalidates_existing_subscriber`.
 
 4. **WAL append happens BEFORE the ring publish.**  Per
    `docs/rfc-wal-phase-b.md` §9.1: a failed WAL append returns
    `Error::Wal` and the ring stays untouched.  Reordering this
    creates a window where the ring has a record that the WAL
    doesn't — defeating crash recovery.  Test:
-   `tests/wal_publisher.rs::each_policy_appends_and_fsyncs_before_ring_publish`.
+   `crates/mmbus/tests/wal_publisher.rs::each_policy_appends_and_fsyncs_before_ring_publish`.
 
 5. **Seqlock bracket pattern around slot writes.**  The publisher
    stores `tail | SEQ_WRITING_BIT` BEFORE the payload write and
    the clean `tail` AFTER.  Subscribers retry on observing the
    WRITING bit.  Without the bracket, a `DropOldest` subscriber
    reads torn payloads.  Validated by
-   `fuzz/fuzz_targets/ring_concurrent.rs`.
+   `crates/mmbus/fuzz/fuzz_targets/ring_concurrent.rs`.
 
 6. **Cursors are globally monotonic across publisher restarts when
    the WAL is enabled.**  `Publisher::create` aligns
@@ -74,7 +74,7 @@ format break or a crash-safety break.
    or weakening either flag op below SeqCst, reintroduces the race.
    The publisher also wakes a client whose cursor went `UNCLAIMED`
    (clean disconnect) so dead peers are still reaped.  Tests:
-   `tests/wakeup_coalescing.rs`.
+   `crates/mmbus/tests/wakeup_coalescing.rs`.
 
 ## Hot-path discipline
 
@@ -101,17 +101,17 @@ These rules guard the per-publish CPU budget.
 ## Testing patterns
 
 - **Acceptance scenarios.**  Cross-cutting durability + replay
-  contracts live in `tests/wal_acceptance.rs` and mirror the
+  contracts live in `crates/mmbus/tests/wal_acceptance.rs` and mirror the
   RFC's §15 scenarios.  When you change WAL semantics, update
   these — they are the contract.
-- **Fuzz harnesses.**  `fuzz/fuzz_targets/ring_concurrent.rs` is
+- **Fuzz harnesses.**  `crates/mmbus/fuzz/fuzz_targets/ring_concurrent.rs` is
   the authority on the seqlock invariants.  Run for at least
   100k iterations before merging any change to `write_slot` /
   `try_receive` / the WRITING-bit dance.
 - **Stress tests are opt-in.**  `cargo test --release --test
   stress -- --ignored` exercises fan-out + restart cycles.  Run
   in CI on tagged releases, not on every PR (they're slow).
-- **No mocked I/O in integration tests.**  All `tests/*.rs` use
+- **No mocked I/O in integration tests.**  All `crates/mmbus/tests/*.rs` use
   real `tempfile::tempdir` + real mmap + real Unix sockets.
   Mocking the data path defeats the point of testing the data
   path.
