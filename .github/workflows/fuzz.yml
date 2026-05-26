@@ -17,6 +17,9 @@ jobs:
   fuzz:
     name: Fuzz ring_publish_receive
     runs-on: ubuntu-latest
+    # Two 60s fuzz targets + build/cache overhead; 30 min is generous
+    # headroom while still capping a runaway run well under the 6h default.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -36,17 +39,23 @@ jobs:
           workspaces: "fuzz -> target"
           prefix-key: "v0-rust-fuzz"
 
+      # --target x86_64-unknown-linux-gnu is explicit on purpose: recent
+      # cargo-fuzz / runner images default the fuzz build to the musl target,
+      # whose statically-linked libc is incompatible with the ASan sanitizer
+      # ("sanitizer is incompatible with statically linked libc" + missing
+      # core for the musl std).  Pinning gnu (dynamically linked, std present
+      # on the nightly toolchain) restores a working sanitizer build.
       - name: Run fuzz target (ring_publish_receive)
         working-directory: fuzz
         run: |
           DURATION="${{ github.event.inputs.duration_seconds || '60' }}"
-          cargo fuzz run ring_publish_receive -- -max_total_time="$DURATION"
+          cargo fuzz run ring_publish_receive --target x86_64-unknown-linux-gnu -- -max_total_time="$DURATION"
 
       - name: Run fuzz target (ring_concurrent)
         working-directory: fuzz
         run: |
           DURATION="${{ github.event.inputs.duration_seconds || '60' }}"
-          cargo fuzz run ring_concurrent -- -max_total_time="$DURATION"
+          cargo fuzz run ring_concurrent --target x86_64-unknown-linux-gnu -- -max_total_time="$DURATION"
 
       - name: Upload crash artifacts on failure
         if: failure()

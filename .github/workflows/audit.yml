@@ -23,6 +23,7 @@ jobs:
   cargo-deny:
     name: cargo-deny (advisories + licenses + bans + sources)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -33,6 +34,7 @@ jobs:
   cargo-audit:
     name: cargo-audit (RustSec advisory DB)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -361,15 +361,31 @@ impl Publisher {
         let mut i = 0;
         while i < self.clients.len() {
             let idx = self.clients[i].cursor_idx;
-            // Wake when the subscriber announced it is about to sleep
-            // (flag set) OR it released its cursor slot (clean disconnect —
-            // probe so a dead peer is reaped + the dropped counter ticks).
-            // A subscriber that is actively draining (claimed cursor, no
-            // flag) is skipped: it sees the new tail on its next ring read
+
+            // Reap a cleanly-disconnected subscriber directly: a released
+            // (UNCLAIMED) cursor slot proves the subscriber's `Drop` ran, so
+            // the client is gone regardless of the wakeup primitive.  We must
+            // NOT rely on `wake()` failing here — on Linux an `eventfd` write
+            // succeeds even when the reader has closed (the publisher holds
+            // its own dup), so the wake never reports the death.  (macOS's
+            // socket `send` does fail, but we want platform-uniform reaping.)
+            if self.ring.cursor_is_unclaimed(idx) {
+                self.clients.swap_remove(i);
+                self.subscribers_dropped_total
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                tracing::info!(
+                    target: "mmbus::publisher",
+                    remaining_clients = self.clients.len(),
+                    "subscriber dropped (cursor released; clean disconnect)",
+                );
+                continue; // swap_remove put a new client at i — re-examine it
+            }
+
+            // Live subscriber: wake only if it announced it is about to sleep
+            // (flag set).  One that is actively draining (claimed cursor, no
+            // flag) is skipped — it sees the new tail on its next ring read
             // without a syscall.  This is the coalescing win.
-            let should_wake =
-                self.ring.take_wakeflag(idx) || self.ring.cursor_is_unclaimed(idx);
-            if !should_wake {
+            if !self.ring.take_wakeflag(idx) {
                 i += 1;
                 continue;
             }
@@ -377,6 +393,8 @@ impl Publisher {
             if self.clients[i].wake() {
                 i += 1;
             } else {
+                // Abrupt death (peer closed without releasing its cursor):
+                // detected on macOS by the socket send failing.
                 self.clients.swap_remove(i);
                 self.subscribers_dropped_total
                     .fetch_add(1, AtomicOrdering::Relaxed);
@@ -448,13 +466,16 @@ impl Publisher {
         #[cfg(unix)]
         loop {
             match self.listener.accept() {
-                Ok((mut sock, _)) => {
+                Ok((sock, _)) => {
                     sock.set_nonblocking(false)?;
                     suppress_sigpipe(&sock);
 
                     // Linux: the eventfd + cursor_idx arrive together via
                     // SCM_RIGHTS.  macOS: cursor_idx is the first 4 bytes
                     // written on the socket, ahead of the 1-byte wakeups.
+                    // (`Read for &UnixStream` lets us read without a `mut`
+                    // binding — which would be unused on Linux and trip
+                    // clippy's `unused_mut` under -D warnings.)
                     #[cfg(target_os = "linux")]
                     let (efd, cursor_idx) = {
                         let (fd, idx) = crate::waker::linux::recv_fd(&sock)?;
@@ -464,7 +485,7 @@ impl Publisher {
                     let cursor_idx = {
                         use std::io::Read;
                         let mut idx_bytes = [0u8; 4];
-                        sock.read_exact(&mut idx_bytes)?;
+                        (&sock).read_exact(&mut idx_bytes)?;
                         u32::from_le_bytes(idx_bytes) as usize
                     };
 

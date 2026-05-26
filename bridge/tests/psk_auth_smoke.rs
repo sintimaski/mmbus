@@ -143,12 +143,19 @@ fn wrong_psk_is_dropped_and_messages_not_republished() {
     let mut peer = TcpStream::connect(addr).expect("connect");
     write_frame(&mut peer, &Frame::peer_hello_with_psk(99, b"WRONG-PSK"));
     // Spam Msg frames.  None should be republished because the bridge
-    // closes our connection after rejecting the hello PSK.
+    // closes our connection after rejecting the hello PSK.  That close
+    // means these writes MAY fail with broken-pipe / connection-reset —
+    // which is correct, expected behaviour (it's the very drop we're
+    // asserting), so tolerate write errors here.  (On Linux the writes
+    // tend to buffer before the RST lands; on macOS the close is observed
+    // immediately and write_all fails — using the strict `write_frame`
+    // here made the test flaky on macOS CI.)  The real assertion is the
+    // receiver thread's timeout: zero messages republished.
     for i in 0..10u64 {
-        write_frame(
-            &mut peer,
-            &Frame::msg(99, i, b"events".to_vec(), b"NOPE".to_vec()),
-        );
+        let frame = Frame::msg(99, i, b"events".to_vec(), b"NOPE".to_vec());
+        let mut buf = Vec::with_capacity(frame.encoded_len());
+        frame.encode(&mut buf);
+        let _ = peer.write_all(&buf);
     }
     drop(peer);
 
