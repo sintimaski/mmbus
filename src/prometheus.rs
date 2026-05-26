@@ -454,13 +454,15 @@ mod tests {
     #[test]
     fn server_responds_404_for_other_paths() {
         // End-to-end: start server, connect, request /, assert 404.
+        // Bind in the main thread and keep the listener bound while we move
+        // it into the handler — binding before the client connects avoids a
+        // connect-before-bind race (and re-binding the same ephemeral port
+        // could collide on a busy CI host).
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        drop(listener); // we'll re-bind inside the test handler
 
         let handle = std::thread::spawn(move || {
             // Run only one accept loop iteration for the test.
-            let listener = TcpListener::bind(addr).unwrap();
             let (mut stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(&stream);
             let mut request = String::new();

@@ -619,8 +619,8 @@ impl Subscriber {
         Ok(self.try_receive())
     }
 
-    /// Public, `Result`-typed wrapper over [`Self::try_drain_wakeup`] for
-    /// the asyncio `add_reader` path: clear one pending wakeup unit so the
+    /// Public, `Result`-typed wrapper over the internal `try_drain_wakeup`
+    /// for the asyncio `add_reader` path: clear one pending wakeup unit so the
     /// (level-triggered) fd stops signalling, then read the ring separately
     /// via `try_receive`.  Returns `Ok(true)` if a unit was drained,
     /// `Ok(false)` if none was pending; `Err` on publisher disconnect.

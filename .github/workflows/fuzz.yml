@@ -17,6 +17,9 @@ jobs:
   fuzz:
     name: Fuzz ring_publish_receive
     runs-on: ubuntu-latest
+    # Two 60s fuzz targets + build/cache overhead; 30 min is generous
+    # headroom while still capping a runaway run well under the 6h default.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 

@@ -12,10 +12,18 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Hard ceiling so a hung test fails fast instead of burning the
+    # 6-hour default job timeout (which is what used to happen on
+    # Windows — see the windows-check job for why Windows is build-only).
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Linux + macOS are the supported runtime platforms (README:
+        # Windows is "not yet").  Windows gets a compile-only check in the
+        # `windows-check` job — running the suite there hangs on the
+        # blocking LockFileEx producer lock (clean_topic_refuses_*).
+        os: [ubuntu-latest, macos-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -42,22 +50,22 @@ jobs:
       # de-facto-standard Rust CI cache.  Replaced manual actions/cache.
       - uses: Swatinem/rust-cache@v2
 
+      # --test-threads=2 caps intra-binary parallelism.  Under the default
+      # (one thread per core) the macOS runners intermittently SIGBUS:
+      # heavyweight tests racing on create_or_reuse/mmap of ring files
+      # trip BSD's mmap-after-resize semantics.  Capping threads is the
+      # project's validated mitigation (see CLAUDE.md / spsc flakiness note).
       - name: cargo test
-        run: cargo test --all-features
+        run: cargo test --all-features -- --test-threads=2
 
       - name: cargo clippy
         run: cargo clippy --all-features -- -D warnings
 
       # Build the Python extension and run the cross-platform smoke
-      # harness on every OS.  Windows-incompatible smokes
-      # (asyncio.add_reader, fastapi without httpx, np_pipeline without
-      # numpy) skip themselves with a logged reason.
-
+      # harness.  `pip install .` triggers the maturin build backend
+      # declared in pyproject.toml; `[tool.maturin]` already pins
+      # `features = ["python", "wal_v2"]`.
       - name: Build + install Python extension
-        # `pip install .` triggers the maturin build backend declared in
-        # pyproject.toml — no manual `maturin develop` (which needs a
-        # venv) required.  `[tool.maturin]` already pins
-        # `features = ["python"]`.
         run: |
           python -m pip install --upgrade pip
           python -m pip install .
@@ -65,18 +73,52 @@ jobs:
       - name: Python smoke
         run: python python/smoke_test.py
 
+  windows-check:
+    name: Windows compile-check
+    runs-on: windows-latest
+    timeout-minutes: 20
+    # Windows is not a supported runtime target yet (README: "not yet"):
+    # the suite hangs on the blocking LockFileEx producer lock and the
+    # named-pipe wakeup path is unverified at runtime.  We still
+    # compile-check (clippy in check-mode, no test execution) so the
+    # Windows-conditional code — e.g. the v5 semaphore-handshake cursor_idx
+    # added in 0.5.0 — can't silently break.  No `cargo test` here: that's
+    # what burned the 6-hour timeout.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # pyo3's build script probes for an interpreter even in check mode.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v0-rust-wincheck"
+
+      # clippy --all-targets compiles (check-mode, no link, no run) the lib,
+      # tests, examples, and benches across all features — catching Windows
+      # compile breakage without executing anything.
+      - name: cargo clippy (compile-check, no run)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
   bridge:
     name: Bridge (${{ matrix.os }}, ${{ matrix.features }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         # The bridge crate is a standalone workspace, so it needs its
         # own job.  We test both feature configurations: TCP-only (the
-        # default) and TCP+QUIC.  Windows is excluded for now — quinn
-        # builds on Windows but our QUIC code hasn't been validated
-        # there; the TCP-only path is exercised under the main `test`
-        # job's `cargo test --all-features` invocation.
+        # default) and TCP+QUIC.  Windows is excluded — quinn builds on
+        # Windows but our QUIC code hasn't been validated there, and the
+        # bridge sits on the same unsupported-on-Windows producer lock.
         os: [ubuntu-latest, macos-latest]
         features: ["", "--features quic"]
 
@@ -94,9 +136,13 @@ jobs:
           prefix-key: "v0-rust-bridge"
           key: ${{ matrix.features }}
 
+      # --test-threads=1: the bridge integration tests (psk_auth_smoke,
+      # forward/receive/mesh smokes) each stand up real buses + sockets and
+      # are heavyweight; serializing them avoids the macOS mmap SIGBUS seen
+      # when several run concurrently.  Few tests, so the cost is negligible.
       - name: cargo test
         working-directory: bridge
-        run: cargo test ${{ matrix.features }}
+        run: cargo test ${{ matrix.features }} -- --test-threads=1
 
       - name: cargo clippy
         working-directory: bridge
