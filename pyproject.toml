@@ -42,3 +42,8 @@ bridge = ["mmbus-bridge"]
 features = ["python", "wal_v2"]
 module-name = "mmbus._mmbus"
 python-source = "python"
+# The Rust crate moved under crates/mmbus when the repo became a Cargo
+# workspace; pyproject.toml + the `python/` source dir stay at the repo
+# root so `pip install .` (and the wheels.yml maturin build) keep working
+# unchanged.  manifest-path points maturin at the relocated crate manifest.
+manifest-path = "crates/mmbus/Cargo.toml"
