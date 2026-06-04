@@ -174,3 +174,42 @@ jobs:
       - name: cargo clippy
         working-directory: crates/mmbus-bridge
         run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
+
+  mmcast:
+    name: mmcast (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # mmcast is pure Python — no Rust crate.  Test on the supported
+        # mmbus runtime platforms (Linux + macOS); Windows is gated on
+        # mmbus's own Windows support landing first.  Python matrix
+        # mirrors the wheel's classifiers minimum and the PyO3-imposed
+        # max (3.13 — see comment in the `test` job).
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # mmcast depends on the `mmbus` wheel from PyPI in the wild, but in
+      # CI we build it from the in-repo source so a PR that bumps mmbus
+      # and mmcast together is testable in one go.  Uses maturin via
+      # `pip install`, which honours pyproject.toml at the repo root.
+      - name: Install mmbus from source
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install maturin
+          python -m pip install .
+
+      - name: Install mmcast (editable) + test deps
+        run: python -m pip install -e "crates/mmcast[test]"
+
+      - name: pytest
+        working-directory: crates/mmcast
+        run: python -m pytest -v
