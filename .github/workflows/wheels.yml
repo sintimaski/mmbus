@@ -1,5 +1,19 @@
 name: Build wheels
 
+# mmbus core wheel build.  Triggered by `v*` tags (e.g. `v0.5.1`) so it
+# does NOT fire on `mmcast-v*` or `bridge-v*` tags — those have their
+# own workflows.
+#
+# The matrix is (platform × Python).  mmbus's PyO3 0.22 surface uses
+# `pyo3::buffer` for the zero-copy `recv_into` path, which is only
+# abi3-available on Python 3.11+ — so we can't ship one abi3 wheel and
+# call it done.  Instead we build per-Python wheels.
+#
+# Python floor is 3.9 (3.8 EOL Oct 2024; 3.9 EOL Oct 2025 but still
+# widely deployed).  Ceiling is 3.13 — PyO3 0.22's max supported
+# version; the PyO3 0.22 → 0.28 migration tracked for v0.2.x lifts
+# the ceiling to 3.14.
+
 on:
   push:
     tags:
@@ -8,53 +22,60 @@ on:
 
 jobs:
   build:
-    name: Build ${{ matrix.target }} on ${{ matrix.os }}
+    name: Build py${{ matrix.python }} ${{ matrix.target }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
+      fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64
-            manylinux: auto
-          - os: ubuntu-latest
-            target: aarch64
-            manylinux: auto
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+        target:
+          - x86_64
+          - aarch64
+          - x64
+        python:
+          - "3.9"
+          - "3.10"
+          - "3.11"
+          - "3.12"
+          - "3.13"
+        # Trim platform-specific combos to what each runner can actually
+        # build: macOS gets x86_64 + aarch64; Linux gets x86_64 + aarch64
+        # (aarch64 via QEMU); Windows gets x64 only.
+        exclude:
           - os: macos-latest
-            target: x86_64
-          - os: macos-latest
-            target: aarch64
-          - os: windows-latest
             target: x64
+          - os: ubuntu-latest
+            target: x64
+          - os: windows-latest
+            target: x86_64
+          - os: windows-latest
+            target: aarch64
 
     steps:
       - uses: actions/checkout@v4
 
-      # PyO3/maturin-action@v1 handles:
-      #  - manylinux container selection for Linux targets (provides
-      #    a target-arch Python interpreter, fixing the "Couldn't find
-      #    any python interpreters" error on aarch64 cross-builds).
-      #  - QEMU setup for aarch64 Linux.
-      #  - Native build for macOS / Windows.
-      # PyO3 0.22's Python version cap (3.13) is satisfied because the
-      # manylinux container ships Python 3.12.
-      # Pin Python to 3.12 so maturin doesn't pick 3.14 (the latest
-       # in maturin-action's cache) and trip PyO3 0.22's max-version
-       # check.  Will be removed in v0.2.x after the PyO3 upgrade.
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
 
+      # PyO3/maturin-action@v1 handles manylinux container selection,
+      # QEMU for aarch64 Linux, and native builds elsewhere.  We pass
+      # `--interpreter python${{ matrix.python }}` so each matrix cell
+      # produces the correct `cp3X-cp3X` wheel.
       - uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          manylinux: ${{ matrix.manylinux || 'auto' }}
-          args: --release --out dist --features python --interpreter python3.12
+          manylinux: auto
+          args: --release --out dist --features python --interpreter python${{ matrix.python }}
           sccache: "true"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}-${{ matrix.target }}
+          name: wheels-${{ matrix.os }}-${{ matrix.target }}-py${{ matrix.python }}
           path: dist/*.whl
 
   publish:

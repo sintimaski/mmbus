@@ -1,10 +1,13 @@
 """T6 — Presence tracking.
 
-Implements the opt-in ``Broadcast.presence`` surface.  Single-process
-semantics: multiple members within one Broadcast see each other via the
-shared ``_presence:<channel>`` mmbus topic.  Multi-process presence
-(per-member sharding) is out of scope for v0.1 — same constraint as
-broadcast.publish per the spec.
+Implements the opt-in ``Broadcast.presence`` surface.  Multiple
+members within one Broadcast see each other via the shared
+``_presence:<channel>`` mmbus topic.  Cross-process presence works
+transparently when the surrounding ``Broadcast`` is in sharded mode
+(``worker_id`` + ``peers`` set): the presence topic rides the same
+``_Channel`` machinery as chat broadcasts, so each Presence's joins,
+heartbeats, and leaves fan out to every peer worker's subscribers.
+Verified by ``tests/test_presence_multiworker.py``.
 """
 from __future__ import annotations
 

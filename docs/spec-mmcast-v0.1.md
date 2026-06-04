@@ -108,7 +108,7 @@ a closed `Broadcast`).
 | # | Question                  | Decision (v0.1)                                     | Why |
 |---|---------------------------|-----------------------------------------------------|-----|
 | 1 | Slow-client policy default | `drop_oldest` + emit `SlowConsumer` warning + bump `sub.slow_count` | Matches the existing mmbus `BackpressurePolicy::DropOldest` semantic at the lib layer.  WS connections wedge silently on backpressure — dropping is more debuggable than blocking. |
-| 2 | Presence backend          | Separate mmbus topic `_presence:<channel>` carrying `(member_id, heartbeat_ts)` tuples; TTL eviction on the consumer side | No second state store.  Heartbeat-based expiry handles ungraceful disconnects without a coordinator. |
+| 2 | Presence backend          | Separate mmbus topic `_presence:<channel>` carrying `(member_id, heartbeat_ts)` tuples; TTL eviction on the consumer side.  Cross-process presence rides the Broadcast's sharding — no extra plumbing. | No second state store.  Heartbeat-based expiry handles ungraceful disconnects without a coordinator. |
 | 3 | Replay semantics          | In-ring history only (`bus.subscribe_with_history`) | The boring, free win.  Durable-WAL replay (`replay_from_cursor=`) lands in v0.2 once we've seen which apps want it. |
 | 4 | PyPI name                 | `mmbus-cast` (import: `mmbus_cast`)                 | Mirrors `mmbus-bridge` precedent; signals family relationship; avoids any name-availability surprise. |
 
@@ -198,7 +198,7 @@ mmbus has a `max_subscribers` ceiling per topic (default 16).
 
 | Phase                  | mmcast pins mmbus as              |
 |------------------------|-----------------------------------|
-| mmbus pre-1.0 (now)    | `mmbus>=0.5,<0.6`                 |
+| mmbus pre-1.0 (now)    | `mmbus>=0.5.1,<0.6`               |
 | mmbus 1.0+             | `mmbus>=1,<2`                     |
 
 mmcast versions independently.  First release: `mmbus-cast 0.1.0`,

@@ -36,7 +36,11 @@ classifiers = [
 ]
 # mmbus is pre-1.0; pin to a single minor range and widen post-1.0.  See
 # docs/spec-mmcast-v0.1.md "Version pinning".
-dependencies = ["mmbus>=0.5,<0.6"]
+# Pin to >=0.5.1 because that's the release where mmbus first ships
+# wheels for Python 3.9–3.13 (0.5.0 was cp312-only).  Without the
+# floor, `pip install mmbus-cast` on any non-3.12 interpreter would
+# fail at the mmbus dependency.
+dependencies = ["mmbus>=0.5.1,<0.6"]
 
 [project.optional-dependencies]
 # `pip install mmbus-cast[fastapi]` for the WS demo + ASGI helpers.

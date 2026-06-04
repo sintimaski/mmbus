@@ -47,10 +47,14 @@ First release.  Pre-1.0, API may iterate.
 
 ### Notes
 
-- mmbus dependency pinned to `>=0.5,<0.6` for the pre-1.0 floor-and-
-  ceiling rule.  Will widen to `>=1,<2` after mmbus's 1.0 freeze.
+- mmbus dependency pinned to `>=0.5.1,<0.6` (0.5.1 is the first
+  release with the Python 3.9–3.13 wheel matrix; pre-1.0 floor-and-
+  ceiling rule).  Will widen to `>=1,<2` after mmbus's 1.0 freeze.
 - Single-publisher mode is the default (one process owns a topic);
   sharded mode kicks in when `worker_id` + `peers` are supplied.
+  Sharded mode now covers presence too — Presence rides the same
+  per-worker shards as chat publishes, so cross-process presence works
+  without extra config.  Verified by `test_presence_multiworker.py`.
 - `replay_last=N` is in-ring only (mmbus's
   `subscribe_with_history`).  Durable-WAL replay is planned for v0.2
   along with a per-subscriber replay buffer.

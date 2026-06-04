@@ -48,6 +48,11 @@ tracing = { version = "0.1", default-features = false, features = ["std", "attri
 # off so log lines stay clean in files / non-tty.  Only pulled in when
 # `logging` (hence the Python wheel) is enabled.
 tracing-subscriber = { version = "0.3", optional = true, default-features = false, features = ["fmt", "env-filter", "std"] }
+# We deliberately do NOT enable abi3 here: mmbus uses `pyo3::buffer`
+# for the zero-copy `recv_into` path (subscription.rs), and the
+# buffer protocol is only available under abi3 when targeting
+# `Py_3_11`+.  Keeping the full C-API means one wheel per Python
+# version per platform — see `wheels.yml`'s python matrix.
 pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
 # Wait-free Arc<T> swapper for the v2 WAL hot path: lets the
 # publisher load the active MmapSegmentWriter without taking the
