@@ -15,6 +15,7 @@ build-backend = "hatchling.build"
 name = "mmbus-cast"
 version = "0.1.0"
 description = "ASGI WebSocket broadcast over mmbus — no Redis, no daemon"
+readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
 authors = [{ name = "mmbus contributors" }]

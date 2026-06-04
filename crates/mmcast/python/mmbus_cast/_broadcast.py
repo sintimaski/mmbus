@@ -517,7 +517,7 @@ class Broadcast:
                 self._channels[channel] = ch
             return ch
 
-    # ── presence (T6) ────────────────────────────────────────────────────
+    # ── presence ─────────────────────────────────────────────────────────
     def presence(
         self,
         channel: str,
@@ -525,5 +525,22 @@ class Broadcast:
         member_id: str,
         ttl_secs: float = 15.0,
         heartbeat_secs: float = 5.0,
-    ):
-        raise NotImplementedError("Broadcast.presence lands in T6")
+    ) -> "Presence":
+        """Open a presence handle for ``channel`` as ``member_id``.
+
+        Async context manager + async iterator over :class:`PresenceChange`.
+        See :class:`~mmbus_cast._presence.Presence` for details.
+        """
+        if self._closed or self._bus is None:
+            raise BroadcastClosedError("Broadcast is not open")
+        # Lazy import to avoid a hard ordering between _broadcast and
+        # _presence at module load time.
+        from ._presence import Presence
+
+        return Presence(
+            self,
+            channel,
+            member_id=member_id,
+            ttl_secs=ttl_secs,
+            heartbeat_secs=heartbeat_secs,
+        )

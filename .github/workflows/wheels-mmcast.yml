@@ -1,0 +1,64 @@
+name: Build mmcast wheel
+
+# mmcast is pure Python (no Rust crate) so the wheel build is one job,
+# one platform, one wheel — distinct from `wheels.yml` which produces
+# the matrix of native wheels for the `mmbus` PyO3 extension.
+#
+# Tag prefix: `mmcast-v*` (the family-prefix scheme — see
+# docs/spec-mmcast-v0.1.md "Version pinning").  `wheels.yml` consumes
+# bare `v*` for mmbus and `mmbus-bridge` ships its own.
+
+on:
+  push:
+    tags:
+      - "mmcast-v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build mmcast wheel (py3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build backend
+        run: python -m pip install --upgrade pip build twine
+
+      - name: Build wheel + sdist
+        working-directory: crates/mmcast
+        run: python -m build
+
+      - name: Twine check
+        run: twine check crates/mmcast/dist/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mmbus-cast-dist
+          path: crates/mmcast/dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: [build]
+    runs-on: ubuntu-latest
+    # Trusted publishing via PyPI's OIDC flow (no API token in secrets).
+    # The PyPI project `mmbus-cast` must be configured to trust this
+    # workflow under sintimaski/mmbus.  See:
+    # https://docs.pypi.org/trusted-publishers/
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mmbus-cast
+    permissions:
+      id-token: write
+    if: startsWith(github.ref, 'refs/tags/mmcast-v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: mmbus-cast-dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

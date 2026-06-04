@@ -1,0 +1,41 @@
+# Side-by-side benchmark: encode/broadcaster + Redis vs mmcast.
+#
+# Container count is itself the headline: the Redis stack needs three
+# services (redis + app); the mmcast stack needs one (app).  Run it::
+#
+#     cd crates/mmcast/examples/benchmark
+#     ./run.sh
+#
+# Build context is the repo root so Dockerfiles can copy in the local
+# mmbus + mmcast source (no PyPI dependency for the demo).
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: bench-redis
+    networks: [bench]
+    profiles: [redis]
+
+  redis_app:
+    build:
+      context: ../../../..
+      dockerfile: crates/mmcast/examples/benchmark/redis_side/Dockerfile
+    container_name: bench-redis-app
+    environment:
+      REDIS_URL: redis://redis:6379
+    depends_on: [redis]
+    networks: [bench]
+    ports: ["8001:8000"]
+    profiles: [redis]
+
+  mmcast_app:
+    build:
+      context: ../../../..
+      dockerfile: crates/mmcast/examples/benchmark/mmcast_side/Dockerfile
+    container_name: bench-mmcast-app
+    networks: [bench]
+    ports: ["8002:8000"]
+    profiles: [mmcast]
+
+networks:
+  bench: {}

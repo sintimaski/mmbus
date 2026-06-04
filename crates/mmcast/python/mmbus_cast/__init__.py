@@ -19,15 +19,18 @@ See ``docs/spec-mmcast-v0.1.md`` for the contract.
 """
 from __future__ import annotations
 
-from ._broadcast import Broadcast, BroadcastClosedError, SlowConsumer
+from ._broadcast import Broadcast, BroadcastClosedError, SlowConsumer, Subscription
 from ._event import Event, PresenceChange
+from ._presence import Presence
 
 __all__ = [
     "Broadcast",
     "BroadcastClosedError",
     "Event",
+    "Presence",
     "PresenceChange",
     "SlowConsumer",
+    "Subscription",
 ]
 
 __version__ = "0.1.0"
