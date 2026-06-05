@@ -23,6 +23,17 @@ All notable changes to mmbus are recorded here.  Format follows
   comments for why we don't ship abi3 wheels here (the buffer-protocol
   zero-copy `recv_into` path requires `Py_3_11` under abi3, which
   would drop 3.9 / 3.10 anyway).
+- **Pre-tag wheel-matrix gate.**  `ci.yml`'s `mmcast` job now matrixes
+  over all five supported Python versions (3.9 – 3.13) on Linux +
+  macOS — every PR builds mmbus from source against each cell,
+  installs the wheel, runs a publish/subscribe round-trip, and runs
+  the full mmcast suite (40+ tests) against it.  This eliminates
+  "matrix broken at tag time" as a failure mode: a future Python
+  version that breaks the PyO3 build fails the PR check, not the
+  release.  Cross-compile cells (Linux aarch64, macOS x86_64) are
+  still gated only by `wheels.yml` itself; they share the same
+  toolchain as the native cells, and have not regressed in any
+  previous release using this matrix shape.
 - `mmbus-bridge` 0.5.0 → 0.5.1 (matches mmbus exactness pin).
 
 ## [0.5.0] - 2026-05-20

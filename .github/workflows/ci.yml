@@ -184,11 +184,19 @@ jobs:
       matrix:
         # mmcast is pure Python — no Rust crate.  Test on the supported
         # mmbus runtime platforms (Linux + macOS); Windows is gated on
-        # mmbus's own Windows support landing first.  Python matrix
-        # mirrors the wheel's classifiers minimum and the PyO3-imposed
-        # max (3.13 — see comment in the `test` job).
+        # mmbus's own Windows support landing first.
+        #
+        # The Python matrix covers every version mmbus 0.5.1+ ships a
+        # wheel for.  This job double-duties as the **wheel-matrix gate**:
+        # each cell builds mmbus from source via maturin, installs the
+        # resulting wheel into the runner's Python, and runs the full
+        # 40+ mmcast test suite against it.  If a future Python version
+        # breaks the mmbus PyO3 build (or the wheel-tier integration),
+        # this job's matrix surfaces it on every PR — eliminating the
+        # "matrix breaks at tag time" failure mode that wheels.yml
+        # otherwise has.
         os: [ubuntu-latest, macos-latest]
-        python: ["3.9", "3.12"]
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
 
     steps:
       - uses: actions/checkout@v4
@@ -196,6 +204,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v0-mmcast-wheel-smoke"
+          key: py${{ matrix.python }}
 
       # mmcast depends on the `mmbus` wheel from PyPI in the wild, but in
       # CI we build it from the in-repo source so a PR that bumps mmbus
@@ -206,6 +221,26 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install maturin
           python -m pip install .
+
+      # Explicit publish/subscribe round-trip against the just-built
+      # wheel — the cheapest possible "the wheel actually works" gate.
+      # If this passes the mmcast tests below will too; if it fails
+      # we get a focused diagnostic instead of a confusing pytest
+      # collection error.
+      - name: mmbus wheel round-trip smoke
+        shell: python
+        run: |
+          import asyncio, tempfile, mmbus
+          async def main():
+              d = tempfile.mkdtemp()
+              bus = mmbus.Bus("ci-smoke", base_dir=d, wal_enabled=False)
+              t = bus.topic("x")
+              sub = await bus.subscribe_async("x", timeout_secs=2.0)
+              t.publish(b"hello")
+              msg = await sub.recv_timeout(2.0)
+              assert msg == b"hello", msg
+              print("roundtrip OK on py${{ matrix.python }}")
+          asyncio.run(main())
 
       - name: Install mmcast (editable) + test deps
         run: python -m pip install -e "crates/mmcast[test]"
