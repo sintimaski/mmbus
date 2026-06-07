@@ -76,25 +76,23 @@ async def test_presence_across_two_sharded_workers(short_bus_dir):
         bus_name, worker_id="w1", peers=peers, **_fresh_bus(short_bus_dir)
     )
     async with w0, w1:
-        # Pre-claim publisher slots for the presence topic on both
-        # sides so subscriptions don't time out waiting for the peer.
-        await w0.prepare("_presence:chat")
-        await w1.prepare("_presence:chat")
-
+        # No internal-topic poking needed: the channel reconnect loop
+        # converges the cross-shard subscriptions once both workers'
+        # presence publishers exist (staggered-startup resilience).
         async with w0.presence(
             "chat",
             member_id="alice",
-            ttl_secs=2.0,
+            ttl_secs=5.0,
             heartbeat_secs=0.2,
         ) as p_alice:
             async with w1.presence(
                 "chat",
                 member_id="bob",
-                ttl_secs=2.0,
+                ttl_secs=5.0,
                 heartbeat_secs=0.2,
             ) as p_bob:
-                await _wait_for_member(p_alice, "bob")
-                await _wait_for_member(p_bob, "alice")
+                await _wait_for_member(p_alice, "bob", timeout=8.0)
+                await _wait_for_member(p_bob, "alice", timeout=8.0)
                 assert {"alice", "bob"} <= p_alice.members
                 assert {"alice", "bob"} <= p_bob.members
 
@@ -113,9 +111,6 @@ async def test_presence_graceful_leave_across_shards(short_bus_dir):
         bus_name, worker_id="w1", peers=peers, **_fresh_bus(short_bus_dir)
     )
     async with w0, w1:
-        await w0.prepare("_presence:chat")
-        await w1.prepare("_presence:chat")
-
         async with w0.presence(
             "chat",
             member_id="alice",
@@ -129,11 +124,11 @@ async def test_presence_graceful_leave_across_shards(short_bus_dir):
                 heartbeat_secs=0.5,
             )
             await p_bob.__aenter__()
-            await _wait_for_member(p_alice, "bob")
+            await _wait_for_member(p_alice, "bob", timeout=8.0)
 
             # Bob exits gracefully on the OTHER shard.  Alice on w0 must
             # still see the leave event because the leave was published
-            # to `_presence:chat.w1` and Alice subscribes to both peer
+            # to `_presence.chat.w1` and Alice subscribes to both peer
             # shards.
             await p_bob.__aexit__(None, None, None)
             await _wait_for_leave(p_alice, "bob", timeout=3.0)
@@ -154,29 +149,29 @@ async def test_presence_ttl_eviction_across_shards(short_bus_dir):
         bus_name, worker_id="w1", peers=peers, **_fresh_bus(short_bus_dir)
     )
     async with w0, w1:
-        await w0.prepare("_presence:chat")
-        await w1.prepare("_presence:chat")
-
+        # ttl must comfortably exceed cross-shard reconnect convergence
+        # (~2s) so Alice actually sees Bob before any TTL math; the test
+        # then stops Bob's heartbeat and checks eviction.
         async with w0.presence(
             "chat",
             member_id="alice",
-            ttl_secs=0.4,
-            heartbeat_secs=0.05,
+            ttl_secs=1.0,
+            heartbeat_secs=0.1,
         ) as p_alice:
             p_bob = w1.presence(
                 "chat",
                 member_id="bob",
-                ttl_secs=0.4,
-                heartbeat_secs=0.05,
+                ttl_secs=1.0,
+                heartbeat_secs=0.1,
             )
             await p_bob.__aenter__()
             try:
-                await _wait_for_member(p_alice, "bob")
+                await _wait_for_member(p_alice, "bob", timeout=8.0)
                 # Cancel bob's heartbeat without a graceful leave.
                 assert p_bob._heartbeat_task is not None
                 p_bob._heartbeat_task.cancel()
                 # Alice (on the other shard) evicts bob within ~1.5×TTL.
-                await _wait_for_leave(p_alice, "bob", timeout=2.0)
+                await _wait_for_leave(p_alice, "bob", timeout=3.0)
             finally:
                 p_bob._closed = True
                 for t in (p_bob._consume_task, p_bob._eviction_task):

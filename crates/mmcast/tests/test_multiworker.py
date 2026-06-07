@@ -24,11 +24,9 @@ tests close it.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import shutil
 import socket
-import struct
 import subprocess
 import sys
 import time
@@ -132,11 +130,9 @@ async def test_publish_only_uses_own_shard(short_bus_dir):
     async with alpha:
         await alpha.prepare("notes")
 
-        # Direct mmbus.Bus subscription to the physical shard topic
-        # to confirm the sharding pattern from outside mmcast.
-        import mmbus
-
-        # Reuse alpha's bus instance — exposed for tests only.
+        # Direct mmbus.Bus subscription to the physical shard topic to
+        # confirm the sharding pattern from outside mmcast.  Reuse alpha's
+        # bus instance — exposed for tests only.
         bus = alpha._bus
         assert bus is not None
         async_sub = await bus.subscribe_async(

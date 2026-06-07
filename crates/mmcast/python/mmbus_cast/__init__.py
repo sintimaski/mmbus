@@ -19,16 +19,24 @@ See ``docs/spec-mmcast-v0.1.md`` for the contract.
 """
 from __future__ import annotations
 
-from ._broadcast import Broadcast, BroadcastClosedError, SlowConsumer, Subscription
+from ._broadcast import (
+    Broadcast,
+    BroadcastClosedError,
+    SlowConsumer,
+    Subscription,
+)
 from ._event import Event, PresenceChange
 from ._presence import Presence
+from ._validate import RESERVED_PREFIX, InvalidChannelError
 
 __all__ = [
     "Broadcast",
     "BroadcastClosedError",
     "Event",
+    "InvalidChannelError",
     "Presence",
     "PresenceChange",
+    "RESERVED_PREFIX",
     "SlowConsumer",
     "Subscription",
 ]

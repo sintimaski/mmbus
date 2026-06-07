@@ -15,7 +15,7 @@ import uuid
 
 import pytest
 
-from mmbus_cast import Broadcast, Event, SlowConsumer
+from mmbus_cast import Broadcast
 
 
 @pytest.fixture
