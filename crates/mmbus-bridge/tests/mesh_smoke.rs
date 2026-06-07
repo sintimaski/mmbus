@@ -120,7 +120,10 @@ fn bridge_fans_out_to_two_peers_via_mesh() {
                 ..Default::default()
             },
         );
-        bus.wait_for_subscribers("events", 1, Duration::from_secs(5))
+        // 30s safety-net (not a perf assertion) — a 5s deadline is
+        // flake-prone for the bridge subscriber-connect on loaded CI
+        // runners; see forward_smoke for the failure mode.
+        bus.wait_for_subscribers("events", 1, Duration::from_secs(30))
             .expect("bridge subscriber must connect");
         for i in 0..4u64 {
             bus.publish("events", &i.to_le_bytes()).expect("publish ok");

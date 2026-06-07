@@ -75,7 +75,13 @@ fn bridge_forwards_local_publishes_to_one_peer_over_tcp() {
                 ..Default::default()
             },
         );
-        bus.wait_for_subscribers("events", 1, Duration::from_secs(5))
+        // 30s safety-net (not a perf assertion): the bridge's subscriber
+        // thread can be slow to connect on a loaded CI runner (esp. the
+        // heavier `--features quic` build).  A 5s deadline here flaked —
+        // it timed out, the publisher bailed before sending any Msg
+        // frames, and the reader saw only the PeerHello.  Same reasoning
+        // as the read-deadline below.
+        bus.wait_for_subscribers("events", 1, Duration::from_secs(30))
             .expect("bridge subscriber must connect");
         for i in 0..5u64 {
             bus.publish("events", &i.to_le_bytes()).expect("publish ok");

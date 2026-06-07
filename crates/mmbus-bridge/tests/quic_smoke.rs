@@ -147,8 +147,10 @@ fn quic_forward_then_receive_end_to_end() {
             },
         );
         // The send bridge's subscriber thread is the only subscriber;
-        // wait for it to connect, then publish.
-        bus.wait_for_subscribers("events", 1, Duration::from_secs(10))
+        // wait for it to connect, then publish.  30s safety-net (not a
+        // perf assertion) — flake-prone at shorter deadlines on loaded
+        // CI runners; see forward_smoke for the failure mode.
+        bus.wait_for_subscribers("events", 1, Duration::from_secs(30))
             .expect("bridge subscriber must connect");
         for i in 0..3u64 {
             bus.publish("events", &i.to_le_bytes()).expect("publish");
