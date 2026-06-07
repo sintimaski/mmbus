@@ -129,6 +129,32 @@ app = FastAPI(lifespan=lifespan)
 
 Full chat app: [`examples/fastapi_chat/`](examples/fastapi_chat/).
 
+### Django (Channels)
+
+mmcast ships no Django-specific helper, but the same `Broadcast` API
+works inside a Channels `AsyncWebsocketConsumer` — open a subscription in
+`connect()`, publish in `receive()`:
+
+```python
+from channels.generic.websocket import AsyncWebsocketConsumer
+from mmbus_cast import Broadcast
+
+broadcast = Broadcast("my-app")  # opened once in apps.py ready() / lifespan
+
+class ChatConsumer(AsyncWebsocketConsumer):
+    async def connect(self):
+        await self.accept()
+        self._sub = broadcast.subscribe("chat")
+        sub = await self._sub.__aenter__()
+        self._task = asyncio.create_task(self._pump(sub))
+
+    async def receive(self, text_data=None, bytes_data=None):
+        await broadcast.publish("chat", text_data.encode())
+```
+
+Verified by `tests/test_django_integration.py` (real Channels
+`WebsocketCommunicator`).
+
 ## Multi-worker FastAPI
 
 mmbus enforces single-publisher-per-topic *across processes*.  For

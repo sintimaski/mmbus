@@ -87,8 +87,14 @@ First release.  Pre-1.0, API may iterate.
 - Tests: 100+ cases across smoke, validation, broadcast core, the
   subscribe API shape, concurrency races, backpressure, replay, presence
   (incl. malformed-input hardening), reconnect convergence, FastAPI
-  helpers, multi-worker sharding (incl. real uvicorn subprocesses), and
-  the chat-app end-to-end.  No mocks on the data path — real mmap, real
-  Unix sockets, real ASGI.
+  helpers + a fresh-app integration test (WS↔WS and HTTP-publish→WS),
+  Django Channels integration (real `WebsocketCommunicator` + consumer),
+  multi-worker sharding (incl. real uvicorn subprocesses), and the
+  chat-app end-to-end.  No mocks on the data path — real mmap, real Unix
+  sockets, real ASGI.
+- **Framework integration**: the generic `Broadcast` API works inside a
+  Django Channels `AsyncWebsocketConsumer` (tested) even though mmcast
+  ships no Django-specific helper — Django Channels support remains a
+  v0.1 non-goal, but "it works with Django" is verified, not assumed.
 
 [0.1.0]: https://github.com/sintimaski/mmbus/releases/tag/mmcast-v0.1.0

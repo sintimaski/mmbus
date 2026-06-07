@@ -47,8 +47,21 @@ dependencies = ["mmbus>=0.5.1,<0.6"]
 [project.optional-dependencies]
 # `pip install mmbus-cast[fastapi]` for the WS demo + ASGI helpers.
 fastapi = ["fastapi>=0.100", "uvicorn[standard]>=0.23"]
-# Test-only — kept out of the wheel.
-test = ["pytest>=7", "pytest-asyncio>=0.21", "anyio>=4"]
+# Test-only — kept out of the wheel.  Includes the FastAPI + Django
+# (Channels) stacks so the framework-integration tests actually run in
+# CI; both are additionally guarded by `pytest.importorskip` so a bare
+# `pytest` without them degrades to skips rather than errors.
+test = [
+    "pytest>=7",
+    "pytest-asyncio>=0.21",
+    "anyio>=4",
+    "fastapi>=0.100",
+    "httpx>=0.23",
+    "websockets>=11",
+    "django>=4.2",
+    "channels>=4",
+    "daphne>=4",  # channels.testing imports it (WebsocketCommunicator)
+]
 
 [project.urls]
 Homepage = "https://github.com/sintimaski/mmbus"
