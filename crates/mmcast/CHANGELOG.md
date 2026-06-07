@@ -22,10 +22,13 @@ First release.  Pre-1.0, API may iterate.
   - `await broadcast.prepare(*channels)` — claim publisher slots at
     app startup so the first subscriber doesn't pay a connect-timeout
     wait.
-  - `broadcast.presence(channel, *, member_id, ttl_secs=15.0, heartbeat_secs=5.0)`
+  - `broadcast.presence(channel, *, member_id, ttl_secs=15.0, heartbeat_secs=5.0, changes_queue_max=4096)`
     — async context manager + iterator over `PresenceChange` events;
-    backed by a separate `_presence:<channel>` mmbus topic with TTL
+    backed by a separate `_presence.<channel>` mmbus topic with TTL
     heartbeat eviction.
+  - `subscribe()` returns an awaitable async-context-manager, so both
+    `await bc.subscribe(...)` and `async with bc.subscribe(...) as sub`
+    work.  Arguments are validated eagerly at the call.
 - **`Subscription`** — async iterator over `Event(data, cursor)`;
   per-consumer `slow_count` and `delivered_count` counters.
 - **`SlowConsumer`** policy matrix: `drop_oldest` (default),
@@ -40,10 +43,33 @@ First release.  Pre-1.0, API may iterate.
   multi-worker FastAPI deployments need.
 - **Examples**:
   - `examples/fastapi_chat/` — full FastAPI chat app with HTMX
-    frontend.
+    frontend, an `Origin` allowlist (`MMCAST_ALLOWED_ORIGINS`), and
+    per-message error handling.
   - `examples/benchmark/` — docker-compose harness for the side-by-
     side comparison vs `encode/broadcaster` + Redis (loadgen, both
-    Dockerfiles, results JSON).
+    Dockerfiles, healthchecks, results JSON).
+
+### Security & robustness
+
+- **Channel-name validation** (`InvalidChannelError`): the `_` prefix is
+  reserved for internal subsystems (presence); path-traversal and
+  non-allowlist names are rejected at `publish`/`subscribe`/`prepare`/
+  `presence`, and `worker_id`/`peers` are validated too (they become
+  on-disk path components).  An app deriving a channel from untrusted
+  input can't escape into a subsystem topic or an out-of-tree mmap path.
+- **Presence hardening**: a single malformed record on the presence topic
+  can no longer kill the consume loop (pure, total parser); the change
+  queue is bounded (drop-oldest); the member table and member-id length
+  are capped; a member never TTL-evicts itself; the heartbeat interval
+  has a floor.
+- **Concurrency**: per-channel locking prevents duplicate mmbus
+  subscriptions under concurrent `subscribe()`; a subscribe racing
+  `__aexit__` can't resurrect an orphan channel; consumer close is
+  signalled out-of-band (asyncio.Event) so a full queue can't strand an
+  iterator.
+- **Staggered multi-worker startup**: a peer shard offline at subscribe
+  time is retried by a background reconnect loop until convergence, so
+  workers can start in any order.
 
 ### Notes
 
@@ -58,8 +84,11 @@ First release.  Pre-1.0, API may iterate.
 - `replay_last=N` is in-ring only (mmbus's
   `subscribe_with_history`).  Durable-WAL replay is planned for v0.2
   along with a per-subscriber replay buffer.
-- Tests: 35 cases across smoke, broadcast core, backpressure, replay,
-  presence, FastAPI helpers, and the chat-app end-to-end.  No mocks
-  on the data path — real mmap, real Unix sockets, real ASGI.
+- Tests: 100+ cases across smoke, validation, broadcast core, the
+  subscribe API shape, concurrency races, backpressure, replay, presence
+  (incl. malformed-input hardening), reconnect convergence, FastAPI
+  helpers, multi-worker sharding (incl. real uvicorn subprocesses), and
+  the chat-app end-to-end.  No mocks on the data path — real mmap, real
+  Unix sockets, real ASGI.
 
 [0.1.0]: https://github.com/sintimaski/mmbus/releases/tag/mmcast-v0.1.0

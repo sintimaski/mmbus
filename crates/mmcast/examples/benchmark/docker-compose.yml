@@ -1,6 +1,6 @@
 # Side-by-side benchmark: encode/broadcaster + Redis vs mmcast.
 #
-# Container count is itself the headline: the Redis stack needs three
+# Container count is itself the headline: the Redis stack needs two
 # services (redis + app); the mmcast stack needs one (app).  Run it::
 #
 #     cd crates/mmcast/examples/benchmark
@@ -8,6 +8,10 @@
 #
 # Build context is the repo root so Dockerfiles can copy in the local
 # mmbus + mmcast source (no PyPI dependency for the demo).
+#
+# Healthchecks (python urllib — the slim images have no curl) let
+# `docker compose up --wait` block until each app is actually serving,
+# so the loadgen never races a not-yet-ready app.
 
 services:
   redis:
@@ -15,6 +19,11 @@ services:
     container_name: bench-redis
     networks: [bench]
     profiles: [redis]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
 
   redis_app:
     build:
@@ -23,10 +32,17 @@ services:
     container_name: bench-redis-app
     environment:
       REDIS_URL: redis://redis:6379
-    depends_on: [redis]
+    depends_on:
+      redis:
+        condition: service_healthy
     networks: [bench]
     ports: ["8001:8000"]
     profiles: [redis]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=2).status==200 else 1)"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
 
   mmcast_app:
     build:
@@ -36,6 +52,11 @@ services:
     networks: [bench]
     ports: ["8002:8000"]
     profiles: [mmcast]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=2).status==200 else 1)"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
 
 networks:
   bench: {}

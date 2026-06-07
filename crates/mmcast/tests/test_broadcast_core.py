@@ -5,31 +5,18 @@ async subscriber.  These are integration tests by mmbus convention
 (``CLAUDE.md`` testing rules: real mmap + real Unix sockets, no
 mocks).
 
-Each test gets its own ``tmp_path``-rooted bus dir so they don't
-collide on the global ``/tmp/mmbus/<name>/`` layout.
+Each test gets its own isolated bus dir (the ``short_bus_dir`` fixture
+in ``conftest.py``) so they don't collide on the global
+``/tmp/mmbus/<name>/`` layout.
 """
 from __future__ import annotations
 
 import asyncio
-import os
-import shutil
 import uuid
 
 import pytest
 
 from mmbus_cast import Broadcast, BroadcastClosedError, Event
-
-
-# macOS `SUN_LEN` is ~104 chars and pytest's `tmp_path` lives under
-# `/private/var/folders/...` — easily 80+ chars before we append a bus
-# dir + topic-specific file.  Stash our test buses under a short root
-# and clean them up per test.
-@pytest.fixture
-def short_bus_dir(tmp_path_factory):
-    root = f"/tmp/mmcast-test-{uuid.uuid4().hex[:8]}"
-    os.makedirs(root, exist_ok=True)
-    yield root
-    shutil.rmtree(root, ignore_errors=True)
 
 
 def _fresh_bus(short_root: str) -> dict:

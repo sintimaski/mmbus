@@ -9,48 +9,82 @@ Run it::
 Then open http://localhost:8000 in two browser tabs.  Messages typed in
 either tab show up in both.
 
-Multi-worker (>1) requires per-worker sharding — set ``MMCAST_PEERS``
-to a comma-separated list of worker IDs the deployment runs.  The
-shipped example assumes single-worker for simplicity; see the README
-for the multi-worker pattern.
+Multi-worker (>1) requires per-worker sharding — set ``MMCAST_WORKER_ID``
++ ``MMCAST_PEERS`` per worker (see the README).
+
+Security note: a WebSocket endpoint is a public attack surface even
+though the IPC behind it is private to the host.  This example shows two
+of the controls a real deployment needs — an Origin allowlist and
+per-message error handling — but it has **no authentication**.  Add auth
+appropriate to your app before ``socket.accept()``.  Set
+``MMCAST_ALLOWED_ORIGINS`` (comma-separated) to enforce the Origin
+allowlist; when unset the check is skipped (demo convenience) and a
+warning is logged.
 """
 from __future__ import annotations
 
 import asyncio
-import json
+import logging
 import os
 from contextlib import asynccontextmanager
+from typing import Optional, Set
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
+import mmbus
 from mmbus_cast.fastapi import broadcast_lifespan, worker_shard_from_env
 
+logger = logging.getLogger("mmcast-chat")
 
 CHANNEL = "chat"
+
+
+def _allowed_origins() -> Optional[Set[str]]:
+    raw = os.environ.get("MMCAST_ALLOWED_ORIGINS")
+    if not raw:
+        return None
+    return {o.strip() for o in raw.split(",") if o.strip()}
+
+
+def _origin_ok(socket: WebSocket, allowed: Optional[Set[str]]) -> bool:
+    """Browser same-origin policy does NOT apply to WebSockets, so a page
+    on any site can open a socket to us.  Enforce an Origin allowlist when
+    one is configured.  A missing Origin header (non-browser clients) is
+    allowed; an allowlist that's unset disables the check (demo only)."""
+    if allowed is None:
+        return True
+    origin = socket.headers.get("origin")
+    if origin is None:
+        return True  # non-browser client (curl, native app, tests)
+    return origin in allowed
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     worker_id, peers = worker_shard_from_env()
-    # Single-process default: one worker, peers=[self].  Multi-worker
-    # users set MMCAST_PEERS in the deployment env.
+    # Single-process default: one worker.  Multi-worker users set
+    # MMCAST_WORKER_ID + MMCAST_PEERS in the deployment env.
     multi_worker = len(peers) > 1
+    if _allowed_origins() is None:
+        logger.warning(
+            "MMCAST_ALLOWED_ORIGINS is unset — WebSocket Origin checking is "
+            "DISABLED. Set it before exposing this beyond localhost."
+        )
     async with broadcast_lifespan(
         "mmcast-chat-demo",
         worker_id=worker_id if multi_worker else None,
         peers=peers if multi_worker else None,
         prepare=[CHANNEL],
-        # The chat ring needs to be large enough to absorb burst traffic
-        # without backpressuring slow WS clients.  256 slots × 4 KiB = 1 MiB.
+        # Ring large enough to absorb burst traffic.  256 × 4 KiB = 1 MiB.
         capacity=256,
         slot_size=4096,
-        # WAL gives durable replay across publisher restarts.  Off here
-        # for the demo (we don't need durability for a chat reload toy),
-        # but flip to True for production.
+        # WAL gives durable replay across publisher restarts; off for this
+        # toy.  Flip to True for production durability.
         wal_enabled=False,
     ) as bc:
         app.state.broadcast = bc
+        app.state.allowed_origins = _allowed_origins()
         yield
 
 
@@ -76,7 +110,10 @@ INDEX_HTML = """\
   <button>send</button>
 </form>
 <script>
-  const ws = new WebSocket(`ws://${location.host}/ws`);
+  // Pick ws:// or wss:// to match the page scheme (avoids mixed-content
+  // blocking when served over HTTPS).
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(`${proto}//${location.host}/ws`);
   const log = document.getElementById("log");
   ws.onmessage = (e) => {
     const li = document.createElement("li");
@@ -99,6 +136,10 @@ async def index() -> str:
 
 @app.websocket("/ws")
 async def ws(socket: WebSocket) -> None:
+    if not _origin_ok(socket, socket.app.state.allowed_origins):
+        # 1008 = policy violation.
+        await socket.close(code=1008)
+        return
     await socket.accept()
     bc = socket.app.state.broadcast
 
@@ -106,7 +147,9 @@ async def ws(socket: WebSocket) -> None:
         """Forward broadcast messages → this client."""
         try:
             async for event in sub:
-                await socket.send_text(event.data.decode())
+                # Peers may publish non-UTF-8 bytes (or via the bridge);
+                # replace undecodable bytes rather than killing the task.
+                await socket.send_text(event.data.decode("utf-8", "replace"))
         except (WebSocketDisconnect, RuntimeError):
             pass
 
@@ -115,16 +158,30 @@ async def ws(socket: WebSocket) -> None:
         try:
             while True:
                 msg = await socket.receive_text()
-                await bc.publish(CHANNEL, msg.encode())
+                try:
+                    await bc.publish(CHANNEL, msg.encode())
+                except (mmbus.MessageTooLargeError, mmbus.BusFullError) as e:
+                    # One oversized/rejected message must not tear down the
+                    # client's connection.
+                    logger.warning("mmcast-chat: dropping message: %s", e)
         except WebSocketDisconnect:
             pass
 
-    # Replay the last 20 messages on join so the new tab has context.
-    async with await bc.subscribe(CHANNEL, replay_last=20) as sub:
+    # Replay the last 20 messages on join so a new tab has context.
+    async with bc.subscribe(CHANNEL, replay_last=20) as sub:
         out_task = asyncio.create_task(push_outbound(sub))
         in_task = asyncio.create_task(pull_inbound())
-        done, pending = await asyncio.wait(
-            {out_task, in_task}, return_when=asyncio.FIRST_COMPLETED
-        )
-        for t in pending:
-            t.cancel()
+        try:
+            await asyncio.wait(
+                {out_task, in_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            # Cancel and AWAIT the survivor so no "Task was destroyed but
+            # it is pending!" warning escapes on shutdown.
+            for t in (out_task, in_task):
+                t.cancel()
+            for t in (out_task, in_task):
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass

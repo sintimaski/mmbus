@@ -10,6 +10,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
     && . $HOME/.cargo/env
 
+# The maturin build (manifest-path = crates/mmbus/Cargo.toml) needs the
+# workspace-root Cargo.toml — the crate manifest uses `version.workspace`
+# / `edition.workspace` / `license.workspace`, which only resolve against
+# the workspace root.  Cargo.lock gives a reproducible build.
+COPY ./Cargo.toml /src/mmbus/Cargo.toml
+COPY ./Cargo.lock /src/mmbus/Cargo.lock
 COPY ./pyproject.toml /src/mmbus/pyproject.toml
 COPY ./crates/mmbus /src/mmbus/crates/mmbus
 COPY ./python /src/mmbus/python

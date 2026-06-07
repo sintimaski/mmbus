@@ -25,10 +25,13 @@ end-to-end uvicorn-driven coverage is exercised by the chat example
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 from typing import AsyncIterator, List, Optional, Tuple
 
 from . import Broadcast
+
+logger = logging.getLogger("mmbus_cast")
 
 
 def worker_shard_from_env(
@@ -62,7 +65,23 @@ def worker_shard_from_env(
     elif workers is not None and workers > 0:
         peers = [f"w{i}" for i in range(workers)]
     else:
+        # No peer list and no worker count → single-element list (this
+        # process only).  In a genuinely multi-worker deployment that's a
+        # silently-broken config (each worker only sees its own messages),
+        # so warn loudly — the caller almost certainly meant to set
+        # MMCAST_PEERS or pass `workers=N`.
         peers = [worker_id]
+        web_concurrency = os.environ.get("WEB_CONCURRENCY")
+        if web_concurrency and web_concurrency.strip() not in ("", "1"):
+            logger.warning(
+                "mmcast: WEB_CONCURRENCY=%s suggests a multi-worker "
+                "deployment, but neither %s nor a workers count is set — "
+                "fan-in will be broken (each worker sees only its own "
+                "messages). Set %s to the full worker-id list.",
+                web_concurrency,
+                env_peers,
+                env_peers,
+            )
 
     return worker_id, peers
 

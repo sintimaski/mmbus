@@ -30,6 +30,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+@app.get("/health")
+async def health() -> dict:
+    return {"ok": True}
+
+
 @app.websocket("/ws")
 async def ws(socket: WebSocket) -> None:
     await socket.accept()
@@ -39,10 +44,14 @@ async def ws(socket: WebSocket) -> None:
         try:
             async with bc.subscribe(channel=CHANNEL) as sub:
                 async for event in sub:
-                    # broadcaster delivers Event.message as str — encode
-                    # to keep the payload comparable to mmcast's bytes path.
-                    await socket.send_bytes(event.message.encode()
-                        if isinstance(event.message, str) else event.message)
+                    # broadcaster round-trips str.  We carry raw bytes over
+                    # the WS as latin-1 (a total, byte-preserving codec) so
+                    # the payload is byte-identical to what the loadgen sent
+                    # — matching mmcast's bytes path.  Using the default
+                    # UTF-8 here would corrupt header bytes >= 0x80.
+                    msg = event.message
+                    raw = msg.encode("latin-1") if isinstance(msg, str) else msg
+                    await socket.send_bytes(raw)
         except (WebSocketDisconnect, RuntimeError):
             pass
 
@@ -50,6 +59,8 @@ async def ws(socket: WebSocket) -> None:
         try:
             while True:
                 data = await socket.receive_bytes()
+                # latin-1 is a total 1:1 byte<->codepoint map, so this
+                # round-trips arbitrary bytes losslessly (see push_out).
                 await bc.publish(channel=CHANNEL, message=data.decode("latin-1"))
         except WebSocketDisconnect:
             pass

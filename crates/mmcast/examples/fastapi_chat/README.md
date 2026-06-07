@@ -32,6 +32,28 @@ worker hook.  Native auto-detection of the uvicorn worker index is
 tracked for v0.2 — for now the env-var route is portable and works
 under any process supervisor.
 
+## Security (read before exposing beyond localhost)
+
+This example has **no authentication** — add your app's auth before
+`socket.accept()`.  Two controls are shown:
+
+- **Origin allowlist.**  Browsers don't apply same-origin policy to
+  WebSockets, so any page can open a socket to your server.  Set
+  `MMCAST_ALLOWED_ORIGINS` to a comma-separated list to enforce it:
+
+  ```bash
+  MMCAST_ALLOWED_ORIGINS="https://app.example.com" uvicorn app:app --port 8000
+  ```
+
+  When unset, the check is skipped (demo convenience) and a startup
+  warning is logged.
+
+- **Per-message error handling.**  An oversized or undecodable message
+  from one client is dropped, not allowed to tear down the connection.
+
+Serve over TLS in production; the page auto-selects `wss://` when loaded
+over HTTPS.
+
 ## Compare with broadcaster + Redis
 
 [`encode/broadcaster`](https://github.com/encode/broadcaster)'s docs

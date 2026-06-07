@@ -16,14 +16,16 @@ name = "mmbus-cast"
 version = "0.1.0"
 description = "ASGI WebSocket broadcast over mmbus — no Redis, no daemon"
 readme = "README.md"
-requires-python = ">=3.8"
+# Floor is 3.9: mmbus ships no 3.8 wheel (3.8 is EOL), so a 3.8 install
+# would fail to resolve the dependency.  Keep this in lockstep with the
+# mmbus wheel matrix.
+requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "mmbus contributors" }]
 keywords = ["pubsub", "websocket", "broadcast", "fastapi", "asgi", "mmbus", "ipc"]
 classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",

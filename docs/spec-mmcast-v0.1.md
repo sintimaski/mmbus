@@ -252,11 +252,27 @@ Migration story for broadcaster users: ~5-line diff (constructor +
   channel — collisions raise `AlreadyPublishingError`).
 - No network sockets opened by mmcast itself (cross-host is delegated
   to `mmbus[bridge]`).
+- **Reserved namespace.**  Channel names starting with `_` are reserved
+  for mmcast subsystems (presence uses `_presence.<channel>`).  Public
+  `publish`/`subscribe`/`prepare`/`presence` reject `_`-prefixed names,
+  path-traversal sequences, and non-allowlist characters with
+  `InvalidChannelError` — so an app that derives a channel from
+  untrusted input (e.g. a URL path parameter) cannot publish forged
+  records onto a subsystem topic or steer the on-disk ring path outside
+  the bus directory.  `worker_id`/`peers` are validated on the same
+  allowlist (they become topic suffixes → path components).
+- **WebSocket endpoints remain a public attack surface.**  mmcast adds
+  no auth; the application must authenticate and (for browsers) enforce
+  an `Origin` allowlist before `socket.accept()`.  The chat example
+  demonstrates both.
 
 ## Observability
 
 - Uses `logging.getLogger("mmbus_cast")`; ships at `WARNING` by default.
-- Per-`Subscription`: `slow_count`, `replayed_count`, `delivered_count`
+- Per-`Subscription`: `slow_count`, `delivered_count`.  (A per-subscriber
+  `replayed_count` is deferred to v0.2 with the per-subscriber replay
+  buffer — v0.1 replay is per-channel at open time, so a replayed-vs-live
+  count can't be attributed per subscriber.)
   attributes.
 - Per-`Broadcast`: `stats()` returns a snapshot dict per channel
   derived from `mmbus.Bus.stats(topic)` + the lib's queue depths.
@@ -266,7 +282,7 @@ Migration story for broadcaster users: ~5-line diff (constructor +
 
 ## Acceptance criteria (v0.1 ship-gate)
 
-1. `pip install mmbus-cast` (after PyPI publish) installs cleanly on Linux + macOS, Python 3.8–3.13.
+1. `pip install mmbus-cast` (after PyPI publish) installs cleanly on Linux + macOS, Python 3.9–3.13.
 2. `Broadcast` + `subscribe` + `publish` round-trip across two asyncio tasks.
 3. `replay_last=N` delivers the last N in-ring messages before the live tail.
 4. Slow consumer with `drop_oldest` does not grow memory unboundedly; `slow_count` increments; `SlowConsumer` is logged.

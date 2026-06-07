@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 import statistics
 import struct
 import time
@@ -140,7 +139,10 @@ async def main() -> None:
         "wall_clock_s": round(t1 - t0, 3),
         "delivered_total": received_count[0],
         # Throughput: messages delivered per second across all clients.
-        "delivered_per_sec": round(received_count[0] / (t1 - t0), 1),
+        # Guard against a zero-duration run (no work / instant completion).
+        "delivered_per_sec": (
+            round(received_count[0] / (t1 - t0), 1) if (t1 - t0) > 0 else 0.0
+        ),
         "latency_ms": {
             "count": len(latencies),
             "p50": round(statistics.median(latencies), 3) if latencies else None,

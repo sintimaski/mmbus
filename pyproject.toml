@@ -6,7 +6,10 @@ build-backend = "maturin"
 name = "mmbus"
 version = "0.5.1"
 description = "Zero-copy pub/sub over mmap — Python bindings"
-requires-python = ">=3.8"
+# Wheels are built for 3.9–3.13 (see .github/workflows/wheels.yml).  3.8
+# is EOL and not in the matrix, so declare the real floor rather than
+# advertising a version we don't ship a wheel for.
+requires-python = ">=3.9"
 license = { file = "LICENSE" }
 classifiers = [
     "License :: OSI Approved :: MIT License",

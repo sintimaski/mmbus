@@ -22,7 +22,7 @@ app = FastAPI(lifespan=lifespan)
 async def ws(socket: WebSocket) -> None:
     await socket.accept()
     bc = socket.app.state.broadcast
-    async with await bc.subscribe("chat", replay_last=20) as sub:
+    async with bc.subscribe("chat", replay_last=20) as sub:
         async for event in sub:
             await socket.send_bytes(event.data)
 ```
@@ -58,7 +58,7 @@ pip install mmbus-cast            # base lib (pulls mmbus as a dep)
 pip install mmbus-cast[fastapi]   # + FastAPI example deps
 ```
 
-Wheels: Linux + macOS, Python 3.8 – 3.13.  Windows is gated on mmbus
+Wheels: Linux + macOS, Python 3.9 – 3.13.  Windows is gated on mmbus
 landing its own Windows support.
 
 ## Five-minute tour
@@ -72,7 +72,7 @@ bc = Broadcast("my-app")
 async with bc:
     await bc.publish("notify", b"hello")
 
-    async with await bc.subscribe("notify") as sub:
+    async with bc.subscribe("notify") as sub:
         async for event in sub:
             print(event.data)        # b"hello"
             # event.cursor for advanced "resume from here" patterns
@@ -81,7 +81,7 @@ async with bc:
 ### Replay last N on reconnect
 
 ```python
-async with await bc.subscribe("notify", replay_last=20) as sub:
+async with bc.subscribe("notify", replay_last=20) as sub:
     async for event in sub:
         ...  # the most recent 20 in-ring messages arrive first, then live
 ```
@@ -148,6 +148,22 @@ async with broadcast_lifespan(
 The shard ID can also be set via `MMCAST_WORKER_ID` and `MMCAST_PEERS`
 env vars — handy for systemd / supervisor configs.  See the chat
 example's `README.md`.
+
+## Security
+
+mmbus-cast inherits mmbus's trust model: **same-host, same-user IPC**.
+It opens no network sockets of its own.  Two things follow:
+
+- **A WebSocket endpoint is still a public attack surface.**  mmbus-cast
+  does no authentication — that's your app's job, before `socket.accept()`.
+  Browsers do *not* apply same-origin policy to WebSockets, so add an
+  `Origin` allowlist too (the chat example shows both via
+  `MMCAST_ALLOWED_ORIGINS`).
+- **Channel names are validated.**  Names starting with `_` are reserved
+  for internal subsystems (presence), and path-traversal / non-allowlist
+  names are rejected with `InvalidChannelError` — so an app that derives
+  a channel from untrusted input can't be tricked into a subsystem topic
+  or an out-of-tree mmap path.
 
 ## Cross-host
 

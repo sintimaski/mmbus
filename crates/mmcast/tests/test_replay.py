@@ -8,21 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import shutil
 import uuid
 
 import pytest
 
 from mmbus_cast import Broadcast
-
-
-@pytest.fixture
-def short_bus_dir():
-    root = f"/tmp/mmcast-test-{uuid.uuid4().hex[:8]}"
-    os.makedirs(root, exist_ok=True)
-    yield root
-    shutil.rmtree(root, ignore_errors=True)
 
 
 def _fresh_bus(short_root: str) -> dict:

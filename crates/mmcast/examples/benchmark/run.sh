@@ -13,14 +13,13 @@ PAYLOAD=${PAYLOAD:-128}
 echo "==> Building images"
 docker compose --profile redis --profile mmcast build
 
+# `--wait` blocks until every started service reports healthy (see the
+# healthchecks in docker-compose.yml), so the loadgen below never races a
+# not-yet-ready app.
 echo "==> Starting Redis stack"
-docker compose --profile redis up -d redis redis_app
+docker compose --profile redis up -d --wait redis redis_app
 echo "==> Starting mmcast stack"
-docker compose --profile mmcast up -d mmcast_app
-
-# Crude readiness check — both apps print "Uvicorn running on" to stdout
-# on startup.  Sleep a beat to let lifespan finish.
-sleep 3
+docker compose --profile mmcast up -d --wait mmcast_app
 
 echo "==> Loadgen: Redis side  (8001)"
 python3 loadgen/loadgen.py \

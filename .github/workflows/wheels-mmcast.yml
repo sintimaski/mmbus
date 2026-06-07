@@ -7,6 +7,11 @@ name: Build mmcast wheel
 # Tag prefix: `mmcast-v*` (the family-prefix scheme — see
 # docs/spec-mmcast-v0.1.md "Version pinning").  `wheels.yml` consumes
 # bare `v*` for mmbus and `mmbus-bridge` ships its own.
+#
+# Actions are pinned to major-version tags (e.g. @v4), matching the
+# convention in this repo's other workflows.  For stricter supply-chain
+# hardening, pin to full commit SHAs — deferred so all workflows can be
+# converted together rather than leaving mmcast inconsistent.
 
 on:
   push:

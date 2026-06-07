@@ -4,12 +4,13 @@ Pared down from the chat example: just `/ws` echo-broadcast.  No HTML.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-import asyncio
 
+import mmbus
 from mmbus_cast.fastapi import broadcast_lifespan, worker_shard_from_env
 
 
@@ -42,6 +43,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+@app.get("/health")
+async def health() -> dict:
+    return {"ok": True}
+
+
 @app.websocket("/ws")
 async def ws(socket: WebSocket) -> None:
     await socket.accept()
@@ -58,15 +64,23 @@ async def ws(socket: WebSocket) -> None:
         try:
             while True:
                 data = await socket.receive_bytes()
-                await bc.publish(CHANNEL, data)
+                try:
+                    await bc.publish(CHANNEL, data)
+                except (mmbus.MessageTooLargeError, mmbus.BusFullError):
+                    pass  # bench: drop, keep the connection alive
         except WebSocketDisconnect:
             pass
 
-    async with await bc.subscribe(CHANNEL, queue_depth=4096) as sub:
+    async with bc.subscribe(CHANNEL, queue_depth=4096) as sub:
         out = asyncio.create_task(push_out(sub))
         inn = asyncio.create_task(pull_in())
-        done, pending = await asyncio.wait(
-            {out, inn}, return_when=asyncio.FIRST_COMPLETED
-        )
-        for t in pending:
-            t.cancel()
+        try:
+            await asyncio.wait({out, inn}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in (out, inn):
+                t.cancel()
+            for t in (out, inn):
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
