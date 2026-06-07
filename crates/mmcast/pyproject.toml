@@ -47,10 +47,10 @@ dependencies = ["mmbus>=0.5.1,<0.6"]
 [project.optional-dependencies]
 # `pip install mmbus-cast[fastapi]` for the WS demo + ASGI helpers.
 fastapi = ["fastapi>=0.100", "uvicorn[standard]>=0.23"]
-# Test-only — kept out of the wheel.  Includes the FastAPI + Django
-# (Channels) stacks so the framework-integration tests actually run in
-# CI; both are additionally guarded by `pytest.importorskip` so a bare
-# `pytest` without them degrades to skips rather than errors.
+# Core test deps + the FastAPI stack (light, and FastAPI is the primary
+# target framework, so it runs on the full Python matrix).  The Django
+# integration test is guarded by `pytest.importorskip` and simply skips
+# here — it runs under the `test-integration` extra in a dedicated job.
 test = [
     "pytest>=7",
     "pytest-asyncio>=0.21",
@@ -58,6 +58,13 @@ test = [
     "fastapi>=0.100",
     "httpx>=0.23",
     "websockets>=11",
+    "uvicorn[standard]>=0.23",
+]
+# Heavy framework stacks (Django + Channels + daphne/twisted).  Split out
+# so the full-matrix `test` install stays light and isn't exposed to a
+# transitive build hiccup on the newest Python on every cell — these run
+# in one dedicated CI job on a reduced Python matrix.
+test-integration = [
     "django>=4.2",
     "channels>=4",
     "daphne>=4",  # channels.testing imports it (WebsocketCommunicator)

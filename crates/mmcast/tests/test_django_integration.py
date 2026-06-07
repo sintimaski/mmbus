@@ -44,18 +44,28 @@ from mmbus_cast import Broadcast  # noqa: E402
 
 CHANNEL = "chat"
 
-# The consumer pulls the live Broadcast from this module global, set by
-# each test for the duration of its run.  (Channels' WebsocketCommunicator
-# builds the ASGI scope itself, so a module global is the simplest way to
-# hand the consumer a dependency — mirrors how a real app would read it
-# from django.apps / settings.)
-_ACTIVE = {"broadcast": None}
+
+def _with_broadcast(app, broadcast):
+    """Tiny ASGI middleware that injects the live Broadcast into the
+    connection scope under ``scope["broadcast"]``.
+
+    This is the idiomatic Channels way to hand a consumer a per-app
+    dependency — real apps put ``user`` / ``session`` on the scope the
+    same way (via middleware), and a production deployment would inject
+    the Broadcast from ``apps.py``'s ``ready()`` or an ASGI lifespan.
+    """
+
+    async def wrapped(scope, receive, send):
+        scope = dict(scope)
+        scope["broadcast"] = broadcast
+        await app(scope, receive, send)
+
+    return wrapped
 
 
 class ChatConsumer(AsyncWebsocketConsumer):
     async def connect(self) -> None:
-        self._bc = _ACTIVE["broadcast"]
-        assert self._bc is not None, "test must set _ACTIVE['broadcast']"
+        self._bc: Broadcast = self.scope["broadcast"]
         await self.accept()
         self._sub_ctx = self._bc.subscribe(CHANNEL)
         self._sub = await self._sub_ctx.__aenter__()
@@ -92,29 +102,25 @@ async def test_django_channels_broadcast(short_bus_dir):
     )
     async with bc:
         await bc.prepare(CHANNEL)
-        _ACTIVE["broadcast"] = bc
-        try:
-            app = ChatConsumer.as_asgi()
-            c1 = WebsocketCommunicator(app, "/ws/")
-            c2 = WebsocketCommunicator(app, "/ws/")
-            ok1, _ = await c1.connect()
-            ok2, _ = await c2.connect()
-            assert ok1 and ok2
+        app = _with_broadcast(ChatConsumer.as_asgi(), bc)
+        c1 = WebsocketCommunicator(app, "/ws/")
+        c2 = WebsocketCommunicator(app, "/ws/")
+        ok1, _ = await c1.connect()
+        ok2, _ = await c2.connect()
+        assert ok1 and ok2
 
-            await c1.send_to(text_data="hello-django")
-            # Both clients (sender included) receive the broadcast.
-            assert await c1.receive_from(timeout=5) == "hello-django"
-            assert await c2.receive_from(timeout=5) == "hello-django"
+        await c1.send_to(text_data="hello-django")
+        # Both clients (sender included) receive the broadcast.
+        assert await c1.receive_from(timeout=5) == "hello-django"
+        assert await c2.receive_from(timeout=5) == "hello-django"
 
-            # And the other direction.
-            await c2.send_to(text_data="reply")
-            assert await c1.receive_from(timeout=5) == "reply"
-            assert await c2.receive_from(timeout=5) == "reply"
+        # And the other direction.
+        await c2.send_to(text_data="reply")
+        assert await c1.receive_from(timeout=5) == "reply"
+        assert await c2.receive_from(timeout=5) == "reply"
 
-            await c1.disconnect()
-            await c2.disconnect()
-        finally:
-            _ACTIVE["broadcast"] = None
+        await c1.disconnect()
+        await c2.disconnect()
 
 
 @pytest.mark.asyncio
@@ -128,13 +134,10 @@ async def test_django_channels_single_client_roundtrip(short_bus_dir):
     )
     async with bc:
         await bc.prepare(CHANNEL)
-        _ACTIVE["broadcast"] = bc
-        try:
-            comm = WebsocketCommunicator(ChatConsumer.as_asgi(), "/ws/")
-            ok, _ = await comm.connect()
-            assert ok
-            await comm.send_to(text_data="solo")
-            assert await comm.receive_from(timeout=5) == "solo"
-            await comm.disconnect()
-        finally:
-            _ACTIVE["broadcast"] = None
+        app = _with_broadcast(ChatConsumer.as_asgi(), bc)
+        comm = WebsocketCommunicator(app, "/ws/")
+        ok, _ = await comm.connect()
+        assert ok
+        await comm.send_to(text_data="solo")
+        assert await comm.receive_from(timeout=5) == "solo"
+        await comm.disconnect()
