@@ -63,10 +63,19 @@ fn bridge_forwards_local_publishes_to_one_peer_over_tcp() {
     let cfg = BridgeConfig::from_str(&toml_text).expect("parse config");
 
     // 3) Start a thread that publishes to mmbus on the same bus/topic.
-    //    Each thread/process needs its own Bus handle — PyO3 enforces
-    //    exclusive access to a given object at a time, and the bridge
-    //    holds its own Arc<Bus> in subscriber threads.
+    //    Each thread/process needs its own Bus handle; the bridge holds
+    //    its own Bus in its subscriber thread.
+    //
+    //    The thread must keep its Bus ALIVE until the reader has the
+    //    frames: when the publisher's Bus drops, the bridge's mmbus
+    //    subscriber sees the publisher hang up and stops reading.  If
+    //    that happens before it has drained our 5 messages (likely on a
+    //    loaded runner under the heavier `--features quic` build), only
+    //    the PeerHello reaches TCP and the reader times out with a
+    //    partial buffer.  `done_rx` parks the thread (keeping the Bus
+    //    open) until the main thread signals it has read everything.
     let publish_dir = tmp.path().to_path_buf();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     let publish_thread = thread::spawn(move || {
         let mut bus = Bus::with_config(
             "bridge-smoke",
@@ -76,16 +85,15 @@ fn bridge_forwards_local_publishes_to_one_peer_over_tcp() {
             },
         );
         // 30s safety-net (not a perf assertion): the bridge's subscriber
-        // thread can be slow to connect on a loaded CI runner (esp. the
-        // heavier `--features quic` build).  A 5s deadline here flaked —
-        // it timed out, the publisher bailed before sending any Msg
-        // frames, and the reader saw only the PeerHello.  Same reasoning
-        // as the read-deadline below.
+        // thread can be slow to connect on a loaded CI runner.
         bus.wait_for_subscribers("events", 1, Duration::from_secs(30))
             .expect("bridge subscriber must connect");
         for i in 0..5u64 {
             bus.publish("events", &i.to_le_bytes()).expect("publish ok");
         }
+        // Hold the Bus open until the reader is done (or a generous
+        // fallback elapses, so a failing test can't hang forever).
+        let _ = done_rx.recv_timeout(Duration::from_secs(60));
     });
 
     // 4) Start the bridge.  Its subscriber thread will connect to the
@@ -129,7 +137,9 @@ fn bridge_forwards_local_publishes_to_one_peer_over_tcp() {
         }
     };
 
-    // 7) Assertions.
+    // 7) We have all 6 frames — the messages are safely on the wire, so
+    //    the publisher can drop its Bus now.
+    let _ = done_tx.send(());
     publish_thread.join().expect("publisher thread");
 
     let hello = &frames[0];
