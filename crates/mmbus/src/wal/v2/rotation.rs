@@ -122,6 +122,29 @@ mod tests {
         (dir, active, w)
     }
 
+    /// Smallest segment first-cursor strictly greater than `after` and no
+    /// later than the active segment, by scanning `*.seg` files in `dir`.
+    /// Lets a reader walk segments one at a time instead of jumping to
+    /// active.dat's latest (which skips intermediates when the writer
+    /// rotates several times between reads).  The `<= active_now` bound
+    /// avoids opening a freshly-created segment whose header the writer
+    /// hasn't published via active.dat yet.  `None` = no next segment yet.
+    fn next_ready_segment(dir: &Path, after: u64, active_now: u64) -> Option<u64> {
+        let mut best: Option<u64> = None;
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(stem) = name.strip_suffix(".seg") {
+                if let Ok(c) = stem.parse::<u64>() {
+                    if c > after && c <= active_now && best.map_or(true, |b| c < b) {
+                        best = Some(c);
+                    }
+                }
+            }
+        }
+        best
+    }
+
     #[test]
     fn segment_path_zero_pads_to_20_digits() {
         let dir = std::path::Path::new("/tmp/wal");
@@ -371,12 +394,10 @@ mod tests {
                 }
             };
             let mut got: Vec<u64> = Vec::new();
-            // CI runners + parallel-test contention can starve this
-            // reader thread.  Bumped from 60s → 180s after observing
-            // exactly-60.15s timeout when run alongside the full
-            // integration suite.  Test asserts ordering +
-            // completeness, not perf; the long deadline costs
-            // nothing on a fast machine (typically <50 ms).
+            // Safety-net deadline only (not a perf assertion): the test
+            // completes in a few ms once the reader follows segments
+            // correctly.  Kept generous so a slow CI runner is never
+            // mistaken for a hang.
             let deadline = Instant::now() + Duration::from_secs(180);
             while got.len() < 100 {
                 match reader.next_record() {
@@ -384,43 +405,35 @@ mod tests {
                         let v = u64::from_le_bytes(rec.payload.try_into().unwrap());
                         got.push(v);
                     }
-                    ReadOutcome::AwaitMore => {
+                    // Both "no more records right now" (AwaitMore) and
+                    // "this segment is sealed" (EndOfSegment) mean: try to
+                    // advance to the NEXT segment.
+                    ReadOutcome::AwaitMore | ReadOutcome::EndOfSegment => {
                         if Instant::now() >= deadline {
                             panic!("reader timeout at {} records", got.len());
                         }
-                        // If active.dat has advanced past our segment AND
-                        // we're parked at the live tail, the writer has
-                        // rotated and won't extend this segment.  This
-                        // can happen when the rotation's SKIP_TO_END
-                        // marker didn't fit (last few bytes of segment
-                        // unused), so we never see EndOfSegment via the
-                        // record_len path.  Switch segments.
-                        let latest = active_reader.load_first_cursor();
-                        if latest != current_first {
-                            current_first = latest;
-                            reader = MmapSegmentReader::open(&segment_path(
-                                &dir_for_reader,
-                                current_first,
-                            ))
-                            .unwrap();
-                        } else {
-                            std::hint::spin_loop();
-                        }
-                    }
-                    ReadOutcome::EndOfSegment => {
-                        let latest = active_reader.load_first_cursor();
-                        if latest == current_first {
-                            // No new segment yet — spin.
-                            if Instant::now() >= deadline {
-                                panic!("reader stuck at EndOfSegment after {} records", got.len());
-                            }
-                            std::hint::spin_loop();
-                            continue;
-                        }
-                        current_first = latest;
-                        reader =
-                            MmapSegmentReader::open(&segment_path(&dir_for_reader, current_first))
+                        // Advance to the next segment *by first-cursor*, not
+                        // to active.dat's latest.  The writer can rotate
+                        // past several segments between our reads; jumping
+                        // straight to the latest would skip the intermediate
+                        // segments' records (the bug behind the historical
+                        // "reader timeout at <100 records" flake).  If no
+                        // next segment exists yet, the writer is still
+                        // extending the current one — yield and retry (a
+                        // short sleep, not a busy-spin, so the writer isn't
+                        // starved on a shared-core CI runner).
+                        let active_now = active_reader.load_first_cursor();
+                        match next_ready_segment(&dir_for_reader, current_first, active_now) {
+                            Some(next) => {
+                                current_first = next;
+                                reader = MmapSegmentReader::open(&segment_path(
+                                    &dir_for_reader,
+                                    current_first,
+                                ))
                                 .unwrap();
+                            }
+                            None => thread::sleep(Duration::from_micros(100)),
+                        }
                     }
                     ReadOutcome::Err(e) => panic!("reader error at {} records: {e:?}", got.len()),
                 }
