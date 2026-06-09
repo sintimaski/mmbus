@@ -1,7 +1,7 @@
 # Architecture
 
 This is the as-built architecture of mmbus 0.1.0 (wire format v4).  It
-matches the code in `src/`; the design predecessors and rationale live
+matches the code in `crates/mmbus/src/`; the design predecessors and rationale live
 in `docs/research.md` and the RFCs.
 
 ## Layers
@@ -102,7 +102,7 @@ boundary as IPC payload.
 
 - **SPMC**: one publisher, many subscribers.  Single-publisher is
   enforced at the FS boundary by `flock(LOCK_EX|LOCK_NB)` on a
-  per-topic lockfile (`src/producer_lock.rs`).
+  per-topic lockfile (`crates/mmbus/src/producer_lock.rs`).
 - **Tail-advance rule**: the producer may only advance `tail` while
   `tail - min(active_cursors) < capacity` (default `Error` policy).
   Under `DropOldest`, the producer skips that check; subscribers detect

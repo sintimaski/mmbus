@@ -88,8 +88,8 @@ Pick one based on the use case:
 
 ## Related
 
-- Code: `src/wal/wal.rs::enforce_retention_locked` (the loop).
-- Code: `src/wal/wal.rs::append` (the per-publish pre-check).
+- Code: `crates/mmbus/src/wal/wal.rs::enforce_retention_locked` (the loop).
+- Code: `crates/mmbus/src/wal/wal.rs::append` (the per-publish pre-check).
 - Spec: `docs/rfc-wal-phase-b.md` §7 (Retention).
 - Spec: `docs/rfc-wal-v2-lockfree.md` §3 (v0.2 plan — pre-
   allocated segments make this more predictable).

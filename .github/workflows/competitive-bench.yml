@@ -64,8 +64,8 @@ jobs:
           PY: python
           BENCH_N: ${{ github.event.inputs.bench_n || '200000' }}
         run: |
-          chmod +x benches/competitive/run_all.sh
-          benches/competitive/run_all.sh
+          chmod +x crates/mmbus/benches/competitive/run_all.sh
+          crates/mmbus/benches/competitive/run_all.sh
 
       - name: Upload results
         if: always()
@@ -73,6 +73,6 @@ jobs:
         with:
           name: competitive-results
           path: |
-            benches/competitive/results.json
-            benches/competitive/RESULTS.md
+            crates/mmbus/benches/competitive/results.json
+            crates/mmbus/benches/competitive/RESULTS.md
           if-no-files-found: warn

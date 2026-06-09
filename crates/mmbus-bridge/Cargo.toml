@@ -1,0 +1,69 @@
+[package]
+name = "mmbus-bridge"
+version = "0.5.1"
+edition = "2021"
+description = "Cross-machine relay for mmbus topics over TCP/QUIC"
+license = "MIT"
+readme = "README.md"
+
+[lib]
+# rlib so `cargo test` and the binary can link us as a normal Rust crate;
+# cdylib so maturin can build the `mmbus_bridge._mmbus_bridge` Python
+# extension when `--features python` is on.  The cdylib output is
+# harmless to the binary build path — the binary still links the rlib.
+name = "mmbus_bridge"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Enable the QUIC transport behind `--features quic`.  Pulls in tokio,
+# quinn, rustls, and rcgen; the TCP-only build stays slim.  See
+# `docs/rfc-b4b-quic.md` for the design.
+quic = ["dep:quinn", "dep:tokio", "dep:rustls", "dep:rcgen", "dep:rustls-pki-types", "dep:ring"]
+# PyO3 bindings — built as the `mmbus_bridge._mmbus_bridge` Python
+# extension via maturin.  Pulls in pyo3 + serde_json (the latter
+# adapts Python dict → BridgeConfig by sharing the bridge's existing
+# Deserialize impl).  Off by default for plain Rust users.  See
+# `docs/rfc-bridge-python-sdk.md`.
+python = ["dep:pyo3", "dep:serde_json"]
+# `pyo3/extension-module` is deliberately split OUT of `python` and
+# enabled ONLY by the wheel build (maturin reads it from
+# `bridge/pyproject.toml`).  extension-module tells the linker NOT to
+# provide libpython — correct for a wheel (symbols resolve at import
+# time) but fatal for the `mmbus-bridge` binary + `cargo test`
+# harnesses, which need libpython linked.  Keeping it separate lets
+# `cargo build/test --features python` work on every platform
+# (Linux included) while the wheel still gets the right link flags.
+extension-module = ["python", "pyo3/extension-module"]
+
+[dependencies]
+mmbus = { path = "../mmbus" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "1"
+pyo3 = { version = "0.22", optional = true }
+serde_json = { version = "1", optional = true }
+
+# `quic` feature dependencies — all optional + off by default.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"], optional = true }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "io-util", "sync", "time", "net"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+rustls-pki-types = { version = "1", optional = true }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"], optional = true }
+# Reused for the SHA-256 fingerprint helper; ring is already in the
+# tree via rustls so this doesn't add download time.
+ring = { version = "0.17", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+# Standalone workspace — the repo-root workspace deliberately EXCLUDES this
+# crate so the core library's `cargo build` / `cargo test` never pulls in
+# the heavy QUIC stack.  Build/test it explicitly via
+# `cd crates/mmbus-bridge && cargo test` (or `cargo test -p` won't reach it —
+# it is not a member of the root workspace).
+[workspace]
+
+[[bin]]
+name = "mmbus-bridge"
+path = "src/main.rs"

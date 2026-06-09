@@ -4,9 +4,12 @@ build-backend = "maturin"
 
 [project]
 name = "mmbus"
-version = "0.5.0"
+version = "0.5.1"
 description = "Zero-copy pub/sub over mmap — Python bindings"
-requires-python = ">=3.8"
+# Wheels are built for 3.9–3.13 (see .github/workflows/wheels.yml).  3.8
+# is EOL and not in the matrix, so declare the real floor rather than
+# advertising a version we don't ship a wheel for.
+requires-python = ">=3.9"
 license = { file = "LICENSE" }
 classifiers = [
     "License :: OSI Approved :: MIT License",
@@ -42,3 +45,8 @@ bridge = ["mmbus-bridge"]
 features = ["python", "wal_v2"]
 module-name = "mmbus._mmbus"
 python-source = "python"
+# The Rust crate moved under crates/mmbus when the repo became a Cargo
+# workspace; pyproject.toml + the `python/` source dir stay at the repo
+# root so `pip install .` (and the wheels.yml maturin build) keep working
+# unchanged.  manifest-path points maturin at the relocated crate manifest.
+manifest-path = "crates/mmbus/Cargo.toml"

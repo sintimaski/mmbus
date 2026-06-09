@@ -1,0 +1,13 @@
+# Revisions git blame should skip — bulk mechanical changes (whitespace,
+# repo-wide reformatting, file moves) that would otherwise obscure authorship.
+#
+# Opt in locally once:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+# GitHub honours this file automatically in its blame view.
+#
+# Each non-comment line is the full 40-char SHA of a mechanical commit.
+
+# refactor(workspace): crates/ restructure + repo-wide rustfmt normalization.
+# The reflow is whitespace-only; blame on the moved source files follows the
+# renames back to the original authorship past this revision.
+a6916500ced15f77d0998800b963acd634cc35e3

@@ -1,0 +1,40 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "mmbus-bridge"
+version = "0.5.1"
+description = "In-process cross-machine bridge for mmbus topics (TCP)"
+requires-python = ">=3.8"
+# License declared via the SPDX classifier below rather than a
+# `license = { file = ... }` table: the LICENSE lives in the repo root
+# (one level up) and a parent-relative path breaks maturin's sdist
+# packaging, which refuses files outside the project tree.
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Software Development :: Libraries",
+    "Operating System :: POSIX",
+]
+# The bridge republishes onto a local mmbus Bus, so the companion core
+# wheel must be present at the same version.
+dependencies = ["mmbus==0.5.1"]
+
+[tool.maturin]
+# Build the Rust extension as the private mmbus_bridge._mmbus_bridge
+# sub-module; python/mmbus_bridge/__init__.py re-exports the public API.
+#
+# `extension-module` pulls in `python` transitively (see
+# bridge/Cargo.toml) AND sets the no-link-libpython flag the wheel
+# needs.  TCP-only: we deliberately do NOT enable the crate's `quic`
+# feature here — embedding tokio + quinn + rustls + ring + rcgen would
+# bloat the wheel for the common case.  QUIC users keep the standalone
+# `mmbus-bridge` binary.  See docs/rfc-bridge-python-sdk.md.
+features = ["extension-module"]
+module-name = "mmbus_bridge._mmbus_bridge"
+python-source = "python"
+# Don't try to build the `mmbus-bridge` binary into the wheel — the
+# wheel ships only the extension module + Python wrapper.
+bindings = "pyo3"

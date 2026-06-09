@@ -6,6 +6,36 @@ All notable changes to mmbus are recorded here.  Format follows
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-06-04
+
+> Wheel-coverage fix.  No code changes vs 0.5.0; semantics are byte-
+> identical (wire format v5, on-disk WAL v1, all 0.5.0 APIs).  Existing
+> 0.5.0 installs keep working; new installs on Python 3.9 / 3.10 / 3.11
+> / 3.13 now succeed instead of failing with "No matching distribution".
+
+### Changed
+
+- **Wheels now ship for Python 3.9 – 3.13** (previously cp312-only).
+  `wheels.yml` adds a Python-version matrix dimension so each
+  `(os × target × python)` combo produces its own wheel.  PyO3 0.22's
+  3.13 ceiling remains the upper bound; lifting it to 3.14 waits on
+  the PyO3 0.28 migration tracked for v0.2.x.  See the in-file
+  comments for why we don't ship abi3 wheels here (the buffer-protocol
+  zero-copy `recv_into` path requires `Py_3_11` under abi3, which
+  would drop 3.9 / 3.10 anyway).
+- **Pre-tag wheel-matrix gate.**  `ci.yml`'s `mmcast` job now matrixes
+  over all five supported Python versions (3.9 – 3.13) on Linux +
+  macOS — every PR builds mmbus from source against each cell,
+  installs the wheel, runs a publish/subscribe round-trip, and runs
+  the full mmcast suite (40+ tests) against it.  This eliminates
+  "matrix broken at tag time" as a failure mode: a future Python
+  version that breaks the PyO3 build fails the PR check, not the
+  release.  Cross-compile cells (Linux aarch64, macOS x86_64) are
+  still gated only by `wheels.yml` itself; they share the same
+  toolchain as the native cells, and have not regressed in any
+  previous release using this matrix shape.
+- `mmbus-bridge` 0.5.0 → 0.5.1 (matches mmbus exactness pin).
+
 ## [0.5.0] - 2026-05-20
 
 > Pre-1.0, in active development: **wire format v4 → v5 is a hard break**

@@ -1,0 +1,12 @@
+# Stable rustfmt configuration for mmbus.
+#
+# Deliberately minimal: the Rust-standard 100-column width and the
+# crate edition.  Both crates (the core lib and `bridge/`, a separate
+# Cargo workspace) inherit this file via rustfmt's filesystem-based
+# config discovery, so formatting is uniform repo-wide.
+#
+# Enforced in CI by `cargo fmt --check` (see .github/workflows/ci.yml).
+# The one-shot normalization commit that introduced this file is listed
+# in .git-blame-ignore-revs so `git blame` skips the whitespace churn.
+edition = "2021"
+max_width = 100

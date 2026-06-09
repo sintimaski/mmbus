@@ -1,0 +1,113 @@
+[package]
+name = "mmbus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Zero-copy pub/sub over mmap for local IPC"
+# README lives at the repo root (shared with the maturin wheel); the
+# workspace member points up at it for crates.io / docs.rs metadata.
+readme = "../../README.md"
+
+[lib]
+name = "mmbus"
+# cdylib = Python extension (.so); rlib = Rust dependency
+crate-type = ["cdylib", "rlib"]
+
+# NB: `[profile.release]` (thin LTO) lives in the workspace-root Cargo.toml
+# — Cargo only honours profile tables at the workspace root and ignores
+# them in member manifests.  See that file for the rationale.
+
+[features]
+# The Python extension also wants a built-in way to see the `tracing`
+# events (a Python process can't wire a Rust subscriber itself), so it
+# pulls in the `logging` feature for `mmbus.init_logging()`.
+python = ["pyo3", "logging"]
+# Lock-free mmap-backed WAL (v0.2.0 experimental — see docs/rfc-wal-v2-lockfree.md).
+# Off by default; users opt in for one release of burn-in before promotion in v0.2.1.
+wal_v2 = ["arc-swap"]
+# Prometheus text-format exporter + minimal blocking HTTP server.
+# Zero external deps — uses std::net.  See docs in src/prometheus.rs.
+prometheus = []
+# Opt-in stderr log subscriber (`init_logging`).  Pulls in
+# `tracing-subscriber`; off by default so the core crate stays lean —
+# pure-Rust users who want logs either enable this or wire their own
+# subscriber.  Always on in the Python wheel (see `python` above).
+logging = ["dep:tracing-subscriber"]
+
+[dependencies]
+memmap2 = "0.9"
+thiserror = "1"
+# Structured logging via the de-facto-standard `tracing` crate.
+# Zero overhead when no subscriber is registered (the `event!`
+# macros short-circuit on an atomic check).  Downstream users
+# wire a subscriber (`tracing_subscriber::fmt::init()`) to see
+# the events — see README.md "Observability".
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+# Stderr log subscriber for the optional `logging` feature.  `env-filter`
+# gives the `RUST_LOG=mmbus=debug` per-target experience; `ansi` is left
+# off so log lines stay clean in files / non-tty.  Only pulled in when
+# `logging` (hence the Python wheel) is enabled.
+tracing-subscriber = { version = "0.3", optional = true, default-features = false, features = ["fmt", "env-filter", "std"] }
+# We deliberately do NOT enable abi3 here: mmbus uses `pyo3::buffer`
+# for the zero-copy `recv_into` path (subscription.rs), and the
+# buffer protocol is only available under abi3 when targeting
+# `Py_3_11`+.  Keeping the full C-API means one wheel per Python
+# version per platform — see `wheels.yml`'s python matrix.
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+# Wait-free Arc<T> swapper for the v2 WAL hot path: lets the
+# publisher load the active MmapSegmentWriter without taking the
+# inner mutex (rotation/retention still use the mutex; the hot
+# append doesn't).  vorner/arc-swap is ~1.5k LOC, no transitive
+# deps.  Only pulled in when the `wal_v2` feature is on.
+arc-swap = { version = "1.7", optional = true }
+
+# Unix uses libc directly (eventfd, flock, sendmsg, etc.).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# CRC32C with hardware acceleration on x86 (SSE 4.2) and aarch64 (ARMv8
+# CRC) — used by the WAL Phase B segment writer / reader.  Tiny dep
+# (~300 LOC of Rust + intrinsics), zero impact on the no-WAL build path
+# since BusConfig.wal defaults to disabled.
+[dependencies.crc32c]
+version = "0.6"
+
+# Windows uses windows-sys for LockFileEx, CreateNamedPipe, CreateSemaphore,
+# DuplicateHandle, WaitForMultipleObjects.  Feature gates keep the
+# downloaded surface area small.
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_Security",
+]
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+
+[[example]]
+name = "producer"
+
+[[example]]
+name = "consumer"
+
+[[example]]
+name = "prometheus_exporter"
+required-features = ["prometheus"]
+
+[[bench]]
+name = "ring"
+harness = false
+
+[[bench]]
+name = "e2e"
+harness = false
+
+[[bench]]
+name = "publish_with_wal"
+harness = false
