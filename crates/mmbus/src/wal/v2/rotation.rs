@@ -136,8 +136,9 @@ mod tests {
             let name = name.to_string_lossy();
             if let Some(stem) = name.strip_suffix(".seg") {
                 if let Ok(c) = stem.parse::<u64>() {
-                    if c > after && c <= active_now && best.map_or(true, |b| c < b) {
-                        best = Some(c);
+                    if c > after && c <= active_now {
+                        // Keep the smallest qualifying cursor.
+                        best = Some(best.map_or(c, |b| b.min(c)));
                     }
                 }
             }
