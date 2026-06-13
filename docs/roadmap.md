@@ -1,17 +1,23 @@
 # Roadmap
 
-## Current state (as of v0.4.0)
+## Current state (as of v0.5.1)
 
-Shipped through v0.4.0: ring core, PyO3 bindings, async (asyncio + anyio),
+Shipped through v0.5.1: ring core, PyO3 bindings, async (asyncio + anyio),
 WAL Phase A (replay) + Phase B (durable mmap WAL v2), Prometheus exporter,
-tracing hooks, `mmbus-bridge` in-process Python SDK (TCP, v0.3.x), single-
-lookup publish hot path, zero-copy `publish_many`, `Bus.topic() → TopicPublisher`.
+structured logging (`tracing` in Rust + `init_logging` in Python),
+`mmbus-bridge` in-process Python SDK (TCP, v0.3.x), single-lookup publish
+hot path, zero-copy `publish_many`, `Bus.topic() → TopicPublisher`,
+zero-copy `recv_into` (allocation-free receive), wakeup coalescing
+(wire v5), and Python 3.9–3.13 wheels.  Published to PyPI.
+
+Sibling library: **`mmbus-cast`** (`crates/mmcast/`) — ASGI WebSocket
+broadcast on top of mmbus (v0.1, pending PyPI publish).
 
 Active plans:
-- [`docs/plan-v0.5.md`](plan-v0.5.md) — zero-copy receive, wakeup coalescing,
-  structured logging, NATS bench, bridge asyncio wrapper
-- Windows runtime CI (v0.6 gate)
+- Windows **runtime** support (compile-checked today; tests hang on the
+  blocking producer lock — Phase 7 below)
 - v1.0 API freeze + release
+- True zero-copy receive: expose slot memory as `memoryview` (Phase 2)
 
 ---
 
@@ -51,10 +57,16 @@ Goal: expose Rust core to Python with correct GIL semantics.
 - [x] `sub.recv_timeout(secs)` — blocking with timeout, GIL released
 - [x] `py.allow_threads()` around all blocking waits
 - [x] `maturin develop` workflow; smoke test in `python/smoke_test.py`
-- [ ] Buffer protocol: expose slot memory as `memoryview` (deferred — only
-      meaningful for large arrays; pinned slots would block ring overwrites.
-      Revisit if ML / video use cases emerge.)
-- [ ] Publish wheel to TestPyPI / PyPI (wheels.yml ready; needs `v0.1.0` tag)
+- [x] Allocation-free receive: `recv_into(buf)` / `try_recv_into(buf)`
+      write the payload straight into a caller buffer (bytearray /
+      writable memoryview / numpy uint8), via `pyo3::buffer::PyBuffer`
+      (v0.5.0).  Still one memcpy out of the ring, but no per-message
+      `PyBytes` alloc.
+- [ ] True zero-copy: expose slot memory as a borrowed `memoryview`
+      (no copy at all).  Requires pinning the slot against publisher
+      overwrite for the borrow's lifetime — the open design problem.
+      Meaningful mainly for large arrays (ML / video).
+- [x] Publish wheel to TestPyPI / PyPI (live; see Phase 6)
 
 ---
 
@@ -66,9 +78,11 @@ Goal: expose Rust core to Python with correct GIL semantics.
 - [x] Typed exceptions: `BusFullError`, `MessageTooLargeError`,
       `ConnectTimeoutError`, `TooManySubscribersError`, `AlreadyPublishingError`
 - [x] Type annotations on public API
-- [x] Python 3.8+ support
-- [ ] Serialization helpers (numpy / msgpack / pickle) — out of scope for v0.1;
-      raw bytes is the documented contract
+- [x] Python 3.9+ support (3.8 dropped — EOL; no wheel shipped)
+- [~] Serialization helpers — core keeps the raw-bytes contract by
+      design; codec sugar lives in siblings (`mmbus-cast` ships
+      `publish_json`).  numpy/msgpack helpers can land in a sibling if
+      demand appears; not a core concern.
 
 ---
 
@@ -97,7 +111,9 @@ Goal: expose Rust core to Python with correct GIL semantics.
       blocking on a wakeup — also fixes the "subscriber connects but
       the publisher's accept_clients hasn't run yet, so no wakeup
       arrives" hang
-- [ ] Phase B durable WAL — separate project per RFC
+- [x] Phase B durable WAL — shipped: lock-free mmap-backed WAL v2
+      (`src/wal/v2/`, `wal_v2` feature), append-before-publish ordering,
+      crash recovery + replay.  See `docs/rfc-wal-phase-b.md`.
 
 ---
 
@@ -110,8 +126,10 @@ Goal: expose Rust core to Python with correct GIL semantics.
 - [x] `Bus.slow_subscribers(topic, threshold)` — `[(cursor_idx, lag), ...]`
       for laggards; intended to be called from a periodic monitor thread
       and emit warnings / metrics when non-empty
-- [ ] Prometheus metrics export (optional dependency)
-- [ ] Structured logging (tracing in Rust, `logging` in Python)
+- [x] Prometheus metrics export (optional `prometheus` feature;
+      `src/prometheus.rs` + `examples/prometheus_exporter.rs`)
+- [x] Structured logging — `tracing` events in Rust (`logging` feature,
+      `src/logging.rs`) + `mmbus.init_logging()` in Python (v0.5.0)
 - [x] Fuzz testing of ring buffer under concurrent access — two
       cargo-fuzz targets (`ring_publish_receive` for API-shape coverage,
       `ring_concurrent` for the publisher×subscriber seqlock race that
@@ -136,9 +154,14 @@ Goal: expose Rust core to Python with correct GIL semantics.
 - [x] CI: `cargo test` + `clippy` on Linux + macOS (`.github/workflows/ci.yml`)
 - [x] Wheel build matrix: `linux/macos × x86_64/aarch64` (`wheels.yml`)
 - [x] Docker dev environment for Linux testing from macOS
-- [ ] Tag `v0.1.0` → triggers PyPI publish via wheels.yml
-- [ ] API reference docs (rustdoc + mkdocs)
-- [ ] Use-case mini-guides (FastAPI, ML pipeline, sensor reader)
+- [x] PyPI publish via `wheels.yml` on `v*` tag (live since v0.1.x;
+      latest v0.5.1 ships Python 3.9–3.13 wheels for linux/macos +
+      Windows)
+- [x] API reference: rustdoc published to GitHub Pages (`docs.yml`)
+- [ ] API reference: mkdocs site for the Python API (rustdoc done)
+- [~] Use-case mini-guides — runnable examples shipped
+      (`examples/fastapi_broadcast.py`, `np_pipeline.py`,
+      `observability.py`); prose guides still to write
 
 ---
 

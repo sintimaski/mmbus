@@ -4,9 +4,12 @@
 ///   socket.  Subscribers `poll(2)` both the eventfd and the socket so
 ///   publisher death (POLLHUP) is detected even while idle.
 /// * **Windows**: `CreateSemaphore` + named pipes + `DuplicateHandle`.
-///   Subscribers `WaitForMultipleObjects` on (semaphore, pipe) so peer
-///   process death (`ERROR_BROKEN_PIPE` on the pipe) is detected even
-///   while idle.
+///   Subscribers wait on the semaphore in short slices and probe the
+///   handshake pipe with `PeekNamedPipe` between slices, so publisher
+///   death (`ERROR_BROKEN_PIPE`) is detected even while idle.  (A
+///   synchronous pipe handle can't be a `WaitForMultipleObjects` wait
+///   object — it stays perpetually signaled — so the pipe is probed, not
+///   waited on; see `windows::wait_wakeup`.)
 /// * **macOS / other Unix**: no helpers here — the byte-per-message Unix
 ///   socket scheme is used directly in `publisher.rs` / `subscriber.rs`.
 #[cfg(target_os = "linux")]
@@ -231,22 +234,23 @@ pub(crate) mod windows {
     use std::ffi::CString;
     use std::io;
     use std::os::windows::io::{FromRawHandle, OwnedHandle, RawHandle};
+    use std::time::{Duration, Instant};
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, ERROR_PIPE_CONNECTED, FALSE, HANDLE,
-        INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, ERROR_BROKEN_PIPE, ERROR_PIPE_CONNECTED,
+        FALSE, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileA, ReadFile, WriteFile, FILE_GENERIC_READ, FILE_GENERIC_WRITE, OPEN_EXISTING,
         PIPE_ACCESS_DUPLEX,
     };
     use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeA, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-        PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+        ConnectNamedPipe, CreateNamedPipeA, PeekNamedPipe, PIPE_READMODE_BYTE,
+        PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
     use windows_sys::Win32::System::Threading::{
         CreateSemaphoreA, GetCurrentProcess, GetCurrentProcessId, OpenProcess, ReleaseSemaphore,
-        WaitForMultipleObjects, WaitForSingleObject, INFINITE, PROCESS_DUP_HANDLE,
+        WaitForSingleObject, PROCESS_DUP_HANDLE,
     };
 
     // ── Semaphore primitives ──────────────────────────────────────────────────
@@ -292,33 +296,92 @@ pub(crate) mod windows {
         }
     }
 
-    /// Block until the semaphore has at least one unit **or** the pipe
-    /// signals (the latter typically meaning peer disconnect — a read
-    /// from a closed pipe returns 0 bytes / ERROR_BROKEN_PIPE).
+    /// Block until the semaphore has at least one unit (a wakeup), the
+    /// publisher's pipe breaks (disconnect), or `timeout_ms` elapses.
     ///
-    /// * `timeout_ms < 0` → INFINITE.
+    /// * `timeout_ms < 0` → wait indefinitely (until wakeup or disconnect).
+    /// * Returns `Ok(())` on a wakeup.
     /// * Returns `Err(WouldBlock)` on timeout.
-    /// * Returns `Err(UnexpectedEof)` when the pipe is the wakeup source
-    ///   (peer has disconnected).
+    /// * Returns `Err(UnexpectedEof)` when the publisher has disconnected.
+    ///
+    /// The pipe handle is deliberately **not** used as a
+    /// `WaitForMultipleObjects` wait object.  A synchronous byte-mode pipe
+    /// handle has no pending I/O, so the kernel keeps it perpetually
+    /// signaled — waiting on it returned a bogus "disconnected" on the
+    /// first call, which broke every subscriber receive on Windows.
+    /// Instead we wait on the semaphore in short slices and probe the pipe
+    /// for *actual* closure with `PeekNamedPipe` (which reports
+    /// `ERROR_BROKEN_PIPE` only once the publisher's end is gone).  The
+    /// publisher holds its pipe instance open for the subscriber's
+    /// lifetime (`Publisher`'s per-subscriber `_pipe`), so a broken pipe
+    /// is a true liveness signal.  Disconnect latency is bounded by one
+    /// slice; the wakeup path itself stays immediate (the semaphore
+    /// returns as soon as it's released).
     pub fn wait_wakeup(sem: HANDLE, pipe: HANDLE, timeout_ms: i32) -> io::Result<()> {
-        let handles = [sem, pipe];
-        let timeout = if timeout_ms < 0 {
-            INFINITE
+        // Disconnect-probe granularity.  Small enough that a blocked
+        // receive notices a dead publisher promptly; large enough that an
+        // idle subscriber isn't spinning.
+        const SLICE_MS: u32 = 50;
+        let deadline = if timeout_ms < 0 {
+            None
         } else {
-            timeout_ms as u32
+            Some(Instant::now() + Duration::from_millis(timeout_ms as u64))
         };
-        // SAFETY: handles points to a 2-element stack array of HANDLEs that
-        // are valid for the duration of the call (owned by the caller).
-        let r = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), FALSE, timeout) };
-        match r {
-            WAIT_TIMEOUT => Err(io::Error::new(io::ErrorKind::WouldBlock, "wait timeout")),
-            w if w == WAIT_OBJECT_0 => Ok(()), // semaphore signaled
-            w if w == WAIT_OBJECT_0 + 1 => Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "publisher disconnected (pipe broken)",
-            )),
-            _ => Err(io::Error::last_os_error()),
+        loop {
+            let wait_ms = match deadline {
+                None => SLICE_MS,
+                Some(d) => {
+                    let rem = d.saturating_duration_since(Instant::now());
+                    if rem.is_zero() {
+                        return Err(io::Error::new(io::ErrorKind::WouldBlock, "wait timeout"));
+                    }
+                    (rem.as_millis() as u32).min(SLICE_MS)
+                }
+            };
+            // SAFETY: sem is a caller-owned semaphore HANDLE valid for the
+            // call; WaitForSingleObject reads it and returns a status code.
+            match unsafe { WaitForSingleObject(sem, wait_ms) } {
+                WAIT_OBJECT_0 => return Ok(()), // a wakeup was released
+                WAIT_TIMEOUT => {
+                    // No wakeup this slice — is the publisher still alive?
+                    if pipe_broken(pipe) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "publisher disconnected (pipe broken)",
+                        ));
+                    }
+                    // Alive and no wakeup: loop (or return WouldBlock once
+                    // the overall deadline passes, handled at loop top).
+                }
+                _ => return Err(io::Error::last_os_error()),
+            }
         }
+    }
+
+    /// Non-destructive probe: `true` once the pipe's write end (the
+    /// publisher) has closed.  `PeekNamedPipe` returns 0 +
+    /// `ERROR_BROKEN_PIPE` on a broken pipe, and nonzero otherwise —
+    /// regardless of whether any bytes are buffered, so it never
+    /// false-positives on a healthy-but-idle pipe.
+    fn pipe_broken(pipe: HANDLE) -> bool {
+        let mut avail: u32 = 0;
+        // SAFETY: pipe is a caller-owned HANDLE valid for the call; every
+        // out pointer except `lpTotalBytesAvail` is NULL (permitted), and
+        // we only read back `avail`.
+        let ok = unsafe {
+            PeekNamedPipe(
+                pipe,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut avail,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok != 0 {
+            return false; // pipe healthy (buffered bytes, if any, ignored)
+        }
+        io::Error::last_os_error().raw_os_error() == Some(ERROR_BROKEN_PIPE as i32)
     }
 
     // ── Named pipe primitives (handshake transport) ───────────────────────────

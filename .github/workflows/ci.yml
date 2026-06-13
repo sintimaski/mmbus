@@ -134,6 +134,41 @@ jobs:
       - name: cargo clippy (compile-check, no run)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+  windows-test:
+    name: Windows test (diagnostic)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    # Phase 7: Windows RUNTIME support is in progress.  Historically the
+    # suite was build-only because a hang could burn the 6-hour timeout.
+    # nextest runs each test in its own process with a per-test
+    # terminate-after timeout (see .config/nextest.toml `ci` profile), so
+    # a hang is killed and reported as a timeout in minutes instead of
+    # stalling the run.  `continue-on-error` keeps this informative
+    # (full pass/fail/timeout report in the log) without gating merges
+    # while the remaining Windows issues are worked through.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v0-rust-wintest"
+
+      - uses: taiki-e/install-action@nextest
+
+      # `--no-tests=warn`: don't fail if a target has no tests.  The `ci`
+      # profile bounds each test's wall-clock and never fail-fasts, so we
+      # get the complete picture in one run.
+      - name: cargo nextest (per-test timeout, full report)
+        run: cargo nextest run --all-features --profile ci --no-tests=warn
+
   bridge:
     name: Bridge (${{ matrix.os }}, ${{ matrix.features }})
     runs-on: ${{ matrix.os }}
