@@ -1,0 +1,21 @@
+# nextest configuration.
+#
+# The default profile is left at nextest's defaults so a local
+# `cargo nextest run` behaves normally.  The `ci` profile is used by the
+# Windows diagnostic job (.github/workflows/ci.yml `windows-test`): it
+# bounds each test's wall-clock so a hang on the (in-progress) Windows
+# runtime path is terminated and reported as a timeout in minutes,
+# instead of stalling the job until the 6-hour ceiling.
+
+[profile.ci]
+# Mark a test "slow" after 30s; terminate it after 2 such periods (60s)
+# and report it as a timeout failure.  Generous enough that a merely-slow
+# test on a loaded runner isn't killed, tight enough that a true hang is
+# surfaced quickly.
+slow-timeout = { period = "30s", terminate-after = 2 }
+# Run the whole suite and report every failure/timeout in one pass — we
+# want the complete Windows picture, not just the first problem.
+fail-fast = false
+# Serialise like the Linux/macOS `test` job (avoids the cross-test
+# mmap/lock races those runners hit on 2 cores).
+test-threads = 1
